@@ -144,8 +144,18 @@ const buildRoomNumberMap = async (
 }
 
 const parseCubeId = (id: string): number | null => {
-  if (!id.startsWith(CUBE_ITEM_PREFIX)) return null
-  const parsed = Number(id.slice(CUBE_ITEM_PREFIX.length))
+  const trimmed = id.trim()
+  if (!trimmed) return null
+
+  if (trimmed.startsWith(CUBE_ITEM_PREFIX)) {
+    const parsed = Number(trimmed.slice(CUBE_ITEM_PREFIX.length))
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  const legacyMatch = trimmed.match(/(?:cube[-_:]?)?(\d+)$/i)
+  if (!legacyMatch) return null
+
+  const parsed = Number(legacyMatch[1])
   return Number.isFinite(parsed) ? parsed : null
 }
 
@@ -612,7 +622,18 @@ const IfcViewer = ({
     if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
       const cubeId = selectedElement.expressID
       removeCustomCube(cubeId)
-      setFurnitureEntries((prev) => prev.filter((item) => item.id !== `${CUBE_ITEM_PREFIX}${cubeId}`))
+      const nextFurniture = furnitureEntries.filter((item) => {
+        const parsedId = parseCubeId(item.id)
+        if (parsedId !== null) {
+          return parsedId !== cubeId
+        }
+        return item.id !== `${CUBE_ITEM_PREFIX}${cubeId}`
+      })
+      if (onFurnitureChange) {
+        suppressFurnitureNotifyRef.current = true
+        onFurnitureChange(nextFurniture)
+      }
+      setFurnitureEntries(nextFurniture)
       const nodeId = Object.values(tree.nodes).find(
         (node) =>
           node.nodeType === 'custom' &&
@@ -641,13 +662,14 @@ const IfcViewer = ({
     resetSelection()
     setSelectedNodeId(null)
   }, [
+    furnitureEntries,
     hideIfcElement,
+    onFurnitureChange,
     pushHistoryEntry,
     removeCustomCube,
     removeNode,
     resetSelection,
     selectedElement,
-    setFurnitureEntries,
     tree.nodes,
     upsertMetadataEntry
   ])
@@ -668,8 +690,12 @@ const IfcViewer = ({
       setMetadataEntries(sanitizeMetadataEntries(Array.isArray(metadata) ? metadata : []))
     }
     if (furniture !== undefined) {
-      suppressFurnitureNotifyRef.current = true
-      setFurnitureEntries(Array.isArray(furniture) ? furniture : [])
+      const incomingFurniture = Array.isArray(furniture) ? furniture : []
+      setFurnitureEntries((prev) => {
+        if (prev === incomingFurniture) return prev
+        suppressFurnitureNotifyRef.current = true
+        return incomingFurniture
+      })
     }
     if (history !== undefined) {
       suppressHistoryNotifyRef.current = true
@@ -1540,3 +1566,4 @@ const IfcViewer = ({
 }
 
 export default IfcViewer
+
