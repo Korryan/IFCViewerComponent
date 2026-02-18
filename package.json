@@ -6,6 +6,9 @@
   "main": "src/index.ts",
   "module": "src/index.ts",
   "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "exports": {
     ".": "./src/index.ts"
   },
@@ -15,5 +18,10 @@
     "three": ">=0.135.0 <0.200.0",
     "web-ifc": ">=0.0.39 <0.1.0",
     "web-ifc-viewer": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3"
   }
 }

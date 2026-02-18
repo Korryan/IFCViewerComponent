@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plane, Raycaster, Vector3 } from 'three'
+import CameraControls from 'camera-controls'
 import { IfcViewerAPI } from 'web-ifc-viewer'
-import { IFCDOOR, IFCSPACE, IFCWALL } from 'web-ifc'
 import type {
   FurnitureItem,
   HistoryEntry,
@@ -42,18 +42,19 @@ type Loader = (viewer: IfcViewerAPI) => Promise<any>
 const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
 const POSITION_EPSILON = 1e-4
-const IFC_VIEW_FILTERS = [
-  { key: 'space', label: 'IfcSpace', typeId: IFCSPACE },
-  { key: 'wall', label: 'IfcWall', typeId: IFCWALL },
-  { key: 'door', label: 'IfcDoor', typeId: IFCDOOR }
-] as const
+const WALK_MOVE_SPEED = 2.8
+const WALK_LOOK_SENSITIVITY = 0.0025
+const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
 // Common property names used by authoring tools for room numbers (Pset text values).
 const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
   'roomnumber'
 ])
 const SHORTCUTS = [
-  { keys: 'A', label: 'Open insert menu at cursor' },
+  { keys: 'M', label: 'Toggle free look / walk mode' },
+  { keys: 'Arrow Keys', label: 'Move in walk mode (fixed height)' },
+  { keys: 'Right Mouse Drag (walk)', label: 'Look around in place' },
+  { keys: 'A (free mode)', label: 'Open insert menu at cursor' },
   { keys: 'G', label: 'Start move mode' },
   { keys: 'X / Y / Z', label: 'Lock axis while moving' },
   { keys: 'F', label: 'Move in floor plane (keep height)' },
@@ -61,6 +62,187 @@ const SHORTCUTS = [
   { keys: 'Esc', label: 'Cancel drag / close menus' },
   { keys: '? / H', label: 'Toggle shortcuts help' }
 ]
+
+type IfcMeshLike = {
+  modelID?: number
+  geometry?: { dispose?: () => void }
+  material?: { dispose?: () => void } | Array<{ dispose?: () => void }>
+}
+
+type IfcSceneLike = {
+  children?: unknown[]
+  remove: (item: unknown) => void
+}
+
+type NavigationMode = 'free' | 'walk'
+type WalkMoveKey = 'arrowup' | 'arrowleft' | 'arrowdown' | 'arrowright'
+type RoomListEntry = { nodeId: string; label: string; roomNumber?: string | null }
+
+const emptyWalkKeyState: Record<WalkMoveKey, boolean> = {
+  arrowup: false,
+  arrowleft: false,
+  arrowdown: false,
+  arrowright: false
+}
+
+const getWalkMoveKey = (event: KeyboardEvent): WalkMoveKey | null => {
+  const key = event.key.toLowerCase()
+  if (key === 'arrowup' || key === 'up' || event.code === 'ArrowUp') return 'arrowup'
+  if (key === 'arrowleft' || key === 'left' || event.code === 'ArrowLeft') return 'arrowleft'
+  if (key === 'arrowdown' || key === 'down' || event.code === 'ArrowDown') return 'arrowdown'
+  if (key === 'arrowright' || key === 'right' || event.code === 'ArrowRight') return 'arrowright'
+  return null
+}
+
+const disposeMeshResources = (mesh: IfcMeshLike | null | undefined) => {
+  if (!mesh) return
+  mesh.geometry?.dispose?.()
+  if (Array.isArray(mesh.material)) {
+    mesh.material.forEach((material) => material?.dispose?.())
+    return
+  }
+  mesh.material?.dispose?.()
+}
+
+const removeMeshesByModelId = (collection: unknown[] | undefined, modelID: number) => {
+  if (!Array.isArray(collection)) return
+  for (let index = collection.length - 1; index >= 0; index -= 1) {
+    const item = collection[index] as { modelID?: number }
+    if (item?.modelID === modelID) {
+      collection.splice(index, 1)
+    }
+  }
+}
+
+const collectLoadedIfcModelIds = (viewer: IfcViewerAPI, fallbackModelID: number | null): number[] => {
+  const ids = new Set<number>()
+  if (typeof fallbackModelID === 'number') {
+    ids.add(fallbackModelID)
+  }
+
+  const manager = viewer.IFC.loader.ifcManager as {
+    state?: { models?: Record<string, { mesh?: unknown }> }
+  }
+  const models = manager.state?.models ?? {}
+  Object.keys(models).forEach((rawId) => {
+    const parsed = Number(rawId)
+    if (Number.isFinite(parsed)) {
+      ids.add(parsed)
+    }
+  })
+
+  ;(viewer.context.items.ifcModels as Array<{ modelID?: number }>).forEach((mesh) => {
+    if (typeof mesh?.modelID === 'number') {
+      ids.add(mesh.modelID)
+    }
+  })
+
+  return Array.from(ids)
+}
+
+const removeIfcModelSafely = (viewer: IfcViewerAPI, modelID: number) => {
+  const manager = viewer.IFC.loader.ifcManager as {
+    close?: (id: number, scene?: unknown) => void
+    state?: { models?: Record<number, { mesh?: unknown }> }
+  }
+  const scene = viewer.context.getScene() as IfcSceneLike
+
+  if (manager.state?.models?.[modelID]) {
+    try {
+      manager.close?.(modelID, scene)
+    } catch (err) {
+      console.warn('Failed to close IFC model', modelID, err)
+    }
+  } else {
+    try {
+      viewer.IFC.removeIfcModel(modelID)
+    } catch (err) {
+      console.warn('Failed to remove IFC model', modelID, err)
+    }
+  }
+
+  const children = Array.isArray(scene.children) ? [...scene.children] : []
+  children.forEach((child) => {
+    const mesh = child as IfcMeshLike
+    if (mesh?.modelID !== modelID) return
+    scene.remove(child)
+    disposeMeshResources(mesh)
+  })
+
+  removeMeshesByModelId(viewer.context.items.ifcModels as unknown[], modelID)
+  removeMeshesByModelId(viewer.context.items.pickableIfcModels as unknown[], modelID)
+}
+
+const purgeIfcVisuals = (viewer: IfcViewerAPI, modelIDsToRemove: number[]) => {
+  const modelIdSet = new Set(modelIDsToRemove)
+  const scene = viewer.context.getScene() as IfcSceneLike
+  const removed = new Set<unknown>()
+  const stack = Array.isArray(scene.children) ? [...scene.children] : []
+
+  while (stack.length > 0) {
+    const current = stack.pop() as IfcMeshLike & {
+      modelID?: number
+      geometry?: { getAttribute?: (name: string) => unknown; dispose?: () => void }
+      material?: { dispose?: () => void } | Array<{ dispose?: () => void }>
+      children?: unknown[]
+      parent?: { remove?: (item: unknown) => void }
+    }
+    if (!current) continue
+    if (Array.isArray(current.children) && current.children.length > 0) {
+      stack.push(...current.children)
+    }
+
+    const modelID = typeof current.modelID === 'number' ? current.modelID : null
+    const isCustomCube = modelID === CUSTOM_CUBE_MODEL_ID
+    const hasExpressIds = Boolean(current.geometry?.getAttribute?.('expressID'))
+    const shouldRemoveByModelID = modelID !== null && modelIdSet.has(modelID) && !isCustomCube
+    const shouldRemoveOrphanIfcVisual = hasExpressIds && !isCustomCube
+    if (!shouldRemoveByModelID && !shouldRemoveOrphanIfcVisual) continue
+
+    if (current.parent?.remove) {
+      current.parent.remove(current)
+    }
+    disposeMeshResources(current)
+    removed.add(current)
+  }
+
+  const purgeCollection = (collection: unknown[] | undefined) => {
+    if (!Array.isArray(collection)) return
+    for (let index = collection.length - 1; index >= 0; index -= 1) {
+      const item = collection[index] as {
+        modelID?: number
+        geometry?: { getAttribute?: (name: string) => unknown }
+      }
+      const modelID = typeof item?.modelID === 'number' ? item.modelID : null
+      const isCustomCube = modelID === CUSTOM_CUBE_MODEL_ID
+      const hasExpressIds = Boolean(item?.geometry?.getAttribute?.('expressID'))
+      const shouldRemoveByModelID = modelID !== null && modelIdSet.has(modelID) && !isCustomCube
+      const shouldRemoveOrphanIfcVisual = hasExpressIds && !isCustomCube
+      if (removed.has(item) || shouldRemoveByModelID || shouldRemoveOrphanIfcVisual) {
+        collection.splice(index, 1)
+      }
+    }
+  }
+
+  purgeCollection(viewer.context.items.ifcModels as unknown[])
+  purgeCollection(viewer.context.items.pickableIfcModels as unknown[])
+}
+
+const applyNavigationControls = (viewer: IfcViewerAPI, mode: NavigationMode) => {
+  const controls = viewer.context.ifcCamera.cameraControls
+  if (mode === 'walk') {
+    controls.mouseButtons.left = CameraControls.ACTION.NONE
+    controls.mouseButtons.middle = CameraControls.ACTION.NONE
+    controls.mouseButtons.right = CameraControls.ACTION.NONE
+    controls.mouseButtons.wheel = CameraControls.ACTION.NONE
+    return
+  }
+
+  controls.mouseButtons.left = CameraControls.ACTION.NONE
+  controls.mouseButtons.middle = CameraControls.ACTION.ROTATE
+  controls.mouseButtons.right = CameraControls.ACTION.TRUCK
+  controls.mouseButtons.wheel = CameraControls.ACTION.DOLLY
+}
 
 const normalizeIfcValue = (rawValue: any): string => {
   if (rawValue === null || rawValue === undefined) {
@@ -192,7 +374,7 @@ const sanitizeHistoryEntries = (entries: HistoryEntry[]): HistoryEntry[] => {
 // Top-level viewer wiring together scene setup, selection hook, and UI overlays
 const IfcViewer = ({
   file,
-  defaultModelUrl = '/test.ifc',
+  defaultModelUrl,
   showTree = true,
   showProperties = true,
   showShortcuts = true,
@@ -210,14 +392,14 @@ const IfcViewer = ({
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const treeUploadInputRef = useRef<HTMLInputElement | null>(null)
   const pendingTreeUploadRef = useRef<string | null>(null)
-  const filterCacheRef = useRef<Map<number, Map<number, number[]>>>(new Map())
   // Pointer bookkeeping so the insert menu knows where to appear
   const lastPointerPosRef = useRef<{ x: number; y: number }>({ x: 16, y: 16 })
   // Remember the last loaded IFC model id for cleanup
   const lastModelIdRef = useRef<number | null>(null)
   const loadTokenRef = useRef(0)
-  const [status, setStatus] = useState<string | null>('Loading sample model...')
+  const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [navigationMode, setNavigationMode] = useState<NavigationMode>('free')
   const [hoverCoords, setHoverCoords] = useState<Point3D | null>(null)
   const [isInsertMenuOpen, setIsInsertMenuOpen] = useState(false)
   const [insertMenuAnchor, setInsertMenuAnchor] = useState<{ x: number; y: number } | null>(null)
@@ -238,9 +420,6 @@ const IfcViewer = ({
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [furnitureEntries, setFurnitureEntries] = useState<FurnitureItem[]>([])
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
-  const [viewFilters, setViewFilters] = useState<Record<string, boolean>>(() => {
-    return Object.fromEntries(IFC_VIEW_FILTERS.map((filter) => [filter.key, false]))
-  })
   const [isHydrated, setIsHydrated] = useState(false)
   const furnitureRestoredRef = useRef(false)
   const offsetsRestoredRef = useRef<number | null>(null)
@@ -249,6 +428,13 @@ const IfcViewer = ({
   const suppressMetadataNotifyRef = useRef(false)
   const suppressFurnitureNotifyRef = useRef(false)
   const suppressHistoryNotifyRef = useRef(false)
+  const walkKeyStateRef = useRef<Record<WalkMoveKey, boolean>>({ ...emptyWalkKeyState })
+  const walkHeadingRef = useRef<Vector3>(new Vector3(0, 0, -1))
+  const walkFrameRef = useRef<number | null>(null)
+  const walkLastTimestampRef = useRef<number | null>(null)
+  const walkLookActiveRef = useRef(false)
+  const walkLookPointerIdRef = useRef<number | null>(null)
+  const walkLookLastPointerRef = useRef<{ x: number; y: number } | null>(null)
 
   const {
     selectedElement,
@@ -293,19 +479,23 @@ const IfcViewer = ({
     })
     return ids
   }, [metadataEntries])
-  const activeFilterDefs = useMemo(
-    () => IFC_VIEW_FILTERS.filter((filter) => viewFilters[filter.key]),
-    [viewFilters]
-  )
-  const filterOptions = useMemo(
-    () =>
-      IFC_VIEW_FILTERS.map((filter) => ({
-        key: filter.key,
-        label: filter.label,
-        active: Boolean(viewFilters[filter.key])
-      })),
-    [viewFilters]
-  )
+  const roomOptions = useMemo<RoomListEntry[]>(() => {
+    const roomNumbers = roomNumbersRef.current
+    return Object.values(tree.nodes)
+      .filter(
+        (node) => node.nodeType === 'ifc' && node.expressID !== null && node.type.toUpperCase() === 'IFCSPACE'
+      )
+      .map((node) => ({
+        nodeId: node.id,
+        label: node.label,
+        roomNumber: roomNumbers.get(node.expressID!) ?? null
+      }))
+      .sort((left, right) => {
+        const leftKey = left.roomNumber?.trim() || left.label
+        const rightKey = right.roomNumber?.trim() || right.label
+        return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: 'base' })
+      })
+  }, [tree.nodes])
   const pickMenuItems = useMemo(
     () =>
       pickCandidates.map((candidate) => ({
@@ -320,16 +510,93 @@ const IfcViewer = ({
     [pickCandidates]
   )
   const showSidePanel = showTree || showProperties
+  const isWalkMode = navigationMode === 'walk'
+  const navigationModeRef = useRef<NavigationMode>(navigationMode)
 
-  const toggleFilter = useCallback((key: string) => {
-    setViewFilters((prev) => ({
-      ...prev,
-      [key]: !prev[key]
-    }))
+  const toggleNavigationMode = useCallback(() => {
+    setNavigationMode((prev) => (prev === 'free' ? 'walk' : 'free'))
   }, [])
 
-  const resetFilters = useCallback(() => {
-    setViewFilters(Object.fromEntries(IFC_VIEW_FILTERS.map((filter) => [filter.key, false])))
+  useEffect(() => {
+    navigationModeRef.current = navigationMode
+  }, [navigationMode])
+
+  const stopWalkMovementLoop = useCallback(() => {
+    if (walkFrameRef.current !== null) {
+      cancelAnimationFrame(walkFrameRef.current)
+      walkFrameRef.current = null
+    }
+    walkLastTimestampRef.current = null
+    walkKeyStateRef.current = { ...emptyWalkKeyState }
+    walkHeadingRef.current.set(0, 0, -1)
+    walkLookActiveRef.current = false
+    walkLookPointerIdRef.current = null
+    walkLookLastPointerRef.current = null
+  }, [])
+
+  const updateWalkLookByDelta = useCallback((deltaX: number, deltaY: number) => {
+    const viewer = viewerRef.current
+    const controls = viewer?.context?.ifcCamera?.cameraControls as
+      | {
+          getPosition?: (out: Vector3) => void
+          getTarget?: (out: Vector3) => void
+          setLookAt?: (
+            positionX: number,
+            positionY: number,
+            positionZ: number,
+            targetX: number,
+            targetY: number,
+            targetZ: number,
+            enableTransition?: boolean
+          ) => void
+        }
+      | undefined
+    if (!controls?.getPosition || !controls?.getTarget || !controls?.setLookAt) return
+
+    const position = new Vector3()
+    const target = new Vector3()
+    controls.getPosition(position)
+    controls.getTarget(target)
+
+    const direction = target.sub(position)
+    if (direction.lengthSq() <= 1e-8) {
+      direction.copy(walkHeadingRef.current)
+      if (direction.lengthSq() <= 1e-8) {
+        direction.set(0, 0, -1)
+      }
+    }
+    direction.normalize()
+
+    const currentPitch = Math.asin(Math.max(-1, Math.min(1, direction.y)))
+    const currentYaw = Math.atan2(direction.x, direction.z)
+    const nextYaw = currentYaw - deltaX * WALK_LOOK_SENSITIVITY
+    const nextPitch = Math.max(
+      -WALK_PITCH_LIMIT,
+      Math.min(WALK_PITCH_LIMIT, currentPitch - deltaY * WALK_LOOK_SENSITIVITY)
+    )
+    const cosPitch = Math.cos(nextPitch)
+    const nextDirection = new Vector3(
+      Math.sin(nextYaw) * cosPitch,
+      Math.sin(nextPitch),
+      Math.cos(nextYaw) * cosPitch
+    ).normalize()
+
+    const horizontalDirection = new Vector3(nextDirection.x, 0, nextDirection.z)
+    if (horizontalDirection.lengthSq() > 1e-8) {
+      horizontalDirection.normalize()
+      walkHeadingRef.current.copy(horizontalDirection)
+    }
+
+    const nextTarget = position.clone().add(nextDirection)
+    controls.setLookAt(
+      position.x,
+      position.y,
+      position.z,
+      nextTarget.x,
+      nextTarget.y,
+      nextTarget.z,
+      false
+    )
   }, [])
 
   const closePickMenu = useCallback(() => {
@@ -337,6 +604,117 @@ const IfcViewer = ({
     setPickMenuAnchor(null)
     setPickCandidates([])
     setPickCandidateTypes({})
+  }, [])
+
+  const teleportCameraToPoint = useCallback((point: Point3D | null) => {
+    if (!point) return false
+    const viewer = viewerRef.current
+    const controls = viewer?.context?.ifcCamera?.cameraControls as
+      | {
+          getPosition?: (out: Vector3) => void
+          getTarget?: (out: Vector3) => void
+          setLookAt?: (
+            positionX: number,
+            positionY: number,
+            positionZ: number,
+            targetX: number,
+            targetY: number,
+            targetZ: number,
+            enableTransition?: boolean
+          ) => void
+        }
+      | undefined
+    if (!controls?.getPosition || !controls?.getTarget || !controls?.setLookAt) return false
+
+    const currentPosition = new Vector3()
+    const currentTarget = new Vector3()
+    controls.getPosition(currentPosition)
+    controls.getTarget(currentTarget)
+
+    const nextTarget = new Vector3(point.x, point.y, point.z)
+    const translation = nextTarget.clone().sub(currentTarget)
+    currentPosition.add(translation)
+
+    controls.setLookAt(
+      currentPosition.x,
+      currentPosition.y,
+      currentPosition.z,
+      nextTarget.x,
+      nextTarget.y,
+      nextTarget.z,
+      false
+    )
+    return true
+  }, [])
+
+  const moveCameraToPoint = useCallback((point: Point3D | null) => {
+    if (!point) return false
+    const viewer = viewerRef.current
+    const controls = viewer?.context?.ifcCamera?.cameraControls as
+      | {
+          getPosition?: (out: Vector3) => void
+          getTarget?: (out: Vector3) => void
+          setPosition?: (x: number, y: number, z: number, enableTransition?: boolean) => void
+          setTarget?: (x: number, y: number, z: number, enableTransition?: boolean) => void
+          setLookAt?: (
+            positionX: number,
+            positionY: number,
+            positionZ: number,
+            targetX: number,
+            targetY: number,
+            targetZ: number,
+            enableTransition?: boolean
+          ) => void
+        }
+      | undefined
+    if (!controls) return false
+
+    if (typeof controls.getPosition === 'function' && typeof controls.getTarget === 'function') {
+      const currentPosition = new Vector3()
+      const currentTarget = new Vector3()
+      controls.getPosition(currentPosition)
+      controls.getTarget(currentTarget)
+
+      const viewDirection = currentTarget.sub(currentPosition)
+      if (viewDirection.lengthSq() <= 1e-8) {
+        viewDirection.set(0, 0, -1)
+      }
+
+      const nextPosition = new Vector3(point.x, point.y, point.z)
+      const nextTarget = nextPosition.clone().add(viewDirection)
+
+      if (typeof controls.setLookAt === 'function') {
+        controls.setLookAt(
+          nextPosition.x,
+          nextPosition.y,
+          nextPosition.z,
+          nextTarget.x,
+          nextTarget.y,
+          nextTarget.z,
+          false
+        )
+        return true
+      }
+
+      if (typeof controls.setPosition === 'function' && typeof controls.setTarget === 'function') {
+        controls.setPosition(nextPosition.x, nextPosition.y, nextPosition.z, false)
+        controls.setTarget(nextTarget.x, nextTarget.y, nextTarget.z, false)
+        return true
+      }
+    }
+
+    if (typeof controls.setPosition === 'function' && typeof controls.setTarget === 'function') {
+      controls.setPosition(point.x, point.y, point.z, false)
+      controls.setTarget(point.x, point.y, point.z - 1, false)
+      return true
+    }
+
+    if (typeof controls.setLookAt === 'function') {
+      controls.setLookAt(point.x, point.y, point.z, point.x, point.y, point.z - 1, false)
+      return true
+    }
+
+    return false
   }, [])
 
   const handlePickMenuSelect = useCallback(
@@ -407,32 +785,6 @@ const IfcViewer = ({
 
     resolveTypes()
   }, [isPickMenuOpen, pickCandidates, viewerRef])
-
-  const getTypeIds = useCallback(
-    async (modelID: number, typeId: number): Promise<number[]> => {
-      const viewer = viewerRef.current
-      if (!viewer) return []
-      let modelCache = filterCacheRef.current.get(modelID)
-      if (!modelCache) {
-        modelCache = new Map()
-        filterCacheRef.current.set(modelID, modelCache)
-      }
-      const cached = modelCache.get(typeId)
-      if (cached) return cached
-      const manager = viewer.IFC.loader.ifcManager as {
-        getAllItemsOfType?: (id: number, type: number, verbose?: boolean) => number[] | Promise<number[]>
-      }
-      const getter = manager.getAllItemsOfType ?? viewer.IFC.getAllItemsOfType?.bind(viewer.IFC)
-      if (!getter) {
-        return []
-      }
-      const ids = await Promise.resolve(getter(modelID, typeId, false))
-      const safeIds = Array.isArray(ids) ? ids.filter((value) => typeof value === 'number') : []
-      modelCache.set(typeId, safeIds)
-      return safeIds
-    },
-    []
-  )
 
   const pushHistoryEntry = useCallback((ifcId: number, label: string, timestamp?: string) => {
     const nextTimestamp = timestamp ?? new Date().toISOString()
@@ -764,7 +1116,7 @@ const IfcViewer = ({
       const roomNumbers = roomNumbersRef.current
       let currentId: string | null | undefined = nodeId
       while (currentId) {
-        const node = tree.nodes[currentId]
+        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
         if (!node) break
         if (node.nodeType === 'ifc' && node.expressID !== null) {
           const roomNumber = roomNumbers.get(node.expressID)
@@ -873,30 +1225,11 @@ const IfcViewer = ({
     if (activeModelId === null) {
       return
     }
-    let cancelled = false
-    const applyFilters = async () => {
-      if (activeFilterDefs.length === 0) {
-        applyVisibilityFilter(activeModelId, null)
-        if (deletedIfcIds.size > 0) {
-          deletedIfcIds.forEach((id) => hideIfcElement(activeModelId, id))
-        }
-        return
-      }
-      const buckets = await Promise.all(
-        activeFilterDefs.map((filter) => getTypeIds(activeModelId, filter.typeId))
-      )
-      if (cancelled) return
-      const merged = Array.from(new Set(buckets.flat()))
-      const filtered = deletedIfcIds.size
-        ? merged.filter((id) => !deletedIfcIds.has(id))
-        : merged
-      applyVisibilityFilter(activeModelId, filtered)
+    applyVisibilityFilter(activeModelId, null)
+    if (deletedIfcIds.size > 0) {
+      deletedIfcIds.forEach((id) => hideIfcElement(activeModelId, id))
     }
-    void applyFilters()
-    return () => {
-      cancelled = true
-    }
-  }, [activeFilterDefs, activeModelId, applyVisibilityFilter, deletedIfcIds, getTypeIds, hideIfcElement])
+  }, [activeModelId, applyVisibilityFilter, deletedIfcIds, hideIfcElement])
 
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
@@ -1001,6 +1334,23 @@ const IfcViewer = ({
     [tree.nodes]
   )
 
+  const resolveNodeInsertTarget = useCallback(
+    async (nodeId: string, options?: { autoFocus?: boolean }): Promise<Point3D> => {
+      const node = tree.nodes[nodeId]
+      if (!node || node.nodeType !== 'ifc' || node.expressID === null) {
+        return { x: 0, y: 0, z: 0 }
+      }
+
+      const descendantIds = collectDescendantExpressIds(nodeId)
+      const target = await selectById(node.modelID, node.expressID, {
+        highlightIds: descendantIds,
+        autoFocus: options?.autoFocus
+      })
+      return target ?? { x: 0, y: 0, z: 0 }
+    },
+    [collectDescendantExpressIds, selectById, tree.nodes]
+  )
+
   const handleTreeSelect = useCallback(
     async (nodeId: string) => {
       setSelectedNodeId(nodeId)
@@ -1027,21 +1377,21 @@ const IfcViewer = ({
     [clearIfcHighlight, collectDescendantExpressIds, selectById, selectCustomCube, tree.nodes]
   )
 
+  const handleRoomSelect = useCallback(
+    async (nodeId: string) => {
+      setSelectedNodeId(nodeId)
+      const target = await resolveNodeInsertTarget(nodeId)
+      if (!moveCameraToPoint(target)) {
+        teleportCameraToPoint(target)
+      }
+    },
+    [moveCameraToPoint, resolveNodeInsertTarget, teleportCameraToPoint]
+  )
+
   const handleTreeAddCube = useCallback(
     async (nodeId: string) => {
-      const node = tree.nodes[nodeId]
-      let target: Point3D | null = null
-
-      if (node?.nodeType === 'ifc' && node.expressID !== null) {
-        // Mimic "select parent": select the node to resolve a stable world-space target.
-        const descendantIds = collectDescendantExpressIds(nodeId)
-        target = await selectById(node.modelID, node.expressID, {
-          highlightIds: descendantIds
-        })
-      }
-
-      // Spawn at the same coordinates as the parent selection (fallback to origin).
-      const resolvedTarget = target ?? { x: 0, y: 0, z: 0 }
+      // Spawn at the same coordinates resolved from parent selection (fallback to origin).
+      const resolvedTarget = await resolveNodeInsertTarget(nodeId)
       const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
       const roomNumber = resolveRoomNumberForNode(nodeId)
@@ -1058,10 +1408,9 @@ const IfcViewer = ({
     },
     [
       addCustomNode,
-      collectDescendantExpressIds,
       registerCubeFurniture,
+      resolveNodeInsertTarget,
       resolveRoomNumberForNode,
-      selectById,
       selectCustomCube,
       spawnCube,
       tree.nodes
@@ -1074,19 +1423,171 @@ const IfcViewer = ({
   }, [])
 
   useEffect(() => {
+    const viewer = viewerRef.current ?? ensureViewer()
+    if (!viewer) return
+    applyNavigationControls(viewer, navigationMode)
+    if (!isWalkMode) {
+      stopWalkMovementLoop()
+    }
+  }, [ensureViewer, isWalkMode, navigationMode, stopWalkMovementLoop])
+
+  useEffect(() => {
+    if (!isWalkMode) return
+
+    const up = new Vector3(0, 1, 0)
+    const position = new Vector3()
+    const target = new Vector3()
+    const forward = new Vector3()
+    const right = new Vector3()
+    const move = new Vector3()
+
+    const tick = (timestamp: number) => {
+      const viewer = viewerRef.current
+      const controls = viewer?.context?.ifcCamera?.cameraControls
+      if (!controls || typeof controls.getPosition !== 'function' || typeof controls.getTarget !== 'function') {
+        walkFrameRef.current = requestAnimationFrame(tick)
+        return
+      }
+
+      const lastTimestamp = walkLastTimestampRef.current ?? timestamp
+      walkLastTimestampRef.current = timestamp
+      const deltaTime = Math.min((timestamp - lastTimestamp) / 1000, 0.05)
+
+      const keys = walkKeyStateRef.current
+      const forwardInput = (keys.arrowup ? 1 : 0) - (keys.arrowdown ? 1 : 0)
+      const strafeInput = (keys.arrowright ? 1 : 0) - (keys.arrowleft ? 1 : 0)
+
+      if (deltaTime > 0 && (forwardInput !== 0 || strafeInput !== 0)) {
+        controls.getPosition(position)
+        controls.getTarget(target)
+
+        forward.subVectors(target, position)
+        forward.y = 0
+        if (forward.lengthSq() > 1e-8) {
+          forward.normalize()
+          walkHeadingRef.current.copy(forward)
+        } else {
+          forward.copy(walkHeadingRef.current)
+        }
+
+        right.crossVectors(forward, up).normalize()
+
+        move.set(0, 0, 0)
+        move.addScaledVector(forward, forwardInput)
+        move.addScaledVector(right, strafeInput)
+        if (move.lengthSq() > 1e-8) {
+          move.normalize().multiplyScalar(WALK_MOVE_SPEED * deltaTime)
+          position.add(move)
+          target.add(move)
+          controls.setLookAt(
+            position.x,
+            position.y,
+            position.z,
+            target.x,
+            target.y,
+            target.z,
+            false
+          )
+        }
+      }
+
+      walkFrameRef.current = requestAnimationFrame(tick)
+    }
+
+    walkFrameRef.current = requestAnimationFrame(tick)
+    return () => {
+      stopWalkMovementLoop()
+    }
+  }, [isWalkMode, stopWalkMovementLoop])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!isWalkMode || event.button !== 2) return
+      walkLookActiveRef.current = true
+      walkLookPointerIdRef.current = event.pointerId
+      walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      try {
+        container.setPointerCapture(event.pointerId)
+      } catch {
+        // Ignore capture errors for unsupported platforms.
+      }
+      event.preventDefault()
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!isWalkMode || !walkLookActiveRef.current) return
+      if (walkLookPointerIdRef.current !== null && event.pointerId !== walkLookPointerIdRef.current) return
+
+      const lastPointer = walkLookLastPointerRef.current
+      walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      if (!lastPointer) return
+
+      const deltaX = event.clientX - lastPointer.x
+      const deltaY = event.clientY - lastPointer.y
+      if (deltaX === 0 && deltaY === 0) return
+      updateWalkLookByDelta(deltaX, deltaY)
+      event.preventDefault()
+    }
+
+    const stopLook = (event?: PointerEvent) => {
+      if (event && event.button !== 2) return
+      if (event && walkLookPointerIdRef.current !== null && event.pointerId !== walkLookPointerIdRef.current) {
+        return
+      }
+      const pointerId = walkLookPointerIdRef.current
+      walkLookActiveRef.current = false
+      walkLookPointerIdRef.current = null
+      walkLookLastPointerRef.current = null
+      if (pointerId !== null) {
+        try {
+          container.releasePointerCapture(pointerId)
+        } catch {
+          // Ignore release errors for unsupported platforms.
+        }
+      }
+    }
+
+    const handleContextMenu = (event: MouseEvent) => {
+      if (!isWalkMode) return
+      event.preventDefault()
+    }
+
+    const handleWindowBlur = () => {
+      stopLook()
+    }
+
+    container.addEventListener('pointerdown', handlePointerDown)
+    container.addEventListener('pointermove', handlePointerMove)
+    container.addEventListener('contextmenu', handleContextMenu)
+    window.addEventListener('pointerup', stopLook)
+    window.addEventListener('blur', handleWindowBlur)
+    return () => {
+      container.removeEventListener('pointerdown', handlePointerDown)
+      container.removeEventListener('pointermove', handlePointerMove)
+      container.removeEventListener('contextmenu', handleContextMenu)
+      window.removeEventListener('pointerup', stopLook)
+      window.removeEventListener('blur', handleWindowBlur)
+      stopLook()
+    }
+  }, [isWalkMode, updateWalkLookByDelta])
+
+  useEffect(() => {
     const container = containerRef.current
     if (!container) return
 
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return
-      handlePick()
+      handlePick({ autoFocus: !isWalkMode })
     }
 
     container.addEventListener('pointerdown', handlePointerDown)
     return () => {
       container.removeEventListener('pointerdown', handlePointerDown)
     }
-  }, [handlePick])
+  }, [handlePick, isWalkMode])
 
   useEffect(() => {
     const container = containerRef.current
@@ -1160,12 +1661,33 @@ const IfcViewer = ({
   }, [selectedElement, tree.nodes])
 
   useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null) => {
+      const element = target as HTMLElement | null
+      if (!element) return false
+      const tagName = element.tagName
+      return element.isContentEditable || tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT'
+    }
+
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return
+      const key = event.key.toLowerCase()
+      const walkMoveKey = getWalkMoveKey(event)
+
+      if (isWalkMode && walkMoveKey) {
+        walkKeyStateRef.current[walkMoveKey] = true
+        event.preventDefault()
+        return
+      }
+
       if (showShortcuts && (event.key === '?' || event.key.toLowerCase() === 'h')) {
         setIsShortcutsOpen((prev) => !prev)
         return
       }
-      if (event.key.toLowerCase() === 'a') {
+      if (key === 'm') {
+        toggleNavigationMode()
+        return
+      }
+      if (!isWalkMode && key === 'a') {
         // Pop insert menu near cursor and cache the casted target point
         const container = containerRef.current
         if (container) {
@@ -1191,7 +1713,7 @@ const IfcViewer = ({
         setInsertTargetCoords(point ? { x: point.x, y: point.y, z: point.z } : null)
         setIsInsertMenuOpen(true)
       }
-      if (event.key.toLowerCase() === 'k') {
+      if (key === 'k') {
         const container = containerRef.current
         if (!container) return
         const rect = container.getBoundingClientRect()
@@ -1220,7 +1742,7 @@ const IfcViewer = ({
           y: Math.max(0, Math.min(lastPointerPosRef.current.y + 12, rect.height - 12))
         })
       }
-      if (event.key.toLowerCase() === 'g') {
+      if (key === 'g') {
         if (!selectedElement) return
         const viewer = viewerRef.current
         const currentPos = getSelectedWorldPosition()
@@ -1247,7 +1769,7 @@ const IfcViewer = ({
         setIsDragging(true)
         setDragAxisLock(null)
       }
-      if (isDragging && event.key.toLowerCase() === 'f') {
+      if (isDragging && key === 'f') {
         const viewer = viewerRef.current
         const currentPos = getSelectedWorldPosition()
         if (!viewer || !currentPos) return
@@ -1280,9 +1802,8 @@ const IfcViewer = ({
         }
         setDragAxisLock(null)
       }
-      if (isDragging && ['x', 'y', 'z'].includes(event.key.toLowerCase())) {
-        const key = event.key.toLowerCase() as 'x' | 'y' | 'z'
-        setDragAxisLock(key)
+      if (isDragging && (key === 'x' || key === 'y' || key === 'z')) {
+        setDragAxisLock(key as 'x' | 'y' | 'z')
       }
       if (event.key === 'Escape') {
         setIsInsertMenuOpen(false)
@@ -1296,6 +1817,17 @@ const IfcViewer = ({
         setIsShortcutsOpen(false)
         closePickMenu()
       }
+    }
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const walkMoveKey = getWalkMoveKey(event)
+      if (walkMoveKey) {
+        walkKeyStateRef.current[walkMoveKey] = false
+      }
+    }
+
+    const handleWindowBlur = () => {
+      walkKeyStateRef.current = { ...emptyWalkKeyState }
     }
 
     const handlePointerUp = () => {
@@ -1315,15 +1847,20 @@ const IfcViewer = ({
     }
 
     window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    window.addEventListener('blur', handleWindowBlur)
     window.addEventListener('pointerup', handlePointerUp)
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+      window.removeEventListener('blur', handleWindowBlur)
       window.removeEventListener('pointerup', handlePointerUp)
     }
   }, [
     closePickMenu,
     getSelectedWorldPosition,
     hoverCoords,
+    isWalkMode,
     isDragging,
     offsetInputs,
     pickCandidatesAt,
@@ -1333,14 +1870,12 @@ const IfcViewer = ({
     selectCustomCube,
     showShortcuts,
     syncSelectedCubePosition,
-    syncSelectedIfcPosition
+    syncSelectedIfcPosition,
+    toggleNavigationMode
   ])
 
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
-      const viewer = ensureViewer()
-      if (!viewer) return
-
       const token = ++loadTokenRef.current
 
       setStatus(message)
@@ -1350,16 +1885,30 @@ const IfcViewer = ({
       setSelectedNodeId(null)
       setActiveModelId(null)
       roomNumbersRef.current = new Map()
-      filterCacheRef.current.clear()
       offsetsRestoredRef.current = null
-      if (lastModelIdRef.current !== null) {
-        clearOffsetArtifacts(lastModelIdRef.current)
-      }
 
-      if (lastModelIdRef.current !== null) {
-        viewer.IFC.removeIfcModel(lastModelIdRef.current)
-        lastModelIdRef.current = null
+      // Hard reset viewer instance so the next load always starts from an empty scene.
+      const previousViewer = viewerRef.current
+      if (previousViewer) {
+        stopWalkMovementLoop()
+        const loadedModelIds = collectLoadedIfcModelIds(previousViewer, lastModelIdRef.current)
+        loadedModelIds.forEach((modelID) => {
+          clearOffsetArtifacts(modelID)
+          removeIfcModelSafely(previousViewer, modelID)
+        })
+        purgeIfcVisuals(previousViewer, loadedModelIds)
+        previousViewer.dispose()
+        viewerRef.current = null
       }
+      containerRef.current?.replaceChildren()
+      lastModelIdRef.current = null
+      const viewer = ensureViewer()
+      if (!viewer) {
+        setStatus(null)
+        setError('Viewer initialization failed.')
+        return
+      }
+      applyNavigationControls(viewer, navigationModeRef.current)
 
       try {
         const model = await loader(viewer)
@@ -1368,8 +1917,9 @@ const IfcViewer = ({
         }
 
         if (loadTokenRef.current !== token) {
-          if (model.modelID !== undefined) {
-            viewer.IFC.removeIfcModel(model.modelID)
+          if (model.modelID !== undefined && viewerRef.current === viewer) {
+            clearOffsetArtifacts(model.modelID)
+            removeIfcModelSafely(viewer, model.modelID)
           }
           return
         }
@@ -1399,6 +1949,7 @@ const IfcViewer = ({
     return () => {
       clearOffsetArtifacts()
       if (viewerRef.current) {
+        stopWalkMovementLoop()
         viewerRef.current.dispose()
         viewerRef.current = null
       }
@@ -1409,21 +1960,23 @@ const IfcViewer = ({
       offsetsRestoredRef.current = null
       roomNumbersRef.current = new Map()
     }
-  }, [clearOffsetArtifacts, ensureViewer, resetTree])
+  }, [clearOffsetArtifacts, ensureViewer, resetTree, stopWalkMovementLoop])
 
   useEffect(() => {
-    if (!defaultModelUrl) {
+    if (file) {
+      loadModel((viewer) => viewer.IFC.loadIfc(file, true), 'Loading IFC file...')
       return
     }
 
-    if (file) {
-      loadModel((viewer) => viewer.IFC.loadIfc(file, true), 'Loading IFC file...')
-    } else {
+    if (defaultModelUrl) {
       loadModel(
         (viewer) => viewer.IFC.loadIfcUrl(defaultModelUrl, true),
         'Loading sample model...'
       )
+      return
     }
+
+    setStatus(null)
   }, [defaultModelUrl, file, loadModel])
 
   return (
@@ -1456,6 +2009,14 @@ const IfcViewer = ({
               onSelect={handlePickMenuSelect}
               onCancel={closePickMenu}
             />
+            <button
+              type="button"
+              className={`navigation-toggle${showShortcuts ? ' navigation-toggle--with-shortcuts' : ''}${isWalkMode ? ' navigation-toggle--walk' : ''}`}
+              onClick={toggleNavigationMode}
+              title={isWalkMode ? 'Switch to free look mode' : 'Switch to walk mode'}
+            >
+              {isWalkMode ? 'Walk' : 'Free'}
+            </button>
             {status && <div className="viewer-overlay">{status}</div>}
             {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
             {showShortcuts && (
@@ -1484,13 +2045,10 @@ const IfcViewer = ({
                   tree={tree}
                   selectedNodeId={selectedNodeId}
                   onSelectNode={handleTreeSelect}
+                  rooms={roomOptions}
+                  onSelectRoom={handleRoomSelect}
                   onAddCube={handleTreeAddCube}
                   onUploadModel={handleTreeUploadModel}
-                  filters={filterOptions}
-                  filtersDisabled={activeModelId === null}
-                  hasActiveFilters={activeFilterDefs.length > 0}
-                  onToggleFilter={toggleFilter}
-                  onResetFilters={resetFilters}
                 />
               )}
               {showProperties && (

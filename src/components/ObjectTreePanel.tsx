@@ -6,13 +6,10 @@ type ObjectTreePanelProps = {
   tree: ObjectTree
   selectedNodeId: string | null
   onSelectNode: (nodeId: string) => void
+  rooms?: { nodeId: string; label: string; roomNumber?: string | null }[]
+  onSelectRoom?: (nodeId: string) => void
   onAddCube: (nodeId: string) => void
   onUploadModel: (nodeId: string) => void
-  filters?: { key: string; label: string; active: boolean }[]
-  hasActiveFilters?: boolean
-  filtersDisabled?: boolean
-  onToggleFilter?: (key: string) => void
-  onResetFilters?: () => void
 }
 
 type RenderNodeArgs = {
@@ -117,18 +114,15 @@ export const ObjectTreePanel = ({
   tree,
   selectedNodeId,
   onSelectNode,
+  rooms = [],
+  onSelectRoom,
   onAddCube,
-  onUploadModel,
-  filters = [],
-  hasActiveFilters = false,
-  filtersDisabled = false,
-  onToggleFilter,
-  onResetFilters
+  onUploadModel
 }: ObjectTreePanelProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [menuAnchor, setMenuAnchor] = useState<{ x: number; y: number } | null>(null)
   const [menuNodeId, setMenuNodeId] = useState<string | null>(null)
-  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [viewMode, setViewMode] = useState<'tree' | 'rooms'>('tree')
   const contentRef = useRef<HTMLDivElement | null>(null)
   const panelRef = useRef<HTMLElement | null>(null)
 
@@ -142,25 +136,10 @@ export const ObjectTreePanel = ({
   }, [tree.roots])
 
   useEffect(() => {
-    if (filtersDisabled) {
-      setFiltersOpen(false)
+    if (viewMode === 'rooms' && rooms.length === 0) {
+      setViewMode('tree')
     }
-  }, [filtersDisabled])
-
-  useEffect(() => {
-    if (!filtersOpen) return
-    const handlePointerDown = (event: PointerEvent) => {
-      const panel = panelRef.current
-      if (!panel) return
-      if (!panel.contains(event.target as Node)) {
-        setFiltersOpen(false)
-      }
-    }
-    window.addEventListener('pointerdown', handlePointerDown)
-    return () => {
-      window.removeEventListener('pointerdown', handlePointerDown)
-    }
-  }, [filtersOpen])
+  }, [rooms.length, viewMode])
 
   const { selectionPath, selectionTrail } = useMemo(() => {
     const ids: string[] = []
@@ -200,7 +179,9 @@ export const ObjectTreePanel = ({
     if (!selectedNodeId) return
     const container = contentRef.current
     if (!container) return
-    const target = container.querySelector(`[data-node-id="${selectedNodeId}"]`)
+    const target = container.querySelector(
+      `[data-node-id="${selectedNodeId}"], [data-room-node-id="${selectedNodeId}"]`
+    )
     if (target && 'scrollIntoView' in target) {
       ;(target as HTMLElement).scrollIntoView({ block: 'center' })
     }
@@ -219,6 +200,8 @@ export const ObjectTreePanel = ({
   }
 
   const hasContent = useMemo(() => tree.roots.length > 0, [tree.roots])
+  const hasRooms = useMemo(() => rooms.length > 0, [rooms])
+  const isRoomMode = viewMode === 'rooms'
 
   const handleOpenMenu = (nodeId: string, anchor: { x: number; y: number }) => {
     const panel = panelRef.current
@@ -249,63 +232,66 @@ export const ObjectTreePanel = ({
           {selectionTrail.length > 0 ? selectionTrail.join(' / ') : 'No selection'}
         </p>
       </header>
-      {filters.length > 0 && (
-        <div className="tree-panel__actions">
+      <div className="tree-panel__actions">
+        <div className="tree-panel__mode-switch" role="tablist" aria-label="Panel view">
           <button
             type="button"
             className={[
-              'tree-panel__filters-toggle',
-              hasActiveFilters ? 'tree-panel__filters-toggle--active' : ''
+              'tree-panel__mode-toggle',
+              !isRoomMode ? 'tree-panel__mode-toggle--active' : ''
             ]
               .filter(Boolean)
               .join(' ')}
-            onClick={() => setFiltersOpen((prev) => !prev)}
-            disabled={filtersDisabled}
+            onClick={() => setViewMode('tree')}
+            aria-pressed={!isRoomMode}
           >
-            Filters
-            {hasActiveFilters ? ` (${filters.filter((f) => f.active).length})` : ''}
+            Tree
           </button>
-          {filtersOpen && (
-            <div className="tree-panel__filters-dropdown" role="menu">
-              <div className="tree-panel__filters-header">
-                <h3>View filters</h3>
+          <button
+            type="button"
+            className={[
+              'tree-panel__mode-toggle',
+              isRoomMode ? 'tree-panel__mode-toggle--active' : ''
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            onClick={() => setViewMode('rooms')}
+            disabled={!hasRooms}
+            aria-pressed={isRoomMode}
+          >
+            Rooms{hasRooms ? ` (${rooms.length})` : ''}
+          </button>
+        </div>
+      </div>
+      <div ref={contentRef} className="tree-panel__content">
+        {isRoomMode ? (
+          hasRooms ? (
+            <div className="tree-panel__rooms">
+              {rooms.map((room) => (
                 <button
                   type="button"
-                  className="tree-panel__filters-reset"
-                  onClick={() => onResetFilters?.()}
-                  disabled={!hasActiveFilters || filtersDisabled}
+                  key={room.nodeId}
+                  className={[
+                    'tree-panel__room',
+                    selectedNodeId === room.nodeId ? 'tree-panel__room--selected' : ''
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  onClick={() => {
+                    ;(onSelectRoom ?? onSelectNode)(room.nodeId)
+                  }}
+                  data-room-node-id={room.nodeId}
+                  title={room.label}
                 >
-                  Reset
+                  <span className="tree-panel__room-label">{room.label}</span>
+                  {room.roomNumber && <span className="tree-panel__room-number">#{room.roomNumber}</span>}
                 </button>
-              </div>
-              <div className="tree-panel__filters-grid">
-                {filters.map((filter) => (
-                  <label
-                    key={filter.key}
-                    className={[
-                      'tree-panel__filter',
-                      filter.active ? 'tree-panel__filter--active' : ''
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={filter.active}
-                      onChange={() => onToggleFilter?.(filter.key)}
-                      disabled={filtersDisabled}
-                    />
-                    <span>{filter.label}</span>
-                  </label>
-                ))}
-              </div>
-              <p className="tree-panel__filters-hint">Show only selected IFC types.</p>
+              ))}
             </div>
-          )}
-        </div>
-      )}
-      <div ref={contentRef} className="tree-panel__content">
-        {hasContent ? (
+          ) : (
+            <p className="tree-panel__status">No rooms found in this model.</p>
+          )
+        ) : hasContent ? (
           tree.roots.map((rootId) => (
             <TreeNode
               key={rootId}

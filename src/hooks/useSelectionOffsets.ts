@@ -54,11 +54,11 @@ type UseSelectionOffsetsResult = {
   handleOffsetInputChange: (axis: keyof OffsetVector, value: number) => void
   applyOffsetToSelectedElement: () => void
   handleFieldChange: (key: string, value: string) => void
-  handlePick: () => Promise<void>
+  handlePick: (options?: { autoFocus?: boolean }) => Promise<void>
   selectById: (
     modelID: number,
     expressID: number,
-    options?: { highlightIds?: number[] }
+    options?: { highlightIds?: number[]; autoFocus?: boolean }
   ) => Promise<Point3D | null>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
@@ -190,7 +190,7 @@ export const useSelectionOffsets = (
     (modelID: number): OffsetVector => {
       // Prefer original mesh position; fall back to stored subset position
       const viewer = viewerRef.current
-      const mesh = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh
+      const mesh = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh as Mesh | undefined
       if (mesh) {
         mesh.updateMatrixWorld(true)
         const pos = new Vector3()
@@ -241,7 +241,7 @@ export const useSelectionOffsets = (
       if (cached) return cached
 
       const viewer = viewerRef.current
-      const model = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh
+      const model = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh as Mesh | undefined
       const expressAttr = model?.geometry.getAttribute('expressID')
       if (!expressAttr || !('array' in expressAttr)) {
         const empty = new Set<number>()
@@ -300,7 +300,7 @@ export const useSelectionOffsets = (
         scene,
         removePrevious: true,
         customID: customId
-      })
+      }) as Mesh | null
 
       if (!subset) {
         return null
@@ -369,14 +369,14 @@ export const useSelectionOffsets = (
       }
 
       const manager = viewer.IFC.loader.ifcManager
-      const model = manager.state?.models?.[modelID]?.mesh
+      const model = manager.state?.models?.[modelID]?.mesh as Mesh | undefined
       const subset = manager.createSubset({
         modelID,
         ids,
         scene: viewer.context.getScene(),
         removePrevious: true,
         customID: BASE_SUBSET_ID
-      })
+      }) as Mesh | null
 
       if (!subset || !model) {
         return null
@@ -442,7 +442,7 @@ export const useSelectionOffsets = (
           baseSubsetsRef.current.delete(id)
         }
 
-        const model = manager.state?.models?.[id]?.mesh
+        const model = manager.state?.models?.[id]?.mesh as Mesh | undefined
         if (model) {
           model.visible = true
           registerPickable(viewer, model, id)
@@ -467,7 +467,7 @@ export const useSelectionOffsets = (
       const scene = viewer.context.getScene()
 
       const baseSubset = ensureBaseSubset(modelID)
-      const modelMesh = manager.state?.models?.[modelID]?.mesh
+      const modelMesh = manager.state?.models?.[modelID]?.mesh as Mesh | undefined
       const filterSubset = filterSubsetsRef.current.get(modelID)
 
       if (!allowedIds) {
@@ -544,7 +544,7 @@ export const useSelectionOffsets = (
         scene,
         removePrevious: true,
         customID: getFilterSubsetId(modelID)
-      })
+      }) as Mesh | null
       if (subset) {
         if (baseSubset) {
           subset.matrix.copy(baseSubset.matrix)
@@ -916,7 +916,7 @@ export const useSelectionOffsets = (
           scene,
           removePrevious: false,
           customID: BASE_SUBSET_ID
-        })
+        }) as Mesh | null
         if (restored && baseSubset) {
           restored.matrix.copy(baseSubset.matrix)
           restored.matrixAutoUpdate = false
@@ -937,7 +937,7 @@ export const useSelectionOffsets = (
         scene,
         removePrevious: true,
         customID: `${MOVED_SUBSET_PREFIX}${key}`
-      })
+      }) as Mesh | null
 
       if (!moved) {
         return
@@ -1016,13 +1016,14 @@ export const useSelectionOffsets = (
     moveSelectedTo(offsetInputs)
   }, [moveSelectedTo, offsetInputs])
 
-  const handlePick = useCallback(async () => {
+  const handlePick = useCallback(async (options?: { autoFocus?: boolean }) => {
     const viewer = viewerRef.current
     if (!viewer) {
       return
     }
 
     try {
+      const shouldAutoFocus = options?.autoFocus ?? true
       const camera = viewer.context.getCamera()
       const pointer = viewer.context.mouse.position
       const raycaster = new Raycaster()
@@ -1051,14 +1052,14 @@ export const useSelectionOffsets = (
 
       setCubeHighlight(null)
 
-      const picked = await viewer.IFC.selector.pickIfcItem(true)
+      const picked = await viewer.IFC.selector.pickIfcItem(shouldAutoFocus)
       if (!picked || picked.id === undefined || picked.modelID === undefined) {
         viewer.IFC.selector.unpickIfcItems()
         resetSelection()
         return
       }
 
-      const focusPoint = getCameraFocusPoint()
+      const focusPoint = shouldAutoFocus ? getCameraFocusPoint() : null
       await fetchProperties(picked.modelID, picked.id, focusPoint)
     } catch (err) {
       console.error('Failed to pick IFC item', err)
@@ -1070,14 +1071,15 @@ export const useSelectionOffsets = (
     async (
       modelID: number,
       expressID: number,
-      options?: { highlightIds?: number[] }
+      options?: { highlightIds?: number[]; autoFocus?: boolean }
     ) => {
       const viewer = viewerRef.current
       if (!viewer) return null
       try {
         const isRenderable = hasRenderableExpressId(modelID, expressID)
+        const shouldAutoFocus = options?.autoFocus ?? true
         if (isRenderable) {
-          await viewer.IFC.selector.pickIfcItemsByID(modelID, [expressID], true)
+          await viewer.IFC.selector.pickIfcItemsByID(modelID, [expressID], shouldAutoFocus)
         } else if (options?.highlightIds?.length) {
           const renderableIds = options.highlightIds.filter((id) =>
             hasRenderableExpressId(modelID, id)
@@ -1092,9 +1094,10 @@ export const useSelectionOffsets = (
         }
         const focusPoint = isRenderable ? getCameraFocusPoint() : null
         await fetchProperties(modelID, expressID, focusPoint)
-        const resolvedFocus = focusPoint ?? getElementWorldPosition(modelID, expressID)
-        const selectionPoint = resolvedFocus
-          ? resolvedFocus
+        const elementCenter = getElementWorldPosition(modelID, expressID)
+        const resolvedPoint = shouldAutoFocus ? (focusPoint ?? elementCenter) : (elementCenter ?? focusPoint)
+        const selectionPoint = resolvedPoint
+          ? resolvedPoint
           : (() => {
               const fallbackOffset =
                 elementOffsetsRef.current.get(getElementKey(modelID, expressID)) ??
@@ -1102,9 +1105,8 @@ export const useSelectionOffsets = (
               return { x: fallbackOffset.dx, y: fallbackOffset.dy, z: fallbackOffset.dz }
             })()
         if (isRenderable) {
-          const center = getElementWorldPosition(modelID, expressID)
-          if (ENABLE_MANUAL_FOCUS_ON_SELECT && center) {
-            focusOnPoint(center)
+          if (ENABLE_MANUAL_FOCUS_ON_SELECT && elementCenter) {
+            focusOnPoint(elementCenter)
           }
         }
         return selectionPoint
