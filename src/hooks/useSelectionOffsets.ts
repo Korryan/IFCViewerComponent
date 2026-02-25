@@ -45,6 +45,10 @@ type SpawnedModelInfo = {
   position: Point3D
 }
 
+type SelectionTypeFilterOptions = {
+  allowedIfcTypes?: string[]
+}
+
 type UseSelectionOffsetsResult = {
   selectedElement: SelectedElement | null
   offsetInputs: OffsetVector
@@ -54,11 +58,11 @@ type UseSelectionOffsetsResult = {
   handleOffsetInputChange: (axis: keyof OffsetVector, value: number) => void
   applyOffsetToSelectedElement: () => void
   handleFieldChange: (key: string, value: string) => void
-  handlePick: (options?: { autoFocus?: boolean }) => Promise<void>
+  handlePick: (options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }) => Promise<void>
   selectById: (
     modelID: number,
     expressID: number,
-    options?: { highlightIds?: number[]; autoFocus?: boolean }
+    options?: { highlightIds?: number[]; autoFocus?: boolean; allowedIfcTypes?: string[] }
   ) => Promise<Point3D | null>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
@@ -110,6 +114,64 @@ export const useSelectionOffsets = (
   const [propertyFields, setPropertyFields] = useState<PropertyField[]>([])
   const [propertyError, setPropertyError] = useState<string | null>(null)
   const [isFetchingProperties, setIsFetchingProperties] = useState(false)
+  const normalizeIfcTypeName = useCallback((value: unknown): string | null => {
+    if (typeof value !== 'string') return null
+    const trimmed = value.trim()
+    return trimmed ? trimmed.toUpperCase() : null
+  }, [])
+
+  const resolveIfcTypeName = useCallback(
+    async (viewer: IfcViewerAPI, modelID: number, expressID: number): Promise<string | null> => {
+      try {
+        const manager = viewer.IFC?.loader?.ifcManager as
+          | { getIfcType?: (idModel: number, idExpress: number) => string | undefined }
+          | undefined
+        const directType = manager?.getIfcType?.(modelID, expressID)
+        if (directType) {
+          return normalizeIfcTypeName(directType)
+        }
+
+        const props = await viewer.IFC.getProperties(modelID, expressID, false, false)
+        return normalizeIfcTypeName(
+          typeof props?.ifcClass === 'string'
+            ? props.ifcClass
+            : typeof props?.type === 'string'
+              ? props.type
+              : null
+        )
+      } catch (err) {
+        console.warn('Failed to resolve IFC type for selection filter', expressID, err)
+        return null
+      }
+    },
+    [normalizeIfcTypeName]
+  )
+
+  const isIfcSelectionAllowed = useCallback(
+    async (
+      viewer: IfcViewerAPI,
+      modelID: number,
+      expressID: number,
+      options?: SelectionTypeFilterOptions
+    ): Promise<boolean> => {
+      const allowedIfcTypes = options?.allowedIfcTypes
+      if (!allowedIfcTypes || allowedIfcTypes.length === 0) {
+        return true
+      }
+      const normalizedAllowed = new Set(
+        allowedIfcTypes
+          .map((typeName) => normalizeIfcTypeName(typeName))
+          .filter((typeName): typeName is string => Boolean(typeName))
+      )
+      if (normalizedAllowed.size === 0) {
+        return true
+      }
+      const resolvedType = await resolveIfcTypeName(viewer, modelID, expressID)
+      return Boolean(resolvedType && normalizedAllowed.has(resolvedType))
+    },
+    [normalizeIfcTypeName, resolveIfcTypeName]
+  )
+
   const focusOnPoint = useCallback(
     (point: Point3D | null) => {
       const viewer = viewerRef.current
@@ -1016,7 +1078,7 @@ export const useSelectionOffsets = (
     moveSelectedTo(offsetInputs)
   }, [moveSelectedTo, offsetInputs])
 
-  const handlePick = useCallback(async (options?: { autoFocus?: boolean }) => {
+  const handlePick = useCallback(async (options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }) => {
     const viewer = viewerRef.current
     if (!viewer) {
       return
@@ -1059,23 +1121,45 @@ export const useSelectionOffsets = (
         return
       }
 
+      const isAllowed = await isIfcSelectionAllowed(viewer, picked.modelID, picked.id, options)
+      if (!isAllowed) {
+        viewer.IFC.selector.unpickIfcItems()
+        resetSelection()
+        return
+      }
+
       const focusPoint = shouldAutoFocus ? getCameraFocusPoint() : null
       await fetchProperties(picked.modelID, picked.id, focusPoint)
     } catch (err) {
       console.error('Failed to pick IFC item', err)
       resetSelection()
     }
-  }, [fetchProperties, getCameraFocusPoint, getExpressIdFromHit, resetSelection, setCubeHighlight, viewerRef])
+  }, [
+    fetchProperties,
+    getCameraFocusPoint,
+    getExpressIdFromHit,
+    isIfcSelectionAllowed,
+    resetSelection,
+    setCubeHighlight,
+    viewerRef
+  ])
 
   const selectById = useCallback(
     async (
       modelID: number,
       expressID: number,
-      options?: { highlightIds?: number[]; autoFocus?: boolean }
+      options?: { highlightIds?: number[]; autoFocus?: boolean; allowedIfcTypes?: string[] }
     ) => {
       const viewer = viewerRef.current
       if (!viewer) return null
       try {
+        const isAllowed = await isIfcSelectionAllowed(viewer, modelID, expressID, options)
+        if (!isAllowed) {
+          viewer.IFC.selector.unpickIfcItems()
+          resetSelection()
+          return null
+        }
+
         const isRenderable = hasRenderableExpressId(modelID, expressID)
         const shouldAutoFocus = options?.autoFocus ?? true
         if (isRenderable) {
@@ -1123,6 +1207,8 @@ export const useSelectionOffsets = (
       getElementWorldPosition,
       getModelBaseOffset,
       hasRenderableExpressId,
+      isIfcSelectionAllowed,
+      resetSelection,
       viewerRef
     ]
   )

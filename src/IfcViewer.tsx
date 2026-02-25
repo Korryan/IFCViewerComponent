@@ -45,6 +45,16 @@ const POSITION_EPSILON = 1e-4
 const WALK_MOVE_SPEED = 2.8
 const WALK_LOOK_SENSITIVITY = 0.0025
 const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
+// Walk mode keeps scene interaction narrow so navigation stays practical indoors.
+const WALK_ALLOWED_IFC_SELECTION_TYPES = [
+  'IFCWALL',
+  'IFCWALLSTANDARDCASE',
+  'IFCCURTAINWALL',
+  'IFCWINDOW',
+  'IFCFURNISHINGELEMENT',
+  'IFCFURNITURE',
+  'IFCSYSTEMFURNITUREELEMENT'
+]
 // Common property names used by authoring tools for room numbers (Pset text values).
 const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
@@ -432,6 +442,7 @@ const IfcViewer = ({
   const walkHeadingRef = useRef<Vector3>(new Vector3(0, 0, -1))
   const walkFrameRef = useRef<number | null>(null)
   const walkLastTimestampRef = useRef<number | null>(null)
+  const walkMoveActiveRef = useRef(false)
   const walkLookActiveRef = useRef(false)
   const walkLookPointerIdRef = useRef<number | null>(null)
   const walkLookLastPointerRef = useRef<{ x: number; y: number } | null>(null)
@@ -521,6 +532,15 @@ const IfcViewer = ({
     navigationModeRef.current = navigationMode
   }, [navigationMode])
 
+  const setWalkOverlaySuppressed = useCallback((suppressed: boolean) => {
+    const viewer = viewerRef.current
+    const postProduction = viewer?.context?.renderer?.postProduction as
+      | { active?: boolean; visible?: boolean }
+      | undefined
+    if (!postProduction?.active) return
+    postProduction.visible = !suppressed
+  }, [])
+
   const stopWalkMovementLoop = useCallback(() => {
     if (walkFrameRef.current !== null) {
       cancelAnimationFrame(walkFrameRef.current)
@@ -529,10 +549,12 @@ const IfcViewer = ({
     walkLastTimestampRef.current = null
     walkKeyStateRef.current = { ...emptyWalkKeyState }
     walkHeadingRef.current.set(0, 0, -1)
+    walkMoveActiveRef.current = false
     walkLookActiveRef.current = false
     walkLookPointerIdRef.current = null
     walkLookLastPointerRef.current = null
-  }, [])
+    setWalkOverlaySuppressed(false)
+  }, [setWalkOverlaySuppressed])
 
   const updateWalkLookByDelta = useCallback((deltaX: number, deltaY: number) => {
     const viewer = viewerRef.current
@@ -725,10 +747,12 @@ const IfcViewer = ({
       if (candidate.kind === 'custom') {
         selectCustomCube(candidate.expressID)
       } else {
-        selectById(candidate.modelID, candidate.expressID)
+        void selectById(candidate.modelID, candidate.expressID, {
+          allowedIfcTypes: isWalkMode ? WALK_ALLOWED_IFC_SELECTION_TYPES : undefined
+        })
       }
     },
-    [closePickMenu, pickMenuLookup, selectById, selectCustomCube]
+    [closePickMenu, isWalkMode, pickMenuLookup, selectById, selectCustomCube]
   )
 
   useEffect(() => {
@@ -1379,13 +1403,29 @@ const IfcViewer = ({
 
   const handleRoomSelect = useCallback(
     async (nodeId: string) => {
-      setSelectedNodeId(nodeId)
-      const target = await resolveNodeInsertTarget(nodeId)
+      if (isWalkMode) {
+        setSelectedNodeId(null)
+      } else {
+        setSelectedNodeId(nodeId)
+      }
+      const target = await resolveNodeInsertTarget(nodeId, { autoFocus: true })
       if (!moveCameraToPoint(target)) {
         teleportCameraToPoint(target)
       }
+      if (isWalkMode) {
+        clearIfcHighlight()
+        resetSelection()
+        setSelectedNodeId(null)
+      }
     },
-    [moveCameraToPoint, resolveNodeInsertTarget, teleportCameraToPoint]
+    [
+      clearIfcHighlight,
+      isWalkMode,
+      moveCameraToPoint,
+      resetSelection,
+      resolveNodeInsertTarget,
+      teleportCameraToPoint
+    ]
   )
 
   const handleTreeAddCube = useCallback(
@@ -1456,8 +1496,14 @@ const IfcViewer = ({
       const keys = walkKeyStateRef.current
       const forwardInput = (keys.arrowup ? 1 : 0) - (keys.arrowdown ? 1 : 0)
       const strafeInput = (keys.arrowright ? 1 : 0) - (keys.arrowleft ? 1 : 0)
+      const isMoving = forwardInput !== 0 || strafeInput !== 0
 
-      if (deltaTime > 0 && (forwardInput !== 0 || strafeInput !== 0)) {
+      if (walkMoveActiveRef.current !== isMoving) {
+        walkMoveActiveRef.current = isMoving
+        setWalkOverlaySuppressed(isMoving || walkLookActiveRef.current)
+      }
+
+      if (deltaTime > 0 && isMoving) {
         controls.getPosition(position)
         controls.getTarget(target)
 
@@ -1498,7 +1544,7 @@ const IfcViewer = ({
     return () => {
       stopWalkMovementLoop()
     }
-  }, [isWalkMode, stopWalkMovementLoop])
+  }, [isWalkMode, setWalkOverlaySuppressed, stopWalkMovementLoop])
 
   useEffect(() => {
     const container = containerRef.current
@@ -1509,6 +1555,7 @@ const IfcViewer = ({
       walkLookActiveRef.current = true
       walkLookPointerIdRef.current = event.pointerId
       walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      setWalkOverlaySuppressed(true)
       try {
         container.setPointerCapture(event.pointerId)
       } catch {
@@ -1541,6 +1588,7 @@ const IfcViewer = ({
       walkLookActiveRef.current = false
       walkLookPointerIdRef.current = null
       walkLookLastPointerRef.current = null
+      setWalkOverlaySuppressed(walkMoveActiveRef.current)
       if (pointerId !== null) {
         try {
           container.releasePointerCapture(pointerId)
@@ -1572,7 +1620,7 @@ const IfcViewer = ({
       window.removeEventListener('blur', handleWindowBlur)
       stopLook()
     }
-  }, [isWalkMode, updateWalkLookByDelta])
+  }, [isWalkMode, setWalkOverlaySuppressed, updateWalkLookByDelta])
 
   useEffect(() => {
     const container = containerRef.current
@@ -1580,7 +1628,10 @@ const IfcViewer = ({
 
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return
-      handlePick({ autoFocus: !isWalkMode })
+      void handlePick({
+        autoFocus: !isWalkMode,
+        allowedIfcTypes: isWalkMode ? WALK_ALLOWED_IFC_SELECTION_TYPES : undefined
+      })
     }
 
     container.addEventListener('pointerdown', handlePointerDown)
