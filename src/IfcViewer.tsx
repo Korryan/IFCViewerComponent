@@ -534,11 +534,27 @@ const IfcViewer = ({
 
   const setWalkOverlaySuppressed = useCallback((suppressed: boolean) => {
     const viewer = viewerRef.current
+    const camera = viewer?.context?.getCamera?.()
     const postProduction = viewer?.context?.renderer?.postProduction as
       | { active?: boolean; visible?: boolean }
       | undefined
-    if (!postProduction?.active) return
-    postProduction.visible = !suppressed
+    if (!postProduction) return
+
+    // Disable postproduction entirely while moving/look-around in walk mode.
+    // Using `visible` alone can be overridden by internal onSleep/onControl handlers, causing laggy outlines.
+    if (suppressed) {
+      if (postProduction.active) {
+        postProduction.visible = false
+        postProduction.active = false
+      }
+      return
+    }
+
+    // Re-enable and force one visible refresh; web-ifc-viewer sets `visible` before `active`
+    // inside the `active` setter, so toggling only `active = true` can leave a stale outline snapshot.
+    camera?.updateMatrixWorld?.(true)
+    postProduction.active = true
+    postProduction.visible = true
   }, [])
 
   const stopWalkMovementLoop = useCallback(() => {
