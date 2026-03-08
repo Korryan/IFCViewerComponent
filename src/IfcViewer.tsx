@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Plane, Raycaster, Vector3 } from 'three'
+import { FrontSide, Matrix4, Plane, Raycaster, Vector3 } from 'three'
 import CameraControls from 'camera-controls'
 import { IfcViewerAPI } from 'web-ifc-viewer'
 import type {
@@ -39,12 +39,38 @@ type IfcViewerProps = {
 
 type Loader = (viewer: IfcViewerAPI) => Promise<any>
 
+type IfcLoaderManagerLike = {
+  applyWebIfcConfig?: (settings: { COORDINATE_TO_ORIGIN?: boolean; USE_FAST_BOOLS?: boolean }) => Promise<void>
+  ifcAPI?: {
+    GetCoordinationMatrix?: (modelID: number) => Promise<number[]> | number[]
+  }
+  setupCoordinationMatrix?: (matrix: Matrix4) => void
+}
+
+type IfcLoadFacadeLike = {
+  loadIfc?: (file: File, fitToFrame?: boolean) => Promise<any>
+  loadIfcUrl?: (url: string, fitToFrame?: boolean) => Promise<any>
+  addIfcModel?: (mesh: any) => void
+  loader?: {
+    loadAsync?: (url: string, onProgress?: (event: any) => Promise<void> | void) => Promise<any>
+    ifcManager?: IfcLoaderManagerLike
+  }
+  context?: {
+    items?: { ifcModels?: unknown[] }
+    fitToFrame?: () => void
+  }
+}
+
 const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
 const POSITION_EPSILON = 1e-4
 const WALK_MOVE_SPEED = 2.8
 const WALK_LOOK_SENSITIVITY = 0.0025
 const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
+const IFC_LOADER_SETTINGS = {
+  COORDINATE_TO_ORIGIN: true,
+  USE_FAST_BOOLS: false
+}
 // Walk mode keeps scene interaction narrow so navigation stays practical indoors.
 const WALK_ALLOWED_IFC_SELECTION_TYPES = [
   'IFCWALL',
@@ -55,6 +81,10 @@ const WALK_ALLOWED_IFC_SELECTION_TYPES = [
   'IFCFURNITURE',
   'IFCSYSTEMFURNITUREELEMENT'
 ]
+const DEPTH_BIAS_IFC_TYPES = new Set([
+  'IFCDOOR',
+  'IFCWINDOW'
+])
 // Common property names used by authoring tools for room numbers (Pset text values).
 const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
@@ -76,7 +106,29 @@ const SHORTCUTS = [
 type IfcMeshLike = {
   modelID?: number
   geometry?: { dispose?: () => void }
-  material?: { dispose?: () => void } | Array<{ dispose?: () => void }>
+  material?:
+    | {
+        dispose?: () => void
+        side?: number
+        depthTest?: boolean
+        depthWrite?: boolean
+        transparent?: boolean
+        polygonOffset?: boolean
+        polygonOffsetFactor?: number
+        polygonOffsetUnits?: number
+        needsUpdate?: boolean
+      }
+    | Array<{
+        dispose?: () => void
+        side?: number
+        depthTest?: boolean
+        depthWrite?: boolean
+        transparent?: boolean
+        polygonOffset?: boolean
+        polygonOffsetFactor?: number
+        polygonOffsetUnits?: number
+        needsUpdate?: boolean
+      }>
 }
 
 type IfcSceneLike = {
@@ -236,6 +288,60 @@ const purgeIfcVisuals = (viewer: IfcViewerAPI, modelIDsToRemove: number[]) => {
 
   purgeCollection(viewer.context.items.ifcModels as unknown[])
   purgeCollection(viewer.context.items.pickableIfcModels as unknown[])
+}
+
+const tuneIfcMeshMaterial = (
+  material:
+    | {
+        side?: number
+        depthTest?: boolean
+        depthWrite?: boolean
+        transparent?: boolean
+        polygonOffset?: boolean
+        polygonOffsetFactor?: number
+        polygonOffsetUnits?: number
+        needsUpdate?: boolean
+      }
+    | null
+    | undefined
+) => {
+  if (!material) return
+  material.side = FrontSide
+  material.depthTest = true
+  material.depthWrite = true
+  if (material.transparent) {
+    material.polygonOffset = true
+    material.polygonOffsetFactor = -0.5
+    material.polygonOffsetUnits = -0.5
+  } else {
+    material.polygonOffset = false
+    material.polygonOffsetFactor = 0
+    material.polygonOffsetUnits = 0
+  }
+  material.needsUpdate = true
+}
+
+const tuneIfcModelMaterials = (model: unknown) => {
+  if (!model) return
+  const stack: Array<
+    IfcMeshLike & {
+      children?: unknown[]
+    }
+  > = [model as IfcMeshLike & { children?: unknown[] }]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    if (!current) continue
+    if (Array.isArray(current.material)) {
+      current.material.forEach((material) => tuneIfcMeshMaterial(material))
+    } else {
+      tuneIfcMeshMaterial(current.material)
+    }
+    if (Array.isArray(current.children) && current.children.length > 0) {
+      current.children.forEach((child) =>
+        stack.push(child as IfcMeshLike & { children?: unknown[] })
+      )
+    }
+  }
 }
 
 const applyNavigationControls = (viewer: IfcViewerAPI, mode: NavigationMode) => {
@@ -473,7 +579,8 @@ const IfcViewer = ({
     removeCustomCube,
     spawnUploadedModel,
     applyIfcElementOffset,
-    applyVisibilityFilter
+    applyVisibilityFilter,
+    configureDepthBiasTargets
   } = useSelectionOffsets(viewerRef)
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
@@ -490,6 +597,18 @@ const IfcViewer = ({
     })
     return ids
   }, [metadataEntries])
+  const depthBiasTargetIds = useMemo(() => {
+    if (activeModelId === null) return []
+    const ids = new Set<number>()
+    Object.values(tree.nodes).forEach((node) => {
+      if (node.nodeType !== 'ifc') return
+      if (node.modelID !== activeModelId) return
+      if (node.expressID === null) return
+      if (!DEPTH_BIAS_IFC_TYPES.has(node.type.toUpperCase())) return
+      ids.add(node.expressID)
+    })
+    return Array.from(ids)
+  }, [activeModelId, tree.nodes])
   const roomOptions = useMemo<RoomListEntry[]>(() => {
     const roomNumbers = roomNumbersRef.current
     return Object.values(tree.nodes)
@@ -532,30 +651,60 @@ const IfcViewer = ({
     navigationModeRef.current = navigationMode
   }, [navigationMode])
 
-  const setWalkOverlaySuppressed = useCallback((suppressed: boolean) => {
-    const viewer = viewerRef.current
-    const camera = viewer?.context?.getCamera?.()
-    const postProduction = viewer?.context?.renderer?.postProduction as
-      | { active?: boolean; visible?: boolean }
-      | undefined
-    if (!postProduction) return
-
-    // Disable postproduction entirely while moving/look-around in walk mode.
-    // Using `visible` alone can be overridden by internal onSleep/onControl handlers, causing laggy outlines.
-    if (suppressed) {
-      if (postProduction.active) {
-        postProduction.visible = false
-        postProduction.active = false
-      }
-      return
-    }
-
-    // Re-enable and force one visible refresh; web-ifc-viewer sets `visible` before `active`
-    // inside the `active` setter, so toggling only `active = true` can leave a stale outline snapshot.
-    camera?.updateMatrixWorld?.(true)
-    postProduction.active = true
-    postProduction.visible = true
+  const setWalkOverlaySuppressed = useCallback((_suppressed: boolean) => {
+    // Intentionally no-op for debugging: avoid any custom overlay movement logic.
   }, [])
+
+  const loadIfcWithCustomSettings = useCallback(
+    async (viewer: IfcViewerAPI, source: { file?: File; url?: string }, fitToFrame: boolean) => {
+      const ifc = viewer.IFC as unknown as IfcLoadFacadeLike
+      const loader = ifc.loader
+      const ifcManager = loader?.ifcManager
+
+      if (!loader?.loadAsync || !ifcManager?.applyWebIfcConfig || typeof ifc.addIfcModel !== 'function') {
+        if (source.file && typeof ifc.loadIfc === 'function') {
+          return ifc.loadIfc(source.file, fitToFrame)
+        }
+        if (source.url && typeof ifc.loadIfcUrl === 'function') {
+          return ifc.loadIfcUrl(source.url, fitToFrame)
+        }
+        return null
+      }
+
+      const firstModel = Boolean(ifc.context?.items?.ifcModels?.length === 0)
+      await ifcManager.applyWebIfcConfig({
+        COORDINATE_TO_ORIGIN: firstModel,
+        USE_FAST_BOOLS: false
+      })
+
+      let objectUrl: string | null = null
+      const resolvedUrl = source.file ? ((objectUrl = URL.createObjectURL(source.file)), objectUrl) : source.url
+      if (!resolvedUrl) return null
+
+      try {
+        const model = await loader.loadAsync(resolvedUrl)
+        if (!model) return null
+        ifc.addIfcModel(model)
+
+        if (firstModel && typeof model.modelID === 'number') {
+          const matrixArr = await ifcManager.ifcAPI?.GetCoordinationMatrix?.(model.modelID)
+          if (Array.isArray(matrixArr) && matrixArr.length === 16) {
+            ifcManager.setupCoordinationMatrix?.(new Matrix4().fromArray(matrixArr))
+          }
+        }
+
+        if (fitToFrame) {
+          ifc.context?.fitToFrame?.()
+        }
+        return model
+      } finally {
+        if (objectUrl) {
+          URL.revokeObjectURL(objectUrl)
+        }
+      }
+    },
+    []
+  )
 
   const stopWalkMovementLoop = useCallback(() => {
     if (walkFrameRef.current !== null) {
@@ -1271,6 +1420,11 @@ const IfcViewer = ({
     }
   }, [activeModelId, applyVisibilityFilter, deletedIfcIds, hideIfcElement])
 
+  useEffect(() => {
+    if (activeModelId === null) return
+    configureDepthBiasTargets(activeModelId, depthBiasTargetIds)
+  }, [activeModelId, configureDepthBiasTargets, depthBiasTargetIds])
+
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
     const viewer = viewerRef.current
@@ -1978,10 +2132,12 @@ const IfcViewer = ({
       applyNavigationControls(viewer, navigationModeRef.current)
 
       try {
+        await viewer.IFC.applyWebIfcConfig(IFC_LOADER_SETTINGS)
         const model = await loader(viewer)
         if (!model) {
           throw new Error('IFC model could not be loaded.')
         }
+        tuneIfcModelMaterials(model)
 
         if (loadTokenRef.current !== token) {
           if (model.modelID !== undefined && viewerRef.current === viewer) {
@@ -2007,7 +2163,13 @@ const IfcViewer = ({
         resetTree()
       }
     },
-    [clearOffsetArtifacts, ensureViewer, rebuildTreeForModel, resetSelection, resetTree]
+    [
+      clearOffsetArtifacts,
+      ensureViewer,
+      rebuildTreeForModel,
+      resetSelection,
+      resetTree
+    ]
   )
 
   useEffect(() => {
@@ -2031,20 +2193,20 @@ const IfcViewer = ({
 
   useEffect(() => {
     if (file) {
-      loadModel((viewer) => viewer.IFC.loadIfc(file, true), 'Loading IFC file...')
+      loadModel((viewer) => loadIfcWithCustomSettings(viewer, { file }, true), 'Loading IFC file...')
       return
     }
 
     if (defaultModelUrl) {
       loadModel(
-        (viewer) => viewer.IFC.loadIfcUrl(defaultModelUrl, true),
+        (viewer) => loadIfcWithCustomSettings(viewer, { url: defaultModelUrl }, true),
         'Loading sample model...'
       )
       return
     }
 
     setStatus(null)
-  }, [defaultModelUrl, file, loadModel])
+  }, [defaultModelUrl, file, loadIfcWithCustomSettings, loadModel])
 
   return (
     <>

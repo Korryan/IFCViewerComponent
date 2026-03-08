@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ObjectTree } from '../ifcViewerTypes'
 import { InsertMenu } from './InsertMenu'
+import { localizeIfcType } from '../utils/ifcTypeLocalization'
 
 type ObjectTreePanelProps = {
   tree: ObjectTree
@@ -68,7 +69,7 @@ const TreeNode = ({
           title={node.label}
           data-node-id={nodeId}
         >
-          <span className="tree-node__type">{node.type}</span>
+          <span className="tree-node__type">{localizeIfcType(node.type)}</span>
           <span className="tree-node__name">{node.label}</span>
         </button>
         <button

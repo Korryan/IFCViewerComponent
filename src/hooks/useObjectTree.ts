@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import type { ObjectTree, ObjectTreeNode } from '../ifcViewerTypes'
+import { localizeIfcType } from '../utils/ifcTypeLocalization'
 
 type SpatialNode = {
   expressID?: number
@@ -12,14 +13,14 @@ type SpatialNode = {
 const emptyTree: ObjectTree = { nodes: {}, roots: [] }
 const CUSTOM_ROOT_PREFIX = 'custom-root-'
 const CUSTOM_NODE_PREFIX = 'custom-node-'
-const CUSTOM_ROOT_LABEL = 'Custom objects'
+const CUSTOM_ROOT_LABEL = 'Vlastni objekty'
 
 const buildLabel = (node: SpatialNode): string => {
   if (node.Name?.value) return String(node.Name.value)
   if (node.name) return node.name
-  if (node.type && node.expressID !== undefined) return `${node.type} #${node.expressID}`
-  if (node.type) return node.type
-  return 'IFC Item'
+  if (node.type && node.expressID !== undefined) return `${localizeIfcType(node.type)} #${node.expressID}`
+  if (node.type) return localizeIfcType(node.type)
+  return 'IFC prvek'
 }
 
 const normalizeIfcType = (type?: string): string => (type ?? '').toUpperCase()
