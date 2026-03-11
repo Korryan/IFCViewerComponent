@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { FrontSide, Matrix4, Plane, Raycaster, Vector3 } from 'three'
 import CameraControls from 'camera-controls'
-import { IfcViewerAPI } from 'web-ifc-viewer'
+import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
 import type {
   FurnitureItem,
   HistoryEntry,
@@ -81,10 +81,6 @@ const WALK_ALLOWED_IFC_SELECTION_TYPES = [
   'IFCFURNITURE',
   'IFCSYSTEMFURNITUREELEMENT'
 ]
-const DEPTH_BIAS_IFC_TYPES = new Set([
-  'IFCDOOR',
-  'IFCWINDOW'
-])
 // Common property names used by authoring tools for room numbers (Pset text values).
 const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
@@ -579,8 +575,7 @@ const IfcViewer = ({
     removeCustomCube,
     spawnUploadedModel,
     applyIfcElementOffset,
-    applyVisibilityFilter,
-    configureDepthBiasTargets
+    applyVisibilityFilter
   } = useSelectionOffsets(viewerRef)
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
@@ -597,18 +592,6 @@ const IfcViewer = ({
     })
     return ids
   }, [metadataEntries])
-  const depthBiasTargetIds = useMemo(() => {
-    if (activeModelId === null) return []
-    const ids = new Set<number>()
-    Object.values(tree.nodes).forEach((node) => {
-      if (node.nodeType !== 'ifc') return
-      if (node.modelID !== activeModelId) return
-      if (node.expressID === null) return
-      if (!DEPTH_BIAS_IFC_TYPES.has(node.type.toUpperCase())) return
-      ids.add(node.expressID)
-    })
-    return Array.from(ids)
-  }, [activeModelId, tree.nodes])
   const roomOptions = useMemo<RoomListEntry[]>(() => {
     const roomNumbers = roomNumbersRef.current
     return Object.values(tree.nodes)
@@ -1420,11 +1403,6 @@ const IfcViewer = ({
     }
   }, [activeModelId, applyVisibilityFilter, deletedIfcIds, hideIfcElement])
 
-  useEffect(() => {
-    if (activeModelId === null) return
-    configureDepthBiasTargets(activeModelId, depthBiasTargetIds)
-  }, [activeModelId, configureDepthBiasTargets, depthBiasTargetIds])
-
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
     const viewer = viewerRef.current
@@ -1505,29 +1483,6 @@ const IfcViewer = ({
     [resetTree, setIfcTree]
   )
 
-  const collectDescendantExpressIds = useCallback(
-    (nodeId: string) => {
-      const root = tree.nodes[nodeId]
-      if (!root) return []
-      const stack = [...root.children]
-      const ids = new Set<number>()
-      while (stack.length > 0) {
-        const currentId = stack.pop()
-        if (!currentId) continue
-        const node = tree.nodes[currentId]
-        if (!node) continue
-        if (node.nodeType === 'ifc' && node.expressID !== null) {
-          ids.add(node.expressID)
-        }
-        if (node.children.length > 0) {
-          stack.push(...node.children)
-        }
-      }
-      return Array.from(ids)
-    },
-    [tree.nodes]
-  )
-
   const resolveNodeInsertTarget = useCallback(
     async (nodeId: string, options?: { autoFocus?: boolean }): Promise<Point3D> => {
       const node = tree.nodes[nodeId]
@@ -1535,14 +1490,12 @@ const IfcViewer = ({
         return { x: 0, y: 0, z: 0 }
       }
 
-      const descendantIds = collectDescendantExpressIds(nodeId)
       const target = await selectById(node.modelID, node.expressID, {
-        highlightIds: descendantIds,
         autoFocus: options?.autoFocus
       })
       return target ?? { x: 0, y: 0, z: 0 }
     },
-    [collectDescendantExpressIds, selectById, tree.nodes]
+    [selectById, tree.nodes]
   )
 
   const handleTreeSelect = useCallback(
@@ -1552,8 +1505,7 @@ const IfcViewer = ({
       if (!node) return
       if (node.nodeType === 'ifc') {
         if (node.expressID !== null) {
-          const descendantIds = collectDescendantExpressIds(nodeId)
-          await selectById(node.modelID, node.expressID, { highlightIds: descendantIds })
+          await selectById(node.modelID, node.expressID)
           return
         }
         clearIfcHighlight()
@@ -1568,7 +1520,7 @@ const IfcViewer = ({
         selectCustomCube(node.expressID)
       }
     },
-    [clearIfcHighlight, collectDescendantExpressIds, selectById, selectCustomCube, tree.nodes]
+    [clearIfcHighlight, selectById, selectCustomCube, tree.nodes]
   )
 
   const handleRoomSelect = useCallback(

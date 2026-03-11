@@ -11,55 +11,18 @@ import {
   Vector2,
   Vector3
 } from 'three'
-import type { IfcViewerAPI } from 'web-ifc-viewer'
+import type { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
 import type { OffsetVector, Point3D, PropertyField, SelectedElement } from '../ifcViewerTypes'
 
 const BASE_SUBSET_ID = 'base-offset-subset'
 const MOVED_SUBSET_PREFIX = 'moved-offset-'
 const FILTER_SUBSET_PREFIX = 'filter-subset-'
-const DEPTH_BIAS_SUBSET_PREFIX = 'depth-bias-subset-'
 const SPACE_BIAS_SUBSET_PREFIX = 'space-bias-subset-'
 const zeroOffset: OffsetVector = { dx: 0, dy: 0, dz: 0 }
 const CUBE_BASE_COLOR = 0x4f46e5
 const CUBE_HIGHLIGHT_COLOR = 0xffb100
 const COORD_EPSILON = 1e-4
-const ENABLE_MANUAL_FOCUS_ON_SELECT = false
 export const CUSTOM_CUBE_MODEL_ID = -999
-
-const tuneDepthBiasSubsetMesh = (mesh: Mesh | null | undefined) => {
-  if (!mesh) return
-  const tuneMaterial = (
-    material:
-      | {
-          side?: number
-          depthTest?: boolean
-          depthWrite?: boolean
-          transparent?: boolean
-          polygonOffset?: boolean
-          polygonOffsetFactor?: number
-          polygonOffsetUnits?: number
-          needsUpdate?: boolean
-        }
-      | null
-      | undefined
-  ) => {
-    if (!material) return
-    tuneIfcMeshMaterial(material)
-    material.polygonOffset = true
-    material.polygonOffsetFactor = -1
-    material.polygonOffsetUnits = -1
-    material.depthTest = true
-    material.depthWrite = true
-    material.needsUpdate = true
-  }
-
-  if (Array.isArray(mesh.material)) {
-    mesh.material.forEach((material) => tuneMaterial(material as any))
-  } else {
-    tuneMaterial(mesh.material as any)
-  }
-  mesh.renderOrder = 2
-}
 
 const tuneSpaceBiasSubsetMesh = (_mesh: Mesh | null | undefined) => {}
 
@@ -227,7 +190,7 @@ type UseSelectionOffsetsResult = {
   selectById: (
     modelID: number,
     expressID: number,
-    options?: { highlightIds?: number[]; autoFocus?: boolean; allowedIfcTypes?: string[] }
+    options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }
   ) => Promise<Point3D | null>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
@@ -254,7 +217,6 @@ type UseSelectionOffsetsResult = {
     options?: { focus?: boolean }
   ) => Promise<SpawnedModelInfo | null>
   applyVisibilityFilter: (modelID: number, visibleIds: number[] | null) => void
-  configureDepthBiasTargets: (modelID: number, expressIDs: number[]) => void
   configureSpaceBiasTargets: (modelID: number, expressIDs: number[]) => void
 }
 
@@ -265,9 +227,6 @@ export const useSelectionOffsets = (
   const propertyRequestRef = useRef(0)
   const baseSubsetsRef = useRef<Map<number, Mesh>>(new Map())
   const movedSubsetsRef = useRef<Map<string, Mesh>>(new Map())
-  const depthBiasSubsetsRef = useRef<Map<number, Mesh>>(new Map())
-  const depthBiasIdsRef = useRef<Map<number, Set<number>>>(new Map())
-  const depthBiasAppliedRef = useRef<Map<number, Set<number>>>(new Map())
   const spaceBiasSubsetsRef = useRef<Map<number, Mesh>>(new Map())
   const spaceBiasIdsRef = useRef<Map<number, Set<number>>>(new Map())
   const spaceBiasAppliedRef = useRef<Map<number, Set<number>>>(new Map())
@@ -357,17 +316,6 @@ export const useSelectionOffsets = (
     [viewerRef]
   )
 
-  const getCameraFocusPoint = useCallback((): Point3D | null => {
-    const viewer = viewerRef.current
-    const controls = viewer?.context.ifcCamera.cameraControls as
-      | { getTarget?: (out: Vector3) => void }
-      | undefined
-    if (!controls?.getTarget) return null
-    const target = new Vector3()
-    controls.getTarget(target)
-    return { x: target.x, y: target.y, z: target.z }
-  }, [viewerRef])
-
   const setCubeHighlight = useCallback((expressID: number | null) => {
     // Toggle cube color to indicate selection
     if (highlightedCubeRef.current !== null && highlightedCubeRef.current !== expressID) {
@@ -419,10 +367,6 @@ export const useSelectionOffsets = (
 
   const getFilterSubsetId = useCallback((modelID: number) => {
     return `${FILTER_SUBSET_PREFIX}${modelID}`
-  }, [])
-
-  const getDepthBiasSubsetId = useCallback((modelID: number) => {
-    return `${DEPTH_BIAS_SUBSET_PREFIX}${modelID}`
   }, [])
 
   const getSpaceBiasSubsetId = useCallback((modelID: number) => {
@@ -648,122 +592,6 @@ export const useSelectionOffsets = (
     return movedIds
   }, [])
 
-  const updateDepthBiasSubset = useCallback(
-    (modelID: number, allowedIds: Set<number> | null) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-
-      const manager = viewer.IFC.loader.ifcManager
-      const scene = viewer.context.getScene()
-      const targetIds = depthBiasIdsRef.current.get(modelID)
-      const existing = depthBiasSubsetsRef.current.get(modelID)
-      const movedIds = getMovedIdsForModel(modelID)
-      const previousApplied = depthBiasAppliedRef.current.get(modelID) ?? new Set<number>()
-
-      if (!targetIds || targetIds.size === 0) {
-        const restoreIds = Array.from(previousApplied).filter((id) => !movedIds.has(id))
-        if (restoreIds.length > 0) {
-          const baseSubset = ensureBaseSubset(modelID)
-          if (baseSubset) {
-            const restored = manager.createSubset({
-              modelID,
-              ids: restoreIds,
-              scene,
-              removePrevious: false,
-              customID: BASE_SUBSET_ID
-            }) as Mesh | null
-            if (restored) {
-              restored.matrix.copy(baseSubset.matrix)
-              restored.matrixAutoUpdate = false
-            }
-          }
-        }
-        if (existing) {
-          scene.remove(existing)
-          removePickable(viewer, existing)
-          manager.removeSubset(modelID, undefined, getDepthBiasSubsetId(modelID))
-          depthBiasSubsetsRef.current.delete(modelID)
-        }
-        depthBiasAppliedRef.current.delete(modelID)
-        return
-      }
-
-      let idsToShow = Array.from(targetIds).filter((id) => !movedIds.has(id))
-      if (allowedIds) {
-        idsToShow = idsToShow.filter((id) => allowedIds.has(id))
-      }
-      const nextApplied = new Set(idsToShow)
-
-      const restoreIds = Array.from(previousApplied).filter(
-        (id) => !nextApplied.has(id) && !movedIds.has(id)
-      )
-      if (restoreIds.length > 0) {
-        const baseSubset = ensureBaseSubset(modelID)
-        if (baseSubset) {
-          const restored = manager.createSubset({
-            modelID,
-            ids: restoreIds,
-            scene,
-            removePrevious: false,
-            customID: BASE_SUBSET_ID
-          }) as Mesh | null
-          if (restored) {
-            restored.matrix.copy(baseSubset.matrix)
-            restored.matrixAutoUpdate = false
-          }
-        }
-      }
-
-      const removeFromBase = Array.from(nextApplied).filter((id) => !previousApplied.has(id))
-      if (removeFromBase.length > 0) {
-        manager.removeFromSubset(modelID, removeFromBase, BASE_SUBSET_ID)
-      }
-      depthBiasAppliedRef.current.set(modelID, nextApplied)
-
-      if (idsToShow.length === 0) {
-        if (existing) {
-          scene.remove(existing)
-          removePickable(viewer, existing)
-          manager.removeSubset(modelID, undefined, getDepthBiasSubsetId(modelID))
-          depthBiasSubsetsRef.current.delete(modelID)
-        }
-        return
-      }
-
-      if (existing) {
-        scene.remove(existing)
-        removePickable(viewer, existing)
-      }
-
-      const subset = manager.createSubset({
-        modelID,
-        ids: idsToShow,
-        scene,
-        removePrevious: true,
-        customID: getDepthBiasSubsetId(modelID)
-      }) as Mesh | null
-
-      if (!subset) return
-
-      const baseSubset = baseSubsetsRef.current.get(modelID)
-      if (baseSubset) {
-        subset.matrix.copy(baseSubset.matrix)
-        subset.matrixAutoUpdate = false
-      }
-      tuneDepthBiasSubsetMesh(subset)
-      depthBiasSubsetsRef.current.set(modelID, subset)
-      registerPickable(viewer, subset)
-    },
-    [
-      ensureBaseSubset,
-      getDepthBiasSubsetId,
-      getMovedIdsForModel,
-      registerPickable,
-      removePickable,
-      viewerRef
-    ]
-  )
-
   const updateSpaceBiasSubset = useCallback(
     (modelID: number, allowedIds: Set<number> | null) => {
       const viewer = viewerRef.current
@@ -827,64 +655,6 @@ export const useSelectionOffsets = (
     [getMovedIdsForModel, getSpaceBiasSubsetId, registerPickable, removePickable, viewerRef]
   )
 
-  const configureDepthBiasTargets = useCallback(
-    (modelID: number, expressIDs: number[]) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      if (!Number.isFinite(modelID)) return
-
-      const baseSubset = ensureBaseSubset(modelID)
-      if (!baseSubset) return
-      const manager = viewer.IFC.loader.ifcManager
-
-      const nextTargets = new Set<number>()
-      expressIDs.forEach((rawId) => {
-        if (!Number.isFinite(rawId)) return
-        const expressId = Math.trunc(rawId)
-        if (expressId <= 0) return
-        if (!hasRenderableExpressId(modelID, expressId)) return
-        nextTargets.add(expressId)
-      })
-
-      const movedIds = getMovedIdsForModel(modelID)
-      const previousApplied = depthBiasAppliedRef.current.get(modelID) ?? new Set<number>()
-      const nextApplied = new Set(Array.from(nextTargets).filter((id) => !movedIds.has(id)))
-      const restoreIds = Array.from(previousApplied).filter(
-        (id) => !nextApplied.has(id) && !movedIds.has(id)
-      )
-      if (restoreIds.length > 0) {
-        const restored = manager.createSubset({
-          modelID,
-          ids: restoreIds,
-          scene: viewer.context.getScene(),
-          removePrevious: false,
-          customID: BASE_SUBSET_ID
-        }) as Mesh | null
-        if (restored) {
-          restored.matrix.copy(baseSubset.matrix)
-          restored.matrixAutoUpdate = false
-        }
-      }
-
-      if (nextTargets.size === 0) {
-        depthBiasIdsRef.current.delete(modelID)
-        depthBiasAppliedRef.current.delete(modelID)
-      } else {
-        depthBiasIdsRef.current.set(modelID, nextTargets)
-        depthBiasAppliedRef.current.set(modelID, nextApplied)
-      }
-      const activeFilter = filterIdsRef.current.get(modelID) ?? null
-      updateDepthBiasSubset(modelID, activeFilter)
-    },
-    [
-      ensureBaseSubset,
-      getMovedIdsForModel,
-      hasRenderableExpressId,
-      updateDepthBiasSubset,
-      viewerRef
-    ]
-  )
-
   const configureSpaceBiasTargets = useCallback(
     (modelID: number, _expressIDs: number[]) => {
       const viewer = viewerRef.current
@@ -930,7 +700,6 @@ export const useSelectionOffsets = (
       const derivedIds = Array.from(
         new Set([
           ...baseSubsetsRef.current.keys(),
-          ...depthBiasSubsetsRef.current.keys(),
           ...spaceBiasSubsetsRef.current.keys(),
           ...Array.from(movedSubsetsRef.current.keys())
             .map((key) => Number(key.split(':')[0]))
@@ -947,13 +716,6 @@ export const useSelectionOffsets = (
           manager.removeSubset(id, undefined, getFilterSubsetId(id))
           filterSubsetsRef.current.delete(id)
           filterIdsRef.current.delete(id)
-        }
-        const depthBiasSubset = depthBiasSubsetsRef.current.get(id)
-        if (depthBiasSubset) {
-          scene.remove(depthBiasSubset)
-          removePickable(viewer, depthBiasSubset)
-          manager.removeSubset(id, undefined, getDepthBiasSubsetId(id))
-          depthBiasSubsetsRef.current.delete(id)
         }
         const spaceBiasSubset = spaceBiasSubsetsRef.current.get(id)
         if (spaceBiasSubset) {
@@ -989,8 +751,6 @@ export const useSelectionOffsets = (
           model.visible = true
           registerPickable(viewer, model, id)
         }
-        depthBiasIdsRef.current.delete(id)
-        depthBiasAppliedRef.current.delete(id)
         spaceBiasIdsRef.current.delete(id)
         spaceBiasAppliedRef.current.delete(id)
         expressIdCacheRef.current.delete(id)
@@ -1000,13 +760,11 @@ export const useSelectionOffsets = (
       })
       if (typeof modelID !== 'number') {
         baseCentersRef.current.clear()
-        depthBiasIdsRef.current.clear()
-        depthBiasAppliedRef.current.clear()
         spaceBiasIdsRef.current.clear()
         spaceBiasAppliedRef.current.clear()
       }
     },
-    [getDepthBiasSubsetId, getFilterSubsetId, getSpaceBiasSubsetId, registerPickable, removePickable, viewerRef]
+    [getFilterSubsetId, getSpaceBiasSubsetId, registerPickable, removePickable, viewerRef]
   )
 
   const updateVisibilityForModel = useCallback(
@@ -1039,7 +797,6 @@ export const useSelectionOffsets = (
             subset.visible = true
           }
         })
-        updateDepthBiasSubset(modelID, null)
         updateSpaceBiasSubset(modelID, null)
         return
       }
@@ -1061,7 +818,6 @@ export const useSelectionOffsets = (
             subset.visible = false
           }
         })
-        updateDepthBiasSubset(modelID, allowedIds)
         updateSpaceBiasSubset(modelID, allowedIds)
         return
       }
@@ -1080,10 +836,7 @@ export const useSelectionOffsets = (
         }
       })
 
-      const depthBiasIds = depthBiasIdsRef.current.get(modelID) ?? new Set<number>()
-      const idsToShow = Array.from(allowedIds).filter(
-        (id) => !movedIds.has(id) && !depthBiasIds.has(id)
-      )
+      const idsToShow = Array.from(allowedIds).filter((id) => !movedIds.has(id))
       if (idsToShow.length === 0) {
         if (filterSubset) {
           scene.remove(filterSubset)
@@ -1091,7 +844,6 @@ export const useSelectionOffsets = (
           manager.removeSubset(modelID, undefined, getFilterSubsetId(modelID))
           filterSubsetsRef.current.delete(modelID)
         }
-        updateDepthBiasSubset(modelID, allowedIds)
         updateSpaceBiasSubset(modelID, allowedIds)
         return
       }
@@ -1111,7 +863,6 @@ export const useSelectionOffsets = (
         filterSubsetsRef.current.set(modelID, subset as Mesh)
         registerPickable(viewer, subset as Mesh, modelID)
       }
-      updateDepthBiasSubset(modelID, allowedIds)
       updateSpaceBiasSubset(modelID, allowedIds)
     },
     [
@@ -1120,7 +871,6 @@ export const useSelectionOffsets = (
       getMovedIdsForModel,
       registerPickable,
       removePickable,
-      updateDepthBiasSubset,
       updateSpaceBiasSubset,
       viewerRef
     ]
@@ -1479,9 +1229,8 @@ export const useSelectionOffsets = (
         Math.abs(targetOffset.dz - baseCenter.z) < COORD_EPSILON
 
       if (isZeroOffset) {
-        const isForegroundBiasTarget = depthBiasIdsRef.current.get(modelID)?.has(expressID) ?? false
         const isSpaceBiasTarget = spaceBiasIdsRef.current.get(modelID)?.has(expressID) ?? false
-        if (!isForegroundBiasTarget && !isSpaceBiasTarget) {
+        if (!isSpaceBiasTarget) {
           const restored = manager.createSubset({
             modelID,
             ids: [expressID],
@@ -1621,7 +1370,7 @@ export const useSelectionOffsets = (
 
       setCubeHighlight(null)
 
-      const picked = await viewer.IFC.selector.pickIfcItem(shouldAutoFocus)
+      const picked = await viewer.IFC.selector.pickIfcItem(false)
       if (!picked || picked.id === undefined || picked.modelID === undefined) {
         viewer.IFC.selector.unpickIfcItems()
         resetSelection()
@@ -1635,7 +1384,13 @@ export const useSelectionOffsets = (
         return
       }
 
-      const focusPoint = shouldAutoFocus ? getCameraFocusPoint() : null
+      // Keep IFC outlines disabled: clear viewer selection highlight immediately.
+      viewer.IFC.selector.unpickIfcItems()
+      const focusPoint =
+        shouldAutoFocus ? getElementWorldPosition(picked.modelID, picked.id) : null
+      if (shouldAutoFocus && focusPoint) {
+        focusOnPoint(focusPoint)
+      }
       await fetchProperties(picked.modelID, picked.id, focusPoint)
     } catch (err) {
       console.error('Failed to pick IFC item', err)
@@ -1643,7 +1398,8 @@ export const useSelectionOffsets = (
     }
   }, [
     fetchProperties,
-    getCameraFocusPoint,
+    focusOnPoint,
+    getElementWorldPosition,
     getExpressIdFromHit,
     isIfcSelectionAllowed,
     resetSelection,
@@ -1655,7 +1411,7 @@ export const useSelectionOffsets = (
     async (
       modelID: number,
       expressID: number,
-      options?: { highlightIds?: number[]; autoFocus?: boolean; allowedIfcTypes?: string[] }
+      options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }
     ) => {
       const viewer = viewerRef.current
       if (!viewer) return null
@@ -1669,24 +1425,13 @@ export const useSelectionOffsets = (
 
         const isRenderable = hasRenderableExpressId(modelID, expressID)
         const shouldAutoFocus = options?.autoFocus ?? true
-        if (isRenderable) {
-          await viewer.IFC.selector.pickIfcItemsByID(modelID, [expressID], shouldAutoFocus)
-        } else if (options?.highlightIds?.length) {
-          const renderableIds = options.highlightIds.filter((id) =>
-            hasRenderableExpressId(modelID, id)
-          )
-          if (renderableIds.length > 0) {
-            await viewer.IFC.selector.pickIfcItemsByID(modelID, renderableIds, false, true)
-          } else {
-            viewer.IFC.selector.unpickIfcItems()
-          }
-        } else {
-          viewer.IFC.selector.unpickIfcItems()
-        }
-        const focusPoint = isRenderable ? getCameraFocusPoint() : null
+        // Keep IFC outlines disabled: never keep highlighted IFC selection subsets.
+        viewer.IFC.selector.unpickIfcItems()
+        const focusPoint =
+          shouldAutoFocus && isRenderable ? getElementWorldPosition(modelID, expressID) : null
         await fetchProperties(modelID, expressID, focusPoint)
         const elementCenter = getElementWorldPosition(modelID, expressID)
-        const resolvedPoint = shouldAutoFocus ? (focusPoint ?? elementCenter) : (elementCenter ?? focusPoint)
+        const resolvedPoint = shouldAutoFocus ? (focusPoint ?? elementCenter) : elementCenter
         const selectionPoint = resolvedPoint
           ? resolvedPoint
           : (() => {
@@ -1695,10 +1440,8 @@ export const useSelectionOffsets = (
                 getModelBaseOffset(modelID)
               return { x: fallbackOffset.dx, y: fallbackOffset.dy, z: fallbackOffset.dz }
             })()
-        if (isRenderable) {
-          if (ENABLE_MANUAL_FOCUS_ON_SELECT && elementCenter) {
-            focusOnPoint(elementCenter)
-          }
+        if (shouldAutoFocus && selectionPoint) {
+          focusOnPoint(selectionPoint)
         }
         return selectionPoint
       } catch (err) {
@@ -1708,7 +1451,6 @@ export const useSelectionOffsets = (
     },
     [
       fetchProperties,
-      getCameraFocusPoint,
       getElementKey,
       focusOnPoint,
       getElementWorldPosition,
@@ -1732,7 +1474,6 @@ export const useSelectionOffsets = (
 
       manager.removeFromSubset(modelID, [expressID], BASE_SUBSET_ID)
       manager.removeFromSubset(modelID, [expressID], getFilterSubsetId(modelID))
-      manager.removeFromSubset(modelID, [expressID], getDepthBiasSubsetId(modelID))
       manager.removeFromSubset(modelID, [expressID], getSpaceBiasSubsetId(modelID))
 
       const moved = movedSubsetsRef.current.get(key)
@@ -1743,8 +1484,6 @@ export const useSelectionOffsets = (
         movedSubsetsRef.current.delete(key)
       }
       elementOffsetsRef.current.delete(key)
-      depthBiasIdsRef.current.get(modelID)?.delete(expressID)
-      depthBiasAppliedRef.current.get(modelID)?.delete(expressID)
       spaceBiasIdsRef.current.get(modelID)?.delete(expressID)
       spaceBiasAppliedRef.current.get(modelID)?.delete(expressID)
       const activeFilter = filterIdsRef.current.get(modelID) ?? null
@@ -1752,7 +1491,6 @@ export const useSelectionOffsets = (
     },
     [
       ensureBaseSubset,
-      getDepthBiasSubsetId,
       getElementKey,
       getFilterSubsetId,
       getSpaceBiasSubsetId,
@@ -1921,7 +1659,6 @@ export const useSelectionOffsets = (
     spawnUploadedModel,
     applyIfcElementOffset,
     applyVisibilityFilter,
-    configureDepthBiasTargets,
     configureSpaceBiasTargets
   }
 }

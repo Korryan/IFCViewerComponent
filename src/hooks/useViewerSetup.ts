@@ -1,7 +1,7 @@
 import { useCallback, type RefObject } from 'react'
 import { Color } from 'three'
 import CameraControls from 'camera-controls'
-import { IfcViewerAPI } from 'web-ifc-viewer'
+import { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
 
 type EnsureViewerFn = () => IfcViewerAPI | null
 type ViewerHandleRef = { current: IfcViewerAPI | null }
@@ -31,7 +31,8 @@ export const useViewerSetup = (
     viewer.axes.setAxes()
     viewer.grid.setGrid()
     viewer.IFC.setWasmPath(wasmRootPath)
-    viewer.context.renderer.postProduction.active = true
+    // Keep outlines and postprocessing fully disabled.
+    viewer.context.renderer.postProduction.active = false
 
     // Explicit camera clip planes help reduce depth precision artifacts on IFC geometry.
     const perspectiveCamera = viewer.context.ifcCamera.perspectiveCamera
