@@ -2,13 +2,46 @@ import { BufferGeometry } from '../core/BufferGeometry.js';
 import { Float32BufferAttribute } from '../core/BufferAttribute.js';
 import { Vector3 } from '../math/Vector3.js';
 
+/**
+ * Can be used as a helper object to visualize a geometry as a wireframe.
+ *
+ * ```js
+ * const geometry = new THREE.SphereGeometry();
+ *
+ * const wireframe = new THREE.WireframeGeometry( geometry );
+ *
+ * const line = new THREE.LineSegments( wireframe );
+ * line.material.depthWrite = false;
+ * line.material.opacity = 0.25;
+ * line.material.transparent = true;
+ *
+ * scene.add( line );
+ * ```
+ *
+ * Note: It is not yet possible to serialize/deserialize instances of this class.
+ *
+ * @augments BufferGeometry
+ */
 class WireframeGeometry extends BufferGeometry {
 
+	/**
+	 * Constructs a new wireframe geometry.
+	 *
+	 * @param {?BufferGeometry} [geometry=null] - The geometry.
+	 */
 	constructor( geometry = null ) {
 
 		super();
+
 		this.type = 'WireframeGeometry';
 
+		/**
+		 * Holds the constructor parameters that have been
+		 * used to generate the geometry. Any modification
+		 * after instantiation does not change the geometry.
+		 *
+		 * @type {Object}
+		 */
 		this.parameters = {
 			geometry: geometry
 		};
@@ -39,7 +72,7 @@ class WireframeGeometry extends BufferGeometry {
 
 				}
 
-				// create a data structure that contains all eges without duplicates
+				// create a data structure that contains all edges without duplicates
 
 				for ( let o = 0, ol = groups.length; o < ol; ++ o ) {
 
@@ -111,6 +144,16 @@ class WireframeGeometry extends BufferGeometry {
 
 	}
 
+	copy( source ) {
+
+		super.copy( source );
+
+		this.parameters = Object.assign( {}, source.parameters );
+
+		return this;
+
+	}
+
 }
 
 function isUniqueEdge( start, end, edges ) {
@@ -124,7 +167,8 @@ function isUniqueEdge( start, end, edges ) {
 
 	} else {
 
-		edges.add( hash1, hash2 );
+		edges.add( hash1 );
+		edges.add( hash2 );
 		return true;
 
 	}

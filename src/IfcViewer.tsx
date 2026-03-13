@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { FrontSide, Matrix4, Plane, Raycaster, Vector3 } from 'three'
+import { FrontSide, Matrix4, Plane, Raycaster, Vector2, Vector3 } from 'three'
 import CameraControls from 'camera-controls'
 import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
 import type {
@@ -38,6 +38,10 @@ type IfcViewerProps = {
 }
 
 type Loader = (viewer: IfcViewerAPI) => Promise<any>
+type LoadSource =
+  | { kind: 'none' }
+  | { kind: 'file'; file: File }
+  | { kind: 'url'; url: string }
 
 type IfcLoaderManagerLike = {
   applyWebIfcConfig?: (settings: { COORDINATE_TO_ORIGIN?: boolean; USE_FAST_BOOLS?: boolean }) => Promise<void>
@@ -67,6 +71,7 @@ const POSITION_EPSILON = 1e-4
 const WALK_MOVE_SPEED = 2.8
 const WALK_LOOK_SENSITIVITY = 0.0025
 const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
+const MODEL_LOAD_TIMEOUT_MS = 60_000
 const IFC_LOADER_SETTINGS = {
   COORDINATE_TO_ORIGIN: true,
   USE_FAST_BOOLS: false
@@ -86,6 +91,9 @@ const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
   'roomnumber'
 ])
+const ENABLE_ROOM_NUMBER_GROUPING = false
+const MAX_ROOM_NUMBER_LOOKUPS = 400
+const ROOM_NUMBER_BATCH_SIZE = 20
 const SHORTCUTS = [
   { keys: 'M', label: 'Toggle free look / walk mode' },
   { keys: 'Arrow Keys', label: 'Move in walk mode (fixed height)' },
@@ -98,6 +106,31 @@ const SHORTCUTS = [
   { keys: 'Esc', label: 'Cancel drag / close menus' },
   { keys: '? / H', label: 'Toggle shortcuts help' }
 ]
+
+const isSameLoadSource = (left: LoadSource, right: LoadSource): boolean => {
+  if (left.kind !== right.kind) return false
+  if (left.kind === 'none') return true
+  if (left.kind === 'file' && right.kind === 'file') return left.file === right.file
+  if (left.kind === 'url' && right.kind === 'url') return left.url === right.url
+  return false
+}
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timer: number | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`))
+    }, timeoutMs)
+  })
+
+  try {
+    return (await Promise.race([promise, timeoutPromise])) as T
+  } finally {
+    if (timer !== undefined) {
+      window.clearTimeout(timer)
+    }
+  }
+}
 
 type IfcMeshLike = {
   modelID?: number
@@ -302,18 +335,13 @@ const tuneIfcMeshMaterial = (
     | undefined
 ) => {
   if (!material) return
+  // FrontSide is much more stable for IFC models that contain coplanar or duplicated faces.
   material.side = FrontSide
   material.depthTest = true
   material.depthWrite = true
-  if (material.transparent) {
-    material.polygonOffset = true
-    material.polygonOffsetFactor = -0.5
-    material.polygonOffsetUnits = -0.5
-  } else {
-    material.polygonOffset = false
-    material.polygonOffsetFactor = 0
-    material.polygonOffsetUnits = 0
-  }
+  material.polygonOffset = false
+  material.polygonOffsetFactor = 0
+  material.polygonOffsetUnits = 0
   material.needsUpdate = true
 }
 
@@ -417,18 +445,36 @@ const buildRoomNumberMap = async (
   // This is used later to group elements under IfcSpace nodes in the UI tree.
   const expressIds = collectStoreyChildExpressIds(tree)
   if (expressIds.length === 0) return new Map()
-  const results = await Promise.all(
-    expressIds.map(async (expressID) => {
-      try {
-        const properties = await viewer.IFC.getProperties(modelID, expressID, true, true)
-        const roomNumber = extractRoomNumber(properties)
-        return roomNumber ? ([expressID, roomNumber] as const) : null
-      } catch (err) {
-        console.warn('Failed to read room number for element', expressID, err)
-        return null
-      }
-    })
-  )
+
+  const lookupIds =
+    expressIds.length > MAX_ROOM_NUMBER_LOOKUPS ? expressIds.slice(0, MAX_ROOM_NUMBER_LOOKUPS) : expressIds
+
+  if (lookupIds.length < expressIds.length) {
+    console.warn(
+      `Room-number lookup limited to ${MAX_ROOM_NUMBER_LOOKUPS} of ${expressIds.length} elements to prevent OOM.`
+    )
+  }
+
+  const results: Array<readonly [number, string] | null> = []
+  for (let i = 0; i < lookupIds.length; i += ROOM_NUMBER_BATCH_SIZE) {
+    const batch = lookupIds.slice(i, i + ROOM_NUMBER_BATCH_SIZE)
+    const batchResults = await Promise.all(
+      batch.map(async (expressID) => {
+        try {
+          // Recursive relation traversal can blow memory on large IFC graphs.
+          // For room grouping we only need direct Pset access.
+          const properties = await viewer.IFC.getProperties(modelID, expressID, false, true)
+          const roomNumber = extractRoomNumber(properties)
+          return roomNumber ? ([expressID, roomNumber] as const) : null
+        } catch (err) {
+          console.warn('Failed to read room number for element', expressID, err)
+          return null
+        }
+      })
+    )
+    results.push(...batchResults)
+  }
+
   const map = new Map<number, string>()
   results.forEach((entry) => {
     if (!entry) return
@@ -511,6 +557,7 @@ const IfcViewer = ({
   const loadTokenRef = useRef(0)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const lastLoadSourceRef = useRef<LoadSource>({ kind: 'none' })
   const [navigationMode, setNavigationMode] = useState<NavigationMode>('free')
   const [hoverCoords, setHoverCoords] = useState<Point3D | null>(null)
   const [isInsertMenuOpen, setIsInsertMenuOpen] = useState(false)
@@ -609,6 +656,23 @@ const IfcViewer = ({
         return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: 'base' })
       })
   }, [tree.nodes])
+  const treeNodeBySelectionKey = useMemo(() => {
+    const byKey = new Map<string, string>()
+    Object.values(tree.nodes).forEach((node) => {
+      if (node.expressID === null) return
+      const key = `${node.modelID}:${node.expressID}`
+      if (!byKey.has(key)) {
+        byKey.set(key, node.id)
+      }
+    })
+    return byKey
+  }, [tree.nodes])
+  const resolveTreeNodeIdForSelection = useCallback(
+    (modelID: number, expressID: number): string | null => {
+      return treeNodeBySelectionKey.get(`${modelID}:${expressID}`) ?? null
+    },
+    [treeNodeBySelectionKey]
+  )
   const pickMenuItems = useMemo(
     () =>
       pickCandidates.map((candidate) => ({
@@ -654,9 +718,9 @@ const IfcViewer = ({
         return null
       }
 
-      const firstModel = Boolean(ifc.context?.items?.ifcModels?.length === 0)
       await ifcManager.applyWebIfcConfig({
-        COORDINATE_TO_ORIGIN: firstModel,
+        // Keep geometry close to origin for stable depth precision.
+        COORDINATE_TO_ORIGIN: true,
         USE_FAST_BOOLS: false
       })
 
@@ -668,13 +732,6 @@ const IfcViewer = ({
         const model = await loader.loadAsync(resolvedUrl)
         if (!model) return null
         ifc.addIfcModel(model)
-
-        if (firstModel && typeof model.modelID === 'number') {
-          const matrixArr = await ifcManager.ifcAPI?.GetCoordinationMatrix?.(model.modelID)
-          if (Array.isArray(matrixArr) && matrixArr.length === 16) {
-            ifcManager.setupCoordinationMatrix?.(new Matrix4().fromArray(matrixArr))
-          }
-        }
 
         if (fitToFrame) {
           ifc.context?.fitToFrame?.()
@@ -1384,6 +1441,15 @@ const IfcViewer = ({
     metadataEntries.forEach((entry) => {
       if (entry.deleted) return
       if (!entry.position) return
+      const current = getElementWorldPosition(activeModelId, entry.ifcId)
+      if (
+        current &&
+        Math.abs(current.x - entry.position.x) < POSITION_EPSILON &&
+        Math.abs(current.y - entry.position.y) < POSITION_EPSILON &&
+        Math.abs(current.z - entry.position.z) < POSITION_EPSILON
+      ) {
+        return
+      }
       applyIfcElementOffset(activeModelId, entry.ifcId, {
         dx: entry.position.x,
         dy: entry.position.y,
@@ -1391,14 +1457,16 @@ const IfcViewer = ({
       })
     })
     offsetsRestoredRef.current = activeModelId
-  }, [activeModelId, applyIfcElementOffset, isHydrated, metadataEntries])
+  }, [activeModelId, applyIfcElementOffset, getElementWorldPosition, isHydrated, metadataEntries])
 
   useEffect(() => {
     if (activeModelId === null) {
       return
     }
-    applyVisibilityFilter(activeModelId, null)
+    // Keep original IFC mesh visible by default; building base subsets for full model
+    // on every load can introduce extra coplanar geometry and visible z-fighting.
     if (deletedIfcIds.size > 0) {
+      applyVisibilityFilter(activeModelId, null)
       deletedIfcIds.forEach((id) => hideIfcElement(activeModelId, id))
     }
   }, [activeModelId, applyVisibilityFilter, deletedIfcIds, hideIfcElement])
@@ -1463,13 +1531,15 @@ const IfcViewer = ({
         let groupedTree = tree
         roomNumbersRef.current = new Map()
         // Optional grouping: if room numbers exist in Psets, move elements under the matching IfcSpace.
-        try {
-          const roomNumbers = await buildRoomNumberMap(viewer, tree, modelID)
-          if (loadTokenRef.current !== loadToken) return
-          roomNumbersRef.current = roomNumbers
-          groupedTree = groupIfcTreeByRoomNumber(tree, roomNumbers)
-        } catch (err) {
-          console.warn('Failed to group storey nodes by room number', err)
+        if (ENABLE_ROOM_NUMBER_GROUPING) {
+          try {
+            const roomNumbers = await buildRoomNumberMap(viewer, tree, modelID)
+            if (loadTokenRef.current !== loadToken) return
+            roomNumbersRef.current = roomNumbers
+            groupedTree = groupIfcTreeByRoomNumber(tree, roomNumbers)
+          } catch (err) {
+            console.warn('Failed to group storey nodes by room number', err)
+          }
         }
         setIfcTree(groupedTree, modelID)
         setSelectedNodeId(groupedTree.roots[0] ?? null)
@@ -1503,24 +1573,26 @@ const IfcViewer = ({
       setSelectedNodeId(nodeId)
       const node = tree.nodes[nodeId]
       if (!node) return
-      if (node.nodeType === 'ifc') {
-        if (node.expressID !== null) {
-          await selectById(node.modelID, node.expressID)
-          return
-        }
-        clearIfcHighlight()
-        return
-      }
-      clearIfcHighlight()
+
       if (
         node.nodeType === 'custom' &&
         node.modelID === CUSTOM_CUBE_MODEL_ID &&
         node.expressID !== null
       ) {
+        clearIfcHighlight()
         selectCustomCube(node.expressID)
+        return
       }
+
+      if (node.nodeType === 'ifc' && node.expressID !== null) {
+        await selectById(node.modelID, node.expressID)
+        return
+      }
+
+      clearIfcHighlight()
+      resetSelection()
     },
-    [clearIfcHighlight, selectById, selectCustomCube, tree.nodes]
+    [clearIfcHighlight, resetSelection, selectById, selectCustomCube, tree.nodes]
   )
 
   const handleRoomSelect = useCallback(
@@ -1780,10 +1852,9 @@ const IfcViewer = ({
         const plane = dragPlaneRef.current
         if (viewer && plane && containerRef.current) {
           const rect = containerRef.current.getBoundingClientRect()
-          const ndc = new Vector3(
+          const ndc = new Vector2(
             (event.clientX - rect.left) / rect.width * 2 - 1,
-            -(event.clientY - rect.top) / rect.height * 2 + 1,
-            0.5
+            -(event.clientY - rect.top) / rect.height * 2 + 1
           )
           const raycaster = new Raycaster()
           raycaster.setFromCamera(ndc, viewer.context.getCamera())
@@ -1825,13 +1896,10 @@ const IfcViewer = ({
       setSelectedNodeId(null)
       return
     }
-    const match = Object.values(tree.nodes).find(
-      (node) =>
-        node.modelID === selectedElement.modelID &&
-        node.expressID === selectedElement.expressID
-    )
-    setSelectedNodeId(match?.id ?? null)
-  }, [selectedElement, tree.nodes])
+
+    const matchId = resolveTreeNodeIdForSelection(selectedElement.modelID, selectedElement.expressID)
+    setSelectedNodeId(matchId)
+  }, [resolveTreeNodeIdForSelection, selectedElement])
 
   useEffect(() => {
     const isEditableTarget = (target: EventTarget | null) => {
@@ -1953,10 +2021,9 @@ const IfcViewer = ({
         const container = containerRef.current
         if (container) {
           const rect = container.getBoundingClientRect()
-          const ndc = new Vector3(
+          const ndc = new Vector2(
             (lastPointerPosRef.current.x / rect.width) * 2 - 1,
-            -(lastPointerPosRef.current.y / rect.height) * 2 + 1,
-            0.5
+            -(lastPointerPosRef.current.y / rect.height) * 2 + 1
           )
           const raycaster = new Raycaster()
           raycaster.setFromCamera(ndc, viewer.context.getCamera())
@@ -2085,7 +2152,7 @@ const IfcViewer = ({
 
       try {
         await viewer.IFC.applyWebIfcConfig(IFC_LOADER_SETTINGS)
-        const model = await loader(viewer)
+        const model = await withTimeout(loader(viewer), MODEL_LOAD_TIMEOUT_MS, 'IFC model loading')
         if (!model) {
           throw new Error('IFC model could not be loaded.')
         }
@@ -2112,6 +2179,7 @@ const IfcViewer = ({
         console.error('Failed to load IFC model', err)
         setError('Failed to load IFC model. Check the console for details.')
         setStatus(null)
+        lastLoadSourceRef.current = { kind: 'none' }
         resetTree()
       }
     },
@@ -2123,6 +2191,11 @@ const IfcViewer = ({
       resetTree
     ]
   )
+
+  const loadModelRef = useRef(loadModel)
+  useEffect(() => {
+    loadModelRef.current = loadModel
+  }, [loadModel])
 
   useEffect(() => {
     ensureViewer()
@@ -2144,21 +2217,38 @@ const IfcViewer = ({
   }, [clearOffsetArtifacts, ensureViewer, resetTree, stopWalkMovementLoop])
 
   useEffect(() => {
-    if (file) {
-      loadModel((viewer) => loadIfcWithCustomSettings(viewer, { file }, true), 'Loading IFC file...')
+    const nextSource: LoadSource = file
+      ? { kind: 'file', file }
+      : defaultModelUrl
+        ? { kind: 'url', url: defaultModelUrl }
+        : { kind: 'none' }
+
+    if (isSameLoadSource(lastLoadSourceRef.current, nextSource)) {
+      if (nextSource.kind === 'none') {
+        setStatus(null)
+      }
+      return
+    }
+    lastLoadSourceRef.current = nextSource
+
+    if (nextSource.kind === 'file') {
+      void loadModelRef.current(
+        (viewer) => loadIfcWithCustomSettings(viewer, { file: nextSource.file }, true),
+        'Loading IFC file...'
+      )
       return
     }
 
-    if (defaultModelUrl) {
-      loadModel(
-        (viewer) => loadIfcWithCustomSettings(viewer, { url: defaultModelUrl }, true),
+    if (nextSource.kind === 'url') {
+      void loadModelRef.current(
+        (viewer) => loadIfcWithCustomSettings(viewer, { url: nextSource.url }, true),
         'Loading sample model...'
       )
       return
     }
 
     setStatus(null)
-  }, [defaultModelUrl, file, loadIfcWithCustomSettings, loadModel])
+  }, [defaultModelUrl, file, loadIfcWithCustomSettings])
 
   return (
     <>

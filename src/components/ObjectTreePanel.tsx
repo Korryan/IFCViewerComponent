@@ -44,6 +44,10 @@ const TreeNode = ({
   const isExpanded = expanded.has(nodeId)
   const isSelected = selectedNodeId === nodeId
   const isOnPath = pathSet.has(nodeId)
+  const localizedType = localizeIfcType(node.type)
+  const ifcDisplayId =
+    node.nodeType === 'ifc' && node.expressID !== null ? `#${String(node.expressID)}` : null
+  const showTypeBadge = node.label.trim().toLocaleLowerCase() !== localizedType.trim().toLocaleLowerCase()
 
   return (
     <div className="tree-node" style={{ paddingLeft: depth * indentSize }}>
@@ -66,11 +70,13 @@ const TreeNode = ({
             .filter(Boolean)
             .join(' ')}
           onClick={() => onSelectNode(nodeId)}
-          title={node.label}
+          title={ifcDisplayId ? `${node.label} ${ifcDisplayId}` : node.label}
           data-node-id={nodeId}
+          data-ifc-id={ifcDisplayId ?? undefined}
         >
-          <span className="tree-node__type">{localizeIfcType(node.type)}</span>
+          {showTypeBadge && <span className="tree-node__type">{localizedType}</span>}
           <span className="tree-node__name">{node.label}</span>
+          {ifcDisplayId && <span className="tree-node__id">{ifcDisplayId}</span>}
         </button>
         <button
           type="button"
@@ -141,6 +147,13 @@ export const ObjectTreePanel = ({
       setViewMode('tree')
     }
   }, [rooms.length, viewMode])
+  const roomNodeIds = useMemo(() => new Set(rooms.map((room) => room.nodeId)), [rooms])
+  useEffect(() => {
+    if (viewMode !== 'rooms') return
+    if (!selectedNodeId) return
+    if (roomNodeIds.has(selectedNodeId)) return
+    setViewMode('tree')
+  }, [roomNodeIds, selectedNodeId, viewMode])
 
   const { selectionPath, selectionTrail } = useMemo(() => {
     const ids: string[] = []

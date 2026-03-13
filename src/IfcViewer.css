@@ -697,6 +697,22 @@
   white-space: nowrap;
 }
 
+.tree-node__id {
+  color: #475569;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.tree-node__label--path .tree-node__id {
+  color: #1e40af;
+}
+
+.tree-node__label--selected .tree-node__id {
+  color: #bfdbfe;
+}
+
 .tree-node__children {
   display: flex;
   flex-direction: column;

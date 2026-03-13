@@ -6,10 +6,10 @@ import { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
 type EnsureViewerFn = () => IfcViewerAPI | null
 type ViewerHandleRef = { current: IfcViewerAPI | null }
 
-const PERSPECTIVE_NEAR = 1
-const PERSPECTIVE_FAR = 1200
-const ORTHOGRAPHIC_NEAR = 0.1
-const ORTHOGRAPHIC_FAR = 1200
+const PERSPECTIVE_NEAR = 0.2
+const PERSPECTIVE_FAR = 2000
+const ORTHOGRAPHIC_NEAR = 0.2
+const ORTHOGRAPHIC_FAR = 2000
 
 export const useViewerSetup = (
   containerRef: RefObject<HTMLDivElement | null>,
@@ -17,7 +17,7 @@ export const useViewerSetup = (
   wasmRootPath: string
 ): EnsureViewerFn => {
   // Lazy-initialize the underlying IfcViewerAPI once the div ref is ready
-  // Also configures controls, grid/axes, and WASM location
+  // Also configures controls and WASM location
   return useCallback(() => {
     if (viewerRef.current || !containerRef.current) {
       return viewerRef.current
@@ -28,8 +28,6 @@ export const useViewerSetup = (
       backgroundColor: new Color(0xf3f4f6)
     })
 
-    viewer.axes.setAxes()
-    viewer.grid.setGrid()
     viewer.IFC.setWasmPath(wasmRootPath)
     // Keep outlines and postprocessing fully disabled.
     viewer.context.renderer.postProduction.active = false

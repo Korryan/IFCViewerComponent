@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react'
 // Encapsulates selection, IFC property fetching, and offset/subset handling
 import {
   BoxGeometry,
+  DoubleSide,
   Float32BufferAttribute,
   FrontSide,
   Mesh,
@@ -18,9 +19,12 @@ const BASE_SUBSET_ID = 'base-offset-subset'
 const MOVED_SUBSET_PREFIX = 'moved-offset-'
 const FILTER_SUBSET_PREFIX = 'filter-subset-'
 const SPACE_BIAS_SUBSET_PREFIX = 'space-bias-subset-'
+const SELECTION_SUBSET_PREFIX = 'selection-subset-'
 const zeroOffset: OffsetVector = { dx: 0, dy: 0, dz: 0 }
 const CUBE_BASE_COLOR = 0x4f46e5
 const CUBE_HIGHLIGHT_COLOR = 0xffb100
+const IFC_SELECTION_COLOR = 0xffbf00
+const IFC_SELECTION_EMISSIVE = 0x6a3d00
 const COORD_EPSILON = 1e-4
 export const CUSTOM_CUBE_MODEL_ID = -999
 
@@ -42,18 +46,13 @@ const tuneIfcMeshMaterial = (
     | undefined
 ) => {
   if (!material) return
+  // FrontSide is much more stable for IFC models that contain coplanar or duplicated faces.
   material.side = FrontSide
   material.depthTest = true
   material.depthWrite = true
-  if (material.transparent) {
-    material.polygonOffset = true
-    material.polygonOffsetFactor = -0.5
-    material.polygonOffsetUnits = -0.5
-  } else {
-    material.polygonOffset = false
-    material.polygonOffsetFactor = 0
-    material.polygonOffsetUnits = 0
-  }
+  material.polygonOffset = false
+  material.polygonOffsetFactor = 0
+  material.polygonOffsetUnits = 0
   material.needsUpdate = true
 }
 
@@ -194,6 +193,7 @@ type UseSelectionOffsetsResult = {
   ) => Promise<Point3D | null>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
+  hasRenderableExpressId: (modelID: number, expressID: number) => boolean
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
   applyIfcElementOffset: (modelID: number, expressID: number, targetOffset: OffsetVector) => void
@@ -238,6 +238,9 @@ export const useSelectionOffsets = (
   const cubeRegistryRef = useRef<Map<number, Mesh>>(new Map())
   const cubeIdCounterRef = useRef(1)
   const highlightedCubeRef = useRef<number | null>(null)
+  const highlightedIfcRef = useRef<{ modelID: number; expressID: number } | null>(null)
+  const selectionSubsetsRef = useRef<Map<number, Mesh>>(new Map())
+  const selectionMaterialRef = useRef<MeshStandardMaterial | null>(null)
   const focusOffsetRef = useRef<Point3D | null>(null)
   const customCubeRoomsRef = useRef<Map<number, string>>(new Map())
 
@@ -304,14 +307,93 @@ export const useSelectionOffsets = (
     [normalizeIfcTypeName, resolveIfcTypeName]
   )
 
+  const getSelectionSubsetId = useCallback((modelID: number) => {
+    return `${SELECTION_SUBSET_PREFIX}${modelID}`
+  }, [])
+
+  const getSelectionMaterial = useCallback(() => {
+    if (!selectionMaterialRef.current) {
+      selectionMaterialRef.current = new MeshStandardMaterial({
+        color: IFC_SELECTION_COLOR,
+        emissive: IFC_SELECTION_EMISSIVE,
+        side: DoubleSide,
+        roughness: 0.45,
+        metalness: 0,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2
+      })
+    }
+    return selectionMaterialRef.current
+  }, [])
+
+  const clearIfcSelectionHighlight = useCallback(
+    (modelID?: number | null) => {
+      const viewer = viewerRef.current
+      const idsToClear =
+        typeof modelID === 'number' ? [modelID] : Array.from(selectionSubsetsRef.current.keys())
+
+      if (!viewer) {
+        idsToClear.forEach((id) => selectionSubsetsRef.current.delete(id))
+        if (typeof modelID !== 'number' || highlightedIfcRef.current?.modelID === modelID) {
+          highlightedIfcRef.current = null
+        }
+        return
+      }
+
+      const manager = viewer.IFC.loader.ifcManager
+      const scene = viewer.context.getScene()
+      idsToClear.forEach((id) => {
+        const subset = selectionSubsetsRef.current.get(id)
+        if (subset) {
+          scene.remove(subset)
+          selectionSubsetsRef.current.delete(id)
+        }
+        manager.removeSubset(id, undefined, getSelectionSubsetId(id))
+      })
+      if (typeof modelID !== 'number' || highlightedIfcRef.current?.modelID === modelID) {
+        highlightedIfcRef.current = null
+      }
+    },
+    [getSelectionSubsetId, viewerRef]
+  )
+
   const focusOnPoint = useCallback(
     (point: Point3D | null) => {
       const viewer = viewerRef.current
       if (!viewer || !point) return
       const controls = viewer.context.ifcCamera.cameraControls
-      const current = new Vector3()
-      controls.getPosition(current)
-      controls.setLookAt(current.x, current.y, current.z, point.x, point.y, point.z, true)
+      const currentPosition = new Vector3()
+      const currentTarget = new Vector3()
+      controls.getPosition(currentPosition)
+      controls.getTarget(currentTarget)
+
+      const direction = currentPosition.clone().sub(currentTarget)
+      let distance = direction.length()
+      if (!Number.isFinite(distance) || distance < 0.001) {
+        direction.set(1, 0.6, 1)
+        distance = 10
+      }
+      direction.normalize()
+
+      // Keep orientation but bring camera closer so focus feels like actual zoom-to-element.
+      const desiredDistance = Math.min(Math.max(distance * 0.6, 2.5), 16)
+      const nextPosition = new Vector3(point.x, point.y, point.z).addScaledVector(
+        direction,
+        desiredDistance
+      )
+      controls.setLookAt(
+        nextPosition.x,
+        nextPosition.y,
+        nextPosition.z,
+        point.x,
+        point.y,
+        point.z,
+        true
+      )
     },
     [viewerRef]
   )
@@ -358,8 +440,9 @@ export const useSelectionOffsets = (
     setIsFetchingProperties(false)
     setCubeHighlight(null)
     focusOffsetRef.current = null
+    clearIfcSelectionHighlight()
     viewerRef.current?.IFC.selector.unpickIfcItems()
-  }, [setCubeHighlight])
+  }, [clearIfcSelectionHighlight, setCubeHighlight, viewerRef])
 
   const getElementKey = useCallback((modelID: number, expressID: number) => {
     return `${modelID}:${expressID}`
@@ -425,25 +508,28 @@ export const useSelectionOffsets = (
   const getExpressIdSet = useCallback(
     (modelID: number) => {
       const cached = expressIdCacheRef.current.get(modelID)
-      if (cached) return cached
+      if (cached && cached.size > 0) return cached
 
       const viewer = viewerRef.current
       const model = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh as Mesh | undefined
       const expressAttr = model?.geometry.getAttribute('expressID')
       if (!expressAttr || !('array' in expressAttr)) {
-        const empty = new Set<number>()
-        expressIdCacheRef.current.set(modelID, empty)
-        return empty
+        // Model/geometry might not be ready yet. Do not cache empty permanently.
+        return cached ?? new Set<number>()
       }
 
       const uniqueIds = new Set<number>()
       Array.from((expressAttr as { array: ArrayLike<number> }).array).forEach((rawId) => {
         if (typeof rawId === 'number') {
-          uniqueIds.add(rawId)
+          uniqueIds.add(Math.trunc(rawId))
         }
       })
 
-      expressIdCacheRef.current.set(modelID, uniqueIds)
+      if (uniqueIds.size > 0) {
+        expressIdCacheRef.current.set(modelID, uniqueIds)
+      } else if (!cached) {
+        expressIdCacheRef.current.set(modelID, uniqueIds)
+      }
       return uniqueIds
     },
     [viewerRef]
@@ -463,6 +549,69 @@ export const useSelectionOffsets = (
       return getExpressIdSet(modelID).has(expressID)
     },
     [getExpressIdSet]
+  )
+
+  const applyIfcSelectionHighlight = useCallback(
+    (modelID: number, expressID: number) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+      if (!hasRenderableExpressId(modelID, expressID)) {
+        clearIfcSelectionHighlight(modelID)
+        return
+      }
+
+      const previous = highlightedIfcRef.current
+      if (previous && (previous.modelID !== modelID || previous.expressID !== expressID)) {
+        clearIfcSelectionHighlight(previous.modelID)
+      }
+
+      const manager = viewer.IFC.loader.ifcManager
+      const scene = viewer.context.getScene()
+      const subset = manager.createSubset({
+        modelID,
+        ids: [expressID],
+        scene,
+        removePrevious: true,
+        material: getSelectionMaterial(),
+        customID: getSelectionSubsetId(modelID)
+      }) as Mesh | null
+
+      if (!subset) {
+        clearIfcSelectionHighlight(modelID)
+        return
+      }
+
+      const key = getElementKey(modelID, expressID)
+      const movedSubset = movedSubsetsRef.current.get(key)
+      if (movedSubset) {
+        subset.matrix.copy(movedSubset.matrix)
+        subset.matrixAutoUpdate = false
+      } else {
+        const baseSubset = baseSubsetsRef.current.get(modelID)
+        if (baseSubset) {
+          subset.matrix.copy(baseSubset.matrix)
+          subset.matrixAutoUpdate = false
+        } else {
+          const model = manager.state?.models?.[modelID]?.mesh as Mesh | undefined
+          if (model) {
+            subset.matrix.copy(model.matrix)
+            subset.matrixAutoUpdate = false
+          }
+        }
+      }
+
+      subset.renderOrder = 10
+      selectionSubsetsRef.current.set(modelID, subset)
+      highlightedIfcRef.current = { modelID, expressID }
+    },
+    [
+      clearIfcSelectionHighlight,
+      getElementKey,
+      getSelectionMaterial,
+      getSelectionSubsetId,
+      hasRenderableExpressId,
+      viewerRef
+    ]
   )
 
   const getBaseCenter = useCallback(
@@ -701,6 +850,7 @@ export const useSelectionOffsets = (
         new Set([
           ...baseSubsetsRef.current.keys(),
           ...spaceBiasSubsetsRef.current.keys(),
+          ...selectionSubsetsRef.current.keys(),
           ...Array.from(movedSubsetsRef.current.keys())
             .map((key) => Number(key.split(':')[0]))
             .filter((id) => Number.isFinite(id))
@@ -723,6 +873,12 @@ export const useSelectionOffsets = (
           removePickable(viewer, spaceBiasSubset)
           manager.removeSubset(id, undefined, getSpaceBiasSubsetId(id))
           spaceBiasSubsetsRef.current.delete(id)
+        }
+        const selectionSubset = selectionSubsetsRef.current.get(id)
+        if (selectionSubset) {
+          scene.remove(selectionSubset)
+          manager.removeSubset(id, undefined, getSelectionSubsetId(id))
+          selectionSubsetsRef.current.delete(id)
         }
         const movedKeys = Array.from(movedSubsetsRef.current.keys()).filter((key) =>
           key.startsWith(`${id}:`)
@@ -757,14 +913,26 @@ export const useSelectionOffsets = (
         Array.from(baseCentersRef.current.keys())
           .filter((key) => key.startsWith(`${id}:`))
           .forEach((key) => baseCentersRef.current.delete(key))
+        if (highlightedIfcRef.current?.modelID === id) {
+          highlightedIfcRef.current = null
+        }
       })
       if (typeof modelID !== 'number') {
         baseCentersRef.current.clear()
         spaceBiasIdsRef.current.clear()
         spaceBiasAppliedRef.current.clear()
+        selectionSubsetsRef.current.clear()
+        highlightedIfcRef.current = null
       }
     },
-    [getFilterSubsetId, getSpaceBiasSubsetId, registerPickable, removePickable, viewerRef]
+    [
+      getFilterSubsetId,
+      getSelectionSubsetId,
+      getSpaceBiasSubsetId,
+      registerPickable,
+      removePickable,
+      viewerRef
+    ]
   )
 
   const updateVisibilityForModel = useCallback(
@@ -995,7 +1163,9 @@ export const useSelectionOffsets = (
       setPropertyError(null)
 
       try {
-        const properties = await viewer.IFC.getProperties(modelID, expressID, true, true)
+        // Recursive relation traversal can explode on large IFC graphs and freeze UI.
+        // We only need direct attributes + property sets for the inspector panel.
+        const properties = await viewer.IFC.getProperties(modelID, expressID, false, true)
         if (!properties) {
           throw new Error('No properties returned for this element.')
         }
@@ -1041,7 +1211,12 @@ export const useSelectionOffsets = (
         }
         console.error('Failed to load IFC properties', err)
         setPropertyError('Unable to load IFC properties for the selected element.')
-        setSelectedElement(null)
+        setSelectedElement((prev) => {
+          if (prev && prev.modelID === modelID && prev.expressID === expressID) {
+            return prev
+          }
+          return { modelID, expressID }
+        })
         setPropertyFields([])
       } finally {
         if (propertyRequestRef.current === requestToken) {
@@ -1209,6 +1384,7 @@ export const useSelectionOffsets = (
       }
 
       const previous = movedSubsetsRef.current.get(key)
+      const hadMovedSubset = Boolean(previous)
       if (previous) {
         scene.remove(previous)
         removePickable(viewer, previous)
@@ -1230,7 +1406,9 @@ export const useSelectionOffsets = (
 
       if (isZeroOffset) {
         const isSpaceBiasTarget = spaceBiasIdsRef.current.get(modelID)?.has(expressID) ?? false
-        if (!isSpaceBiasTarget) {
+        // Only restore to base subset when the element was actually moved out of it.
+        // Otherwise repeated zero-offset updates duplicate faces and cause z-fighting.
+        if (!isSpaceBiasTarget && hadMovedSubset) {
           const restored = manager.createSubset({
             modelID,
             ids: [expressID],
@@ -1246,6 +1424,14 @@ export const useSelectionOffsets = (
         elementOffsetsRef.current.delete(key)
         const activeFilter = filterIdsRef.current.get(modelID) ?? null
         updateVisibilityForModel(modelID, activeFilter)
+        const activeHighlight = highlightedIfcRef.current
+        if (
+          activeHighlight &&
+          activeHighlight.modelID === modelID &&
+          activeHighlight.expressID === expressID
+        ) {
+          applyIfcSelectionHighlight(modelID, expressID)
+        }
         return
       }
 
@@ -1277,8 +1463,13 @@ export const useSelectionOffsets = (
       registerPickable(viewer, moved as Mesh)
       const activeFilter = filterIdsRef.current.get(modelID) ?? null
       updateVisibilityForModel(modelID, activeFilter)
+      const activeHighlight = highlightedIfcRef.current
+      if (activeHighlight && activeHighlight.modelID === modelID && activeHighlight.expressID === expressID) {
+        applyIfcSelectionHighlight(modelID, expressID)
+      }
     },
     [
+      applyIfcSelectionHighlight,
       ensureBaseSubset,
       getBaseCenter,
       getElementKey,
@@ -1354,6 +1545,7 @@ export const useSelectionOffsets = (
       const hitObject: any = resolvedHit?.object
 
       if (resolvedHit && hitObject?.modelID === CUSTOM_CUBE_MODEL_ID) {
+        clearIfcSelectionHighlight()
         viewer.IFC.selector.unpickIfcItems()
         const hitExpressId = getExpressIdFromHit(resolvedHit as any) ?? cubeIdCounterRef.current
 
@@ -1384,20 +1576,27 @@ export const useSelectionOffsets = (
         return
       }
 
-      // Keep IFC outlines disabled: clear viewer selection highlight immediately.
       viewer.IFC.selector.unpickIfcItems()
-      const focusPoint =
-        shouldAutoFocus ? getElementWorldPosition(picked.modelID, picked.id) : null
+      applyIfcSelectionHighlight(picked.modelID, picked.id)
+      setSelectedElement({ modelID: picked.modelID, expressID: picked.id })
+      setPropertyError(null)
+      const focusPoint = shouldAutoFocus
+        ? picked.point
+          ? { x: picked.point.x, y: picked.point.y, z: picked.point.z }
+          : getElementWorldPosition(picked.modelID, picked.id)
+        : null
       if (shouldAutoFocus && focusPoint) {
         focusOnPoint(focusPoint)
       }
-      await fetchProperties(picked.modelID, picked.id, focusPoint)
+      void fetchProperties(picked.modelID, picked.id, focusPoint)
     } catch (err) {
       console.error('Failed to pick IFC item', err)
       resetSelection()
     }
   }, [
     fetchProperties,
+    applyIfcSelectionHighlight,
+    clearIfcSelectionHighlight,
     focusOnPoint,
     getElementWorldPosition,
     getExpressIdFromHit,
@@ -1425,11 +1624,17 @@ export const useSelectionOffsets = (
 
         const isRenderable = hasRenderableExpressId(modelID, expressID)
         const shouldAutoFocus = options?.autoFocus ?? true
-        // Keep IFC outlines disabled: never keep highlighted IFC selection subsets.
         viewer.IFC.selector.unpickIfcItems()
+        setSelectedElement({ modelID, expressID })
+        setPropertyError(null)
+        if (isRenderable) {
+          applyIfcSelectionHighlight(modelID, expressID)
+        } else {
+          clearIfcSelectionHighlight(modelID)
+        }
         const focusPoint =
           shouldAutoFocus && isRenderable ? getElementWorldPosition(modelID, expressID) : null
-        await fetchProperties(modelID, expressID, focusPoint)
+        void fetchProperties(modelID, expressID, focusPoint)
         const elementCenter = getElementWorldPosition(modelID, expressID)
         const resolvedPoint = shouldAutoFocus ? (focusPoint ?? elementCenter) : elementCenter
         const selectionPoint = resolvedPoint
@@ -1450,6 +1655,8 @@ export const useSelectionOffsets = (
       return null
     },
     [
+      applyIfcSelectionHighlight,
+      clearIfcSelectionHighlight,
       fetchProperties,
       getElementKey,
       focusOnPoint,
@@ -1488,8 +1695,13 @@ export const useSelectionOffsets = (
       spaceBiasAppliedRef.current.get(modelID)?.delete(expressID)
       const activeFilter = filterIdsRef.current.get(modelID) ?? null
       updateVisibilityForModel(modelID, activeFilter)
+      const activeHighlight = highlightedIfcRef.current
+      if (activeHighlight && activeHighlight.modelID === modelID && activeHighlight.expressID === expressID) {
+        clearIfcSelectionHighlight(modelID)
+      }
     },
     [
+      clearIfcSelectionHighlight,
       ensureBaseSubset,
       getElementKey,
       getFilterSubsetId,
@@ -1504,6 +1716,7 @@ export const useSelectionOffsets = (
     (expressID: number) => {
       const cube = cubeRegistryRef.current.get(expressID)
       if (!cube) return
+      clearIfcSelectionHighlight()
       viewerRef.current?.IFC.selector.unpickIfcItems()
       const pos = cube.position
       setSelectedElement({ modelID: CUSTOM_CUBE_MODEL_ID, expressID, type: 'CUBE' })
@@ -1514,12 +1727,13 @@ export const useSelectionOffsets = (
       setCubeHighlight(expressID)
       focusOnPoint({ x: pos.x, y: pos.y, z: pos.z })
     },
-    [buildCubePropertyFields, focusOnPoint, setCubeHighlight]
+    [buildCubePropertyFields, clearIfcSelectionHighlight, focusOnPoint, setCubeHighlight, viewerRef]
   )
 
   const clearIfcHighlight = useCallback(() => {
+    clearIfcSelectionHighlight()
     viewerRef.current?.IFC.selector.unpickIfcItems()
-  }, [viewerRef])
+  }, [clearIfcSelectionHighlight, viewerRef])
 
   const removeCustomCube = useCallback(
     (expressID: number) => {
@@ -1645,6 +1859,7 @@ export const useSelectionOffsets = (
     selectById,
     selectCustomCube,
     clearIfcHighlight,
+    hasRenderableExpressId,
     removeCustomCube,
     getElementWorldPosition,
     moveSelectedTo,

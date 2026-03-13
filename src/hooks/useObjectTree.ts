@@ -3,9 +3,12 @@ import type { ObjectTree, ObjectTreeNode } from '../ifcViewerTypes'
 import { localizeIfcType } from '../utils/ifcTypeLocalization'
 
 type SpatialNode = {
-  expressID?: number
+  expressID?: number | string | { value?: number | string | null } | null
+  expressId?: number | string | { value?: number | string | null } | null
+  localId?: number | string | { value?: number | string | null } | null
   children?: SpatialNode[]
   type?: string
+  category?: string | null
   Name?: { value?: string }
   name?: string
 }
@@ -15,11 +18,34 @@ const CUSTOM_ROOT_PREFIX = 'custom-root-'
 const CUSTOM_NODE_PREFIX = 'custom-node-'
 const CUSTOM_ROOT_LABEL = 'Vlastni objekty'
 
-const buildLabel = (node: SpatialNode): string => {
-  if (node.Name?.value) return String(node.Name.value)
-  if (node.name) return node.name
-  if (node.type && node.expressID !== undefined) return `${localizeIfcType(node.type)} #${node.expressID}`
-  if (node.type) return localizeIfcType(node.type)
+const parseSpatialExpressId = (raw: unknown): number | null => {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return Math.trunc(raw)
+  }
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed)
+    }
+  }
+  if (raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)) {
+    return parseSpatialExpressId((raw as { value?: unknown }).value)
+  }
+  return null
+}
+
+const getSpatialLocalId = (node: SpatialNode): number | null => {
+  return parseSpatialExpressId(node.localId)
+}
+
+const normalizeSpatialType = (node: SpatialNode): string => {
+  const raw = node.type ?? node.category ?? ''
+  const normalized = String(raw).trim().toUpperCase()
+  return normalized || 'UNKNOWN'
+}
+
+const buildLabel = (type: string): string => {
+  if (type !== 'UNKNOWN') return localizeIfcType(type)
   return 'IFC prvek'
 }
 
@@ -27,22 +53,51 @@ const normalizeIfcType = (type?: string): string => (type ?? '').toUpperCase()
 const isIfcType = (node: ObjectTreeNode, target: string): boolean =>
   node.nodeType === 'ifc' && normalizeIfcType(node.type) === target
 
+const makeIfcNodeId = (
+  modelID: number,
+  localId: number,
+  acc: ObjectTree,
+): string => {
+  const baseId = `ifc-${modelID}-${localId}`
+  if (!acc.nodes[baseId]) return baseId
+  let suffix = 1
+  while (acc.nodes[`${baseId}-${suffix}`]) {
+    suffix += 1
+  }
+  return `${baseId}-${suffix}`
+}
+
 const traverseSpatial = (
   node: SpatialNode,
   modelID: number,
   parentId: string | null,
   acc: ObjectTree,
-  counter: { current: number }
-): string => {
-  const expressID = typeof node.expressID === 'number' ? node.expressID : null
-  const id = expressID !== null ? `ifc-${modelID}-${expressID}` : `ifc-${modelID}-aux-${counter.current++}`
-  const label = buildLabel(node)
-  const type = node.type ?? 'UNKNOWN'
+  visited: WeakSet<object>
+): string[] => {
+  if (!node || typeof node !== 'object') return []
+  if (visited.has(node as object)) return []
+  visited.add(node as object)
+
+  const localId = getSpatialLocalId(node)
+  const type = normalizeSpatialType(node)
+  const children = Array.isArray(node.children) ? node.children : []
+  const isUnknown = type === 'UNKNOWN'
+
+  if (isUnknown || localId === null) {
+    const promoted: string[] = []
+    children.forEach((child) => {
+      promoted.push(...traverseSpatial(child, modelID, parentId, acc, visited))
+    })
+    return promoted
+  }
+
+  const id = makeIfcNodeId(modelID, localId, acc)
+  const label = buildLabel(type)
 
   const treeNode: ObjectTreeNode = {
     id,
     modelID,
-    expressID,
+    expressID: localId,
     label,
     type,
     nodeType: 'ifc',
@@ -52,22 +107,22 @@ const traverseSpatial = (
 
   acc.nodes[id] = treeNode
 
-  if (Array.isArray(node.children)) {
-    node.children.forEach((child) => {
-      const childId = traverseSpatial(child, modelID, id, acc, counter)
-      treeNode.children.push(childId)
+  if (children.length > 0) {
+    children.forEach((child) => {
+      const childIds = traverseSpatial(child, modelID, id, acc, visited)
+      treeNode.children.push(...childIds)
     })
   }
 
-  return id
+  return [id]
 }
 
 export const buildIfcTree = (spatialRoot: SpatialNode | null | undefined, modelID: number): ObjectTree => {
   if (!spatialRoot) return emptyTree
   const acc: ObjectTree = { nodes: {}, roots: [] }
-  const counter = { current: 1 }
-  const rootId = traverseSpatial(spatialRoot, modelID, null, acc, counter)
-  acc.roots.push(rootId)
+  const visited = new WeakSet<object>()
+  const rootIds = traverseSpatial(spatialRoot, modelID, null, acc, visited)
+  acc.roots.push(...rootIds)
   return acc
 }
 

@@ -106,7 +106,7 @@ import { IfcViewer } from 'ifc-viewer-component'
 ## Notes
 
 - Styles are imported inside `IfcViewer.tsx` via `./IfcViewer.css`.
-- The component relies on `three`, `web-ifc`, and `web-ifc-viewer` being installed in the host app.
+- The component relies on `three`, `web-ifc`, and `@thatopen/components` (`@thatopen/components-front`) in the host app.
 - The host app is responsible for loading/saving project data (metadata/furniture/history).
 - This repo currently ships source files (`src/*`); the consuming app builds them during its own Vite build.
 
