@@ -84,7 +84,7 @@ const ensureCameraControlsInstalled = () => {
 }
 
 const resolveSpatialType = (item: any): string => {
-  const candidates = [item?.category, item?.type, item?.ifcClass]
+  const candidates = [item?._category, item?.category, item?.ifcClass, item?.type]
   for (const candidate of candidates) {
     if (typeof candidate === 'string') {
       const value = candidate.trim()
@@ -98,24 +98,76 @@ const resolveSpatialType = (item: any): string => {
   return 'UNKNOWN'
 }
 
-const resolveSpatialLocalId = (item: any): number | string | undefined => {
-  const raw = item?.localId
+const parseSpatialIdCandidate = (raw: unknown): number | undefined => {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
     return Math.trunc(raw)
   }
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim()
-    return trimmed.length > 0 ? trimmed : undefined
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed)
+    }
+  }
+  if (raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)) {
+    return parseSpatialIdCandidate((raw as { value?: unknown }).value)
   }
   return undefined
 }
 
-const toLegacySpatial = (item: any): any => ({
-  expressID: resolveSpatialLocalId(item),
-  localId: resolveSpatialLocalId(item),
-  type: resolveSpatialType(item),
-  children: Array.isArray(item?.children) ? item.children.map((child: any) => toLegacySpatial(child)) : []
-})
+const resolveSpatialIdCandidates = (item: any): number[] => {
+  const candidates = [
+    item?.expressID,
+    item?.expressId,
+    item?.id,
+    item?.localId
+  ]
+  const dedup = new Set<number>()
+  candidates.forEach((candidate) => {
+    const parsed = parseSpatialIdCandidate(candidate)
+    if (parsed !== undefined) {
+      dedup.add(parsed)
+    }
+  })
+  return Array.from(dedup)
+}
+
+const resolveSpatialSelectionId = (item: any, renderableIds?: Set<number>): number | undefined => {
+  const candidates = resolveSpatialIdCandidates(item)
+  if (candidates.length === 0) return undefined
+  if (renderableIds && renderableIds.size > 0) {
+    const matching = candidates.find((candidate) => renderableIds.has(candidate))
+    if (matching !== undefined) return matching
+  }
+  return candidates[0]
+}
+
+const resolveSpatialName = (item: any): string | undefined => {
+  const candidates = [item?.name, item?.Name]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const value = candidate.trim()
+      if (value) return value
+    }
+    if (candidate && typeof candidate === 'object' && typeof (candidate as any).value === 'string') {
+      const value = (candidate as any).value.trim()
+      if (value) return value
+    }
+  }
+  return undefined
+}
+
+const toLegacySpatial = (item: any, renderableIds?: Set<number>): any => {
+  const normalizedId = resolveSpatialSelectionId(item, renderableIds)
+  return {
+    expressID: normalizedId,
+    localId: normalizedId,
+    type: resolveSpatialType(item),
+    name: resolveSpatialName(item),
+    children: Array.isArray(item?.children)
+      ? item.children.map((child: any) => toLegacySpatial(child, renderableIds))
+      : []
+  }
+}
 
 const toLegacyItemData = (value: any, depth = 0, stack = new WeakSet<object>()): any => {
   if (value === null || value === undefined) return value
@@ -507,7 +559,7 @@ export class IfcViewerAPI {
         const record = this.modelsById.get(modelID)
         if (!record) return null
         const spatial = await record.fragments.getSpatialStructure()
-        return toLegacySpatial(spatial)
+        return toLegacySpatial(spatial, record.expressIds)
       },
       getItemProperties: async (modelID: number, expressID: number, recursive = false) => {
         return this.getItemProperties(modelID, expressID, recursive, false)
@@ -626,7 +678,7 @@ export class IfcViewerAPI {
         const record = this.modelsById.get(modelID)
         if (!record) return null
         const spatial = await record.fragments.getSpatialStructure()
-        return toLegacySpatial(spatial)
+        return toLegacySpatial(spatial, record.expressIds)
       },
       getProperties: async (
         modelID: number,

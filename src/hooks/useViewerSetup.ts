@@ -47,7 +47,7 @@ export const useViewerSetup = (
     cameraControls.mouseButtons.left = CameraControls.ACTION.NONE
     cameraControls.mouseButtons.middle = CameraControls.ACTION.ROTATE
     cameraControls.mouseButtons.right = CameraControls.ACTION.TRUCK
-    cameraControls.mouseButtons.wheel = CameraControls.ACTION.DOLLY
+    cameraControls.mouseButtons.wheel = CameraControls.ACTION.NONE
 
     viewerRef.current = viewer
     return viewer

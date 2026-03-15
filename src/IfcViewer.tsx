@@ -19,7 +19,13 @@ import { PropertiesPanel } from './components/PropertiesPanel'
 import { ObjectTreePanel } from './components/ObjectTreePanel'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 import { SelectionMenu } from './components/SelectionMenu'
-import { buildIfcTree, groupIfcTreeByRoomNumber, useObjectTree } from './hooks/useObjectTree'
+import {
+  buildIfcTree,
+  groupIfcTreeByRoomNumber,
+  groupIfcTreeBySpatialContainment,
+  useObjectTree
+} from './hooks/useObjectTree'
+import { localizeIfcType } from './utils/ifcTypeLocalization'
 import './IfcViewer.css'
 
 type IfcViewerProps = {
@@ -69,23 +75,16 @@ const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
 const POSITION_EPSILON = 1e-4
 const WALK_MOVE_SPEED = 2.8
-const WALK_LOOK_SENSITIVITY = 0.0025
+const WALK_LOOK_SENSITIVITY = 0.00125
 const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
+const WALK_DRAG_MOVE_PER_PIXEL = 0.02
+const FREE_WHEEL_MOVE_FACTOR = 0.0067
+const FREE_WHEEL_MAX_DELTA = 240
 const MODEL_LOAD_TIMEOUT_MS = 60_000
 const IFC_LOADER_SETTINGS = {
   COORDINATE_TO_ORIGIN: true,
   USE_FAST_BOOLS: false
 }
-// Walk mode keeps scene interaction narrow so navigation stays practical indoors.
-const WALK_ALLOWED_IFC_SELECTION_TYPES = [
-  'IFCWALL',
-  'IFCWALLSTANDARDCASE',
-  'IFCCURTAINWALL',
-  'IFCWINDOW',
-  'IFCFURNISHINGELEMENT',
-  'IFCFURNITURE',
-  'IFCSYSTEMFURNITUREELEMENT'
-]
 // Common property names used by authoring tools for room numbers (Pset text values).
 const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
@@ -94,10 +93,15 @@ const ROOM_NUMBER_KEYS = new Set([
 const ENABLE_ROOM_NUMBER_GROUPING = false
 const MAX_ROOM_NUMBER_LOOKUPS = 400
 const ROOM_NUMBER_BATCH_SIZE = 20
+const CONTAINMENT_RELATION_BATCH_SIZE = 20
+const MAX_CONTAINMENT_RELATION_LOOKUPS = 800
+const UNKNOWN_TREE_TYPE_BATCH_SIZE = 20
+const MAX_UNKNOWN_TREE_TYPE_LOOKUPS = 1200
 const SHORTCUTS = [
   { keys: 'M', label: 'Toggle free look / walk mode' },
   { keys: 'Arrow Keys', label: 'Move in walk mode (fixed height)' },
-  { keys: 'Right Mouse Drag (walk)', label: 'Look around in place' },
+  { keys: 'Middle Mouse Drag (walk)', label: 'Rotate camera' },
+  { keys: 'Right Mouse Drag (walk)', label: 'Move in floor plane' },
   { keys: 'A (free mode)', label: 'Open insert menu at cursor' },
   { keys: 'G', label: 'Start move mode' },
   { keys: 'X / Y / Z', label: 'Lock axis while moving' },
@@ -381,7 +385,7 @@ const applyNavigationControls = (viewer: IfcViewerAPI, mode: NavigationMode) => 
   controls.mouseButtons.left = CameraControls.ACTION.NONE
   controls.mouseButtons.middle = CameraControls.ACTION.ROTATE
   controls.mouseButtons.right = CameraControls.ACTION.TRUCK
-  controls.mouseButtons.wheel = CameraControls.ACTION.DOLLY
+  controls.mouseButtons.wheel = CameraControls.ACTION.NONE
 }
 
 const normalizeIfcValue = (rawValue: any): string => {
@@ -402,6 +406,138 @@ const normalizeIfcValue = (rawValue: any): string => {
 
 const normalizePropertyKey = (value: string): string =>
   value.toLowerCase().replace(/[\s_-]+/g, '')
+
+const normalizeIfcTypeValue = (value: unknown): string | null => {
+  if (typeof value === 'string') {
+    const normalized = value.trim().toUpperCase()
+    return normalized || null
+  }
+  if (value && typeof value === 'object' && 'value' in (value as Record<string, unknown>)) {
+    return normalizeIfcTypeValue((value as { value?: unknown }).value)
+  }
+  return null
+}
+
+const resolveIfcTypeFromProperties = (properties: any): string | null => {
+  const candidates = [
+    properties?.ifcClass,
+    properties?.type,
+    properties?._category,
+    properties?.category,
+    properties?.ObjectType,
+    properties?.PredefinedType
+  ]
+  for (const candidate of candidates) {
+    const normalized = normalizeIfcTypeValue(candidate)
+    if (normalized) return normalized
+  }
+  return null
+}
+
+const parseIfcReferenceId = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.trunc(value)
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed)
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const parsed = parseIfcReferenceId(entry)
+      if (parsed !== null) return parsed
+    }
+    return null
+  }
+  if (!value || typeof value !== 'object') return null
+
+  const candidate = value as Record<string, unknown>
+  const keys = ['value', 'expressID', 'expressId', 'localId', 'id']
+  for (const key of keys) {
+    if (!(key in candidate)) continue
+    const parsed = parseIfcReferenceId(candidate[key])
+    if (parsed !== null) return parsed
+  }
+  return null
+}
+
+const resolveIfcEntityKind = (value: unknown): string | null => {
+  if (!value || typeof value !== 'object') return null
+  const item = value as Record<string, unknown>
+  const candidates = [item.type, item.ifcClass, item._category, item.category]
+  for (const candidate of candidates) {
+    const normalized = normalizeIfcTypeValue(candidate)
+    if (normalized) return normalized
+  }
+  return null
+}
+
+const resolveContainedSpaceId = (properties: any): number | null => {
+  const relationCandidates = [
+    properties?.ContainedInStructure,
+    properties?.containedInStructure,
+    properties?.IsContainedIn,
+    properties?.isContainedIn
+  ]
+  const relations: unknown[] = []
+  relationCandidates.forEach((candidate) => {
+    if (candidate === undefined || candidate === null) return
+    if (Array.isArray(candidate)) {
+      relations.push(...candidate)
+    } else {
+      relations.push(candidate)
+    }
+  })
+
+  for (const relation of relations) {
+    const spaceId = resolveContainedSpaceIdFromRelation(relation)
+    if (spaceId !== null) return spaceId
+  }
+
+  return null
+}
+
+const resolveContainedSpaceIdFromRelation = (relation: unknown): number | null => {
+  if (!relation || typeof relation !== 'object') return null
+  const relationObj = relation as Record<string, unknown>
+  const relationType = resolveIfcEntityKind(relationObj)
+  if (relationType && relationType !== 'IFCRELCONTAINEDINSPATIALSTRUCTURE') return null
+  const spaceCandidate =
+    relationObj.RelatingStructure ??
+    relationObj.relatingStructure ??
+    relationObj.RelatedStructure ??
+    relationObj.relatedStructure
+  return parseIfcReferenceId(spaceCandidate)
+}
+
+const collectContainedRelationIds = (properties: any): number[] => {
+  const relationCandidates = [
+    properties?.ContainedInStructure,
+    properties?.containedInStructure,
+    properties?.IsContainedIn,
+    properties?.isContainedIn
+  ]
+  const relations: unknown[] = []
+  relationCandidates.forEach((candidate) => {
+    if (candidate === undefined || candidate === null) return
+    if (Array.isArray(candidate)) {
+      relations.push(...candidate)
+    } else {
+      relations.push(candidate)
+    }
+  })
+
+  const relationIds: number[] = []
+  for (const relation of relations) {
+    const relationId = parseIfcReferenceId(relation)
+    if (relationId !== null) {
+      relationIds.push(relationId)
+    }
+  }
+  return relationIds
+}
 
 // Extract a room number string from IFC property sets.
 const extractRoomNumber = (properties: any): string | null => {
@@ -481,6 +617,77 @@ const buildRoomNumberMap = async (
     map.set(entry[0], entry[1])
   })
   return map
+}
+
+const IFC_SPATIAL_TYPES = new Set([
+  'IFCPROJECT',
+  'IFCSITE',
+  'IFCBUILDING',
+  'IFCBUILDINGSTOREY',
+  'IFCSPACE'
+])
+
+const collectContainmentCandidateIds = (tree: ObjectTree): number[] => {
+  const ids = new Set<number>()
+
+  // Prefer descendants under storeys: these are the elements that can be re-parented to spaces.
+  const stack: string[] = []
+  Object.values(tree.nodes).forEach((node) => {
+    if (node.nodeType !== 'ifc') return
+    if (node.type.toUpperCase() !== 'IFCBUILDINGSTOREY') return
+    stack.push(...node.children)
+  })
+
+  const visited = new Set<string>()
+  while (stack.length > 0) {
+    const nodeId = stack.pop()
+    if (!nodeId || visited.has(nodeId)) continue
+    visited.add(nodeId)
+
+    const node = tree.nodes[nodeId]
+    if (!node) continue
+    if (node.children.length > 0) {
+      stack.push(...node.children)
+    }
+    if (node.nodeType !== 'ifc' || node.expressID === null) continue
+
+    const type = node.type.toUpperCase()
+    if (IFC_SPATIAL_TYPES.has(type) || type.startsWith('IFCREL')) continue
+    ids.add(node.expressID)
+  }
+
+  // Fallback for atypical hierarchies where storey roots are missing.
+  if (ids.size === 0) {
+    Object.values(tree.nodes).forEach((node) => {
+      if (node.nodeType !== 'ifc' || node.expressID === null) return
+      const type = node.type.toUpperCase()
+      if (IFC_SPATIAL_TYPES.has(type) || type.startsWith('IFCREL')) return
+      const parent = node.parentId ? tree.nodes[node.parentId] : null
+      const parentType = parent?.type?.toUpperCase?.() ?? ''
+      if (parentType === 'IFCBUILDINGSTOREY' || parentType === 'IFCSPACE' || parentType === 'UNKNOWN') {
+        ids.add(node.expressID)
+      }
+    })
+  }
+  return Array.from(ids)
+}
+
+const resolveSpaceFromRelationId = async (
+  viewer: IfcViewerAPI,
+  modelID: number,
+  relationExpressId: number
+): Promise<number | null> => {
+  try {
+    const relationProperties = await viewer.IFC.getProperties(modelID, relationExpressId, false, false)
+    if (!relationProperties) return null
+    const spaceFromRelation = resolveContainedSpaceIdFromRelation(relationProperties)
+    if (spaceFromRelation !== null) {
+      return spaceFromRelation
+    }
+    return resolveContainedSpaceId(relationProperties)
+  } catch {
+    return null
+  }
 }
 
 const parseCubeId = (id: string): number | null => {
@@ -595,6 +802,9 @@ const IfcViewer = ({
   const walkLookActiveRef = useRef(false)
   const walkLookPointerIdRef = useRef<number | null>(null)
   const walkLookLastPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const walkDragActiveRef = useRef(false)
+  const walkDragPointerIdRef = useRef<number | null>(null)
+  const walkDragLastPointerRef = useRef<{ x: number; y: number } | null>(null)
 
   const {
     selectedElement,
@@ -609,6 +819,8 @@ const IfcViewer = ({
     selectById,
     selectCustomCube,
     clearIfcHighlight,
+    highlightIfcGroup,
+    hasRenderableExpressId,
     getElementWorldPosition,
     moveSelectedTo,
     getSelectedWorldPosition,
@@ -758,10 +970,13 @@ const IfcViewer = ({
     walkLookActiveRef.current = false
     walkLookPointerIdRef.current = null
     walkLookLastPointerRef.current = null
+    walkDragActiveRef.current = false
+    walkDragPointerIdRef.current = null
+    walkDragLastPointerRef.current = null
     setWalkOverlaySuppressed(false)
   }, [setWalkOverlaySuppressed])
 
-  const updateWalkLookByDelta = useCallback((deltaX: number, deltaY: number) => {
+  const updateWalkLookByDelta = useCallback((deltaX: number, deltaY: number): boolean => {
     const viewer = viewerRef.current
     const controls = viewer?.context?.ifcCamera?.cameraControls as
       | {
@@ -778,7 +993,7 @@ const IfcViewer = ({
           ) => void
         }
       | undefined
-    if (!controls?.getPosition || !controls?.getTarget || !controls?.setLookAt) return
+    if (!controls?.getPosition || !controls?.getTarget || !controls?.setLookAt) return false
 
     const position = new Vector3()
     const target = new Vector3()
@@ -824,6 +1039,7 @@ const IfcViewer = ({
       nextTarget.z,
       false
     )
+    return true
   }, [])
 
   const closePickMenu = useCallback(() => {
@@ -944,6 +1160,65 @@ const IfcViewer = ({
     return false
   }, [])
 
+  const moveCameraAlongView = useCallback((rawWheelDelta: number) => {
+    const viewer = viewerRef.current
+    const controls = viewer?.context?.ifcCamera?.cameraControls as
+      | {
+          getPosition?: (out: Vector3) => void
+          getTarget?: (out: Vector3) => void
+          setPosition?: (x: number, y: number, z: number, enableTransition?: boolean) => void
+          setTarget?: (x: number, y: number, z: number, enableTransition?: boolean) => void
+          setLookAt?: (
+            positionX: number,
+            positionY: number,
+            positionZ: number,
+            targetX: number,
+            targetY: number,
+            targetZ: number,
+            enableTransition?: boolean
+          ) => void
+        }
+      | undefined
+    if (!controls?.getPosition || !controls?.getTarget) return false
+
+    const wheelDelta = Math.max(-FREE_WHEEL_MAX_DELTA, Math.min(FREE_WHEEL_MAX_DELTA, rawWheelDelta))
+    if (Math.abs(wheelDelta) < 1e-6) return false
+
+    const position = new Vector3()
+    const target = new Vector3()
+    controls.getPosition(position)
+    controls.getTarget(target)
+
+    const direction = target.clone().sub(position)
+    if (direction.lengthSq() <= 1e-8) return false
+    direction.normalize()
+
+    const move = direction.multiplyScalar(-wheelDelta * FREE_WHEEL_MOVE_FACTOR)
+    const nextPosition = position.clone().add(move)
+    const nextTarget = target.clone().add(move)
+
+    if (typeof controls.setLookAt === 'function') {
+      controls.setLookAt(
+        nextPosition.x,
+        nextPosition.y,
+        nextPosition.z,
+        nextTarget.x,
+        nextTarget.y,
+        nextTarget.z,
+        false
+      )
+      return true
+    }
+
+    if (typeof controls.setPosition === 'function' && typeof controls.setTarget === 'function') {
+      controls.setPosition(nextPosition.x, nextPosition.y, nextPosition.z, false)
+      controls.setTarget(nextTarget.x, nextTarget.y, nextTarget.z, false)
+      return true
+    }
+
+    return false
+  }, [])
+
   const handlePickMenuSelect = useCallback(
     (candidateId: string) => {
       const candidate = pickMenuLookup.get(candidateId)
@@ -952,12 +1227,10 @@ const IfcViewer = ({
       if (candidate.kind === 'custom') {
         selectCustomCube(candidate.expressID)
       } else {
-        void selectById(candidate.modelID, candidate.expressID, {
-          allowedIfcTypes: isWalkMode ? WALK_ALLOWED_IFC_SELECTION_TYPES : undefined
-        })
+        void selectById(candidate.modelID, candidate.expressID)
       }
     },
-    [closePickMenu, isWalkMode, pickMenuLookup, selectById, selectCustomCube]
+    [closePickMenu, pickMenuLookup, selectById, selectCustomCube]
   )
 
   useEffect(() => {
@@ -1519,6 +1792,174 @@ const IfcViewer = ({
     [hoverCoords, insertTargetCoords, spawnUploadedModel]
   )
 
+  const resolveIfcNodeType = useCallback(
+    async (viewer: IfcViewerAPI, modelID: number, expressID: number): Promise<string | null> => {
+      try {
+        const manager = viewer.IFC?.loader?.ifcManager as
+          | { getIfcType?: (modelID: number, id: number) => string | undefined }
+          | undefined
+        const directType = manager?.getIfcType?.(modelID, expressID)
+        const normalizedDirect = normalizeIfcTypeValue(directType)
+        if (normalizedDirect) {
+          return normalizedDirect
+        }
+      } catch {
+        // Fallback to property read below.
+      }
+
+      try {
+        const props = await viewer.IFC.getProperties(modelID, expressID, false, false)
+        return resolveIfcTypeFromProperties(props)
+      } catch {
+        return null
+      }
+    },
+    []
+  )
+
+  const hydrateUnknownIfcNodeTypes = useCallback(
+    async (
+      viewer: IfcViewerAPI,
+      tree: ObjectTree,
+      modelID: number,
+      loadToken: number
+    ): Promise<ObjectTree> => {
+      const unknownNodes = Object.values(tree.nodes).filter(
+        (node) =>
+          node.nodeType === 'ifc' &&
+          node.expressID !== null &&
+          node.type.toUpperCase() === 'UNKNOWN'
+      )
+      if (unknownNodes.length === 0) return tree
+
+      const lookupNodes =
+        unknownNodes.length > MAX_UNKNOWN_TREE_TYPE_LOOKUPS
+          ? unknownNodes.slice(0, MAX_UNKNOWN_TREE_TYPE_LOOKUPS)
+          : unknownNodes
+
+      if (lookupNodes.length < unknownNodes.length) {
+        console.warn(
+          `Type lookup limited to ${MAX_UNKNOWN_TREE_TYPE_LOOKUPS} of ${unknownNodes.length} IFC nodes.`
+        )
+      }
+
+      const updates = new Map<string, string>()
+      for (let i = 0; i < lookupNodes.length; i += UNKNOWN_TREE_TYPE_BATCH_SIZE) {
+        if (loadTokenRef.current !== loadToken) {
+          return tree
+        }
+        const batch = lookupNodes.slice(i, i + UNKNOWN_TREE_TYPE_BATCH_SIZE)
+        const resolved = await Promise.all(
+          batch.map(async (node) => {
+            const expressID = node.expressID
+            if (expressID === null) return null
+            const resolvedType = await resolveIfcNodeType(viewer, modelID, expressID)
+            if (!resolvedType || resolvedType === 'UNKNOWN') return null
+            return { nodeId: node.id, type: resolvedType }
+          })
+        )
+        resolved.forEach((entry) => {
+          if (!entry) return
+          updates.set(entry.nodeId, entry.type)
+        })
+      }
+
+      if (updates.size === 0) return tree
+
+      const nextNodes: ObjectTree['nodes'] = { ...tree.nodes }
+      updates.forEach((resolvedType, nodeId) => {
+        const node = nextNodes[nodeId]
+        if (!node) return
+        nextNodes[nodeId] = {
+          ...node,
+          type: resolvedType,
+          label: localizeIfcType(resolvedType)
+        }
+      })
+      return {
+        nodes: nextNodes,
+        roots: tree.roots
+      }
+    },
+    [resolveIfcNodeType]
+  )
+
+  const buildSpatialContainmentMap = useCallback(
+    async (
+      viewer: IfcViewerAPI,
+      tree: ObjectTree,
+      modelID: number,
+      loadToken: number
+    ): Promise<Map<number, number>> => {
+      const spaceIds = new Set<number>()
+      Object.values(tree.nodes).forEach((node) => {
+        if (node.nodeType !== 'ifc' || node.expressID === null) return
+        if (node.type.toUpperCase() === 'IFCSPACE') {
+          spaceIds.add(node.expressID)
+        }
+      })
+      if (spaceIds.size === 0) return new Map()
+
+      const candidates = collectContainmentCandidateIds(tree)
+      if (candidates.length === 0) return new Map()
+      const lookupIds =
+        candidates.length > MAX_CONTAINMENT_RELATION_LOOKUPS
+          ? candidates.slice(0, MAX_CONTAINMENT_RELATION_LOOKUPS)
+          : candidates
+
+      if (lookupIds.length < candidates.length) {
+        console.warn(
+          `Containment lookup limited to ${MAX_CONTAINMENT_RELATION_LOOKUPS} of ${candidates.length} IFC nodes.`
+        )
+      }
+
+      const map = new Map<number, number>()
+      const relationSpaceCache = new Map<number, number | null>()
+      for (let i = 0; i < lookupIds.length; i += CONTAINMENT_RELATION_BATCH_SIZE) {
+        if (loadTokenRef.current !== loadToken) {
+          return map
+        }
+        const batch = lookupIds.slice(i, i + CONTAINMENT_RELATION_BATCH_SIZE)
+        const entries = await Promise.all(
+          batch.map(async (expressID) => {
+            try {
+              const properties = await viewer.IFC.getProperties(modelID, expressID, false, true)
+              let spaceId = resolveContainedSpaceId(properties)
+
+              if (spaceId === null) {
+                const relationIds = collectContainedRelationIds(properties)
+                for (const relationId of relationIds) {
+                  let cachedSpace = relationSpaceCache.get(relationId)
+                  if (cachedSpace === undefined) {
+                    cachedSpace = await resolveSpaceFromRelationId(viewer, modelID, relationId)
+                    relationSpaceCache.set(relationId, cachedSpace)
+                  }
+                  if (cachedSpace !== null && spaceIds.has(cachedSpace)) {
+                    spaceId = cachedSpace
+                    break
+                  }
+                }
+              }
+
+              if (spaceId === null || !spaceIds.has(spaceId)) return null
+              return [expressID, spaceId] as const
+            } catch (err) {
+              console.warn('Failed to resolve IfcRelContainedInSpatialStructure for', expressID, err)
+              return null
+            }
+          })
+        )
+        entries.forEach((entry) => {
+          if (!entry) return
+          map.set(entry[0], entry[1])
+        })
+      }
+
+      return map
+    },
+    []
+  )
+
   const rebuildTreeForModel = useCallback(
     async (modelID: number, loadToken: number) => {
       const viewer = viewerRef.current
@@ -1526,23 +1967,60 @@ const IfcViewer = ({
       try {
         const spatial = await viewer.IFC.getSpatialStructure(modelID)
         if (loadTokenRef.current !== loadToken) return
-        const tree = buildIfcTree(spatial, modelID)
-        if (loadTokenRef.current !== loadToken) return
-        let groupedTree = tree
-        roomNumbersRef.current = new Map()
-        // Optional grouping: if room numbers exist in Psets, move elements under the matching IfcSpace.
-        if (ENABLE_ROOM_NUMBER_GROUPING) {
-          try {
-            const roomNumbers = await buildRoomNumberMap(viewer, tree, modelID)
-            if (loadTokenRef.current !== loadToken) return
-            roomNumbersRef.current = roomNumbers
-            groupedTree = groupIfcTreeByRoomNumber(tree, roomNumbers)
-          } catch (err) {
-            console.warn('Failed to group storey nodes by room number', err)
-          }
+        try {
+          const rawTree = buildIfcTree(spatial, modelID)
+          if (loadTokenRef.current !== loadToken) return
+          roomNumbersRef.current = new Map()
+          setIfcTree(rawTree, modelID)
+          setSelectedNodeId(rawTree.roots[0] ?? null)
+
+          // Enrich labels/relations in background so loading is never blocked by heavy IFC relation traversal.
+          void (async () => {
+            let nextTree = rawTree
+
+            try {
+              const hydratedTree = await hydrateUnknownIfcNodeTypes(viewer, nextTree, modelID, loadToken)
+              if (loadTokenRef.current !== loadToken) return
+              if (hydratedTree !== nextTree) {
+                nextTree = hydratedTree
+                setIfcTree(nextTree, modelID)
+              }
+            } catch (err) {
+              console.warn('Failed to hydrate UNKNOWN IFC node labels', err)
+            }
+
+            try {
+              const containmentMap = await buildSpatialContainmentMap(viewer, nextTree, modelID, loadToken)
+              if (loadTokenRef.current !== loadToken) return
+              const containedTree = groupIfcTreeBySpatialContainment(nextTree, containmentMap)
+              if (containedTree !== nextTree) {
+                nextTree = containedTree
+                setIfcTree(nextTree, modelID)
+              }
+            } catch (err) {
+              console.warn('Failed to group tree nodes by IfcRelContainedInSpatialStructure', err)
+            }
+
+            // Optional grouping: if room numbers exist in Psets, move elements under the matching IfcSpace.
+            if (ENABLE_ROOM_NUMBER_GROUPING) {
+              try {
+                const roomNumbers = await buildRoomNumberMap(viewer, nextTree, modelID)
+                if (loadTokenRef.current !== loadToken) return
+                roomNumbersRef.current = roomNumbers
+                const roomGroupedTree = groupIfcTreeByRoomNumber(nextTree, roomNumbers)
+                if (roomGroupedTree !== nextTree) {
+                  setIfcTree(roomGroupedTree, modelID)
+                }
+              } catch (err) {
+                console.warn('Failed to group storey nodes by room number', err)
+              }
+            }
+          })()
+        } catch (err) {
+          console.error('Failed to build IFC tree', err)
+          resetTree()
+          setSelectedNodeId(null)
         }
-        setIfcTree(groupedTree, modelID)
-        setSelectedNodeId(groupedTree.roots[0] ?? null)
       } catch (err) {
         if (loadTokenRef.current !== loadToken) return
         console.error('Failed to build IFC tree', err)
@@ -1550,7 +2028,7 @@ const IfcViewer = ({
         setSelectedNodeId(null)
       }
     },
-    [resetTree, setIfcTree]
+    [buildSpatialContainmentMap, hydrateUnknownIfcNodeTypes, resetTree, setIfcTree]
   )
 
   const resolveNodeInsertTarget = useCallback(
@@ -1566,6 +2044,40 @@ const IfcViewer = ({
       return target ?? { x: 0, y: 0, z: 0 }
     },
     [selectById, tree.nodes]
+  )
+
+  const collectIfcIdsInSubtree = useCallback(
+    (rootNodeId: string): { modelID: number | null; ids: number[] } => {
+      const root = tree.nodes[rootNodeId]
+      if (!root) return { modelID: null, ids: [] }
+
+      let modelID: number | null = root.nodeType === 'ifc' ? root.modelID : null
+      const ids = new Set<number>()
+      const stack = [rootNodeId]
+
+      while (stack.length > 0) {
+        const nodeId = stack.pop()
+        if (!nodeId) continue
+        const node = tree.nodes[nodeId]
+        if (!node) continue
+
+        if (node.nodeType === 'ifc' && node.expressID !== null) {
+          if (modelID === null) {
+            modelID = node.modelID
+          }
+          if (node.modelID === modelID) {
+            ids.add(node.expressID)
+          }
+        }
+
+        if (node.children.length > 0) {
+          stack.push(...node.children)
+        }
+      }
+
+      return { modelID, ids: Array.from(ids) }
+    },
+    [tree.nodes]
   )
 
   const handleTreeSelect = useCallback(
@@ -1585,14 +2097,33 @@ const IfcViewer = ({
       }
 
       if (node.nodeType === 'ifc' && node.expressID !== null) {
-        await selectById(node.modelID, node.expressID)
+        await selectById(node.modelID, node.expressID, { autoFocus: false })
+        const subtree = collectIfcIdsInSubtree(nodeId)
+        if (subtree.modelID === node.modelID) {
+          const renderableIds = subtree.ids.filter((id) => hasRenderableExpressId(node.modelID, id))
+          const isNodeRenderable = hasRenderableExpressId(node.modelID, node.expressID)
+          if (renderableIds.length > 0 && (renderableIds.length > 1 || !isNodeRenderable)) {
+            highlightIfcGroup(node.modelID, renderableIds, {
+              anchorExpressID: node.expressID
+            })
+          }
+        }
         return
       }
 
       clearIfcHighlight()
       resetSelection()
     },
-    [clearIfcHighlight, resetSelection, selectById, selectCustomCube, tree.nodes]
+    [
+      clearIfcHighlight,
+      collectIfcIdsInSubtree,
+      hasRenderableExpressId,
+      highlightIfcGroup,
+      resetSelection,
+      selectById,
+      selectCustomCube,
+      tree.nodes
+    ]
   )
 
   const handleRoomSelect = useCallback(
@@ -1694,7 +2225,7 @@ const IfcViewer = ({
 
       if (walkMoveActiveRef.current !== isMoving) {
         walkMoveActiveRef.current = isMoving
-        setWalkOverlaySuppressed(isMoving || walkLookActiveRef.current)
+        setWalkOverlaySuppressed(isMoving || walkDragActiveRef.current || walkLookActiveRef.current)
       }
 
       if (deltaTime > 0 && isMoving) {
@@ -1745,10 +2276,18 @@ const IfcViewer = ({
     if (!container) return
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (!isWalkMode || event.button !== 2) return
-      walkLookActiveRef.current = true
-      walkLookPointerIdRef.current = event.pointerId
-      walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      if (!isWalkMode) return
+      if (event.button === 1) {
+        walkLookActiveRef.current = true
+        walkLookPointerIdRef.current = event.pointerId
+        walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      } else if (event.button === 2) {
+        walkDragActiveRef.current = true
+        walkDragPointerIdRef.current = event.pointerId
+        walkDragLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      } else {
+        return
+      }
       setWalkOverlaySuppressed(true)
       try {
         container.setPointerCapture(event.pointerId)
@@ -1759,22 +2298,92 @@ const IfcViewer = ({
     }
 
     const handlePointerMove = (event: PointerEvent) => {
-      if (!isWalkMode || !walkLookActiveRef.current) return
-      if (walkLookPointerIdRef.current !== null && event.pointerId !== walkLookPointerIdRef.current) return
+      if (!isWalkMode) return
 
-      const lastPointer = walkLookLastPointerRef.current
-      walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+      const isLookPointer =
+        walkLookActiveRef.current &&
+        (walkLookPointerIdRef.current === null || event.pointerId === walkLookPointerIdRef.current)
+      if (isLookPointer) {
+        const lastPointer = walkLookLastPointerRef.current
+        walkLookLastPointerRef.current = { x: event.clientX, y: event.clientY }
+        if (!lastPointer) return
+        const deltaX = event.clientX - lastPointer.x
+        const deltaY = event.clientY - lastPointer.y
+        if (deltaX === 0 && deltaY === 0) return
+        updateWalkLookByDelta(deltaX, deltaY)
+        event.preventDefault()
+        return
+      }
+
+      const isDragPointer =
+        walkDragActiveRef.current &&
+        (walkDragPointerIdRef.current === null || event.pointerId === walkDragPointerIdRef.current)
+      if (!isDragPointer) return
+
+      const lastPointer = walkDragLastPointerRef.current
+      walkDragLastPointerRef.current = { x: event.clientX, y: event.clientY }
       if (!lastPointer) return
 
       const deltaX = event.clientX - lastPointer.x
       const deltaY = event.clientY - lastPointer.y
       if (deltaX === 0 && deltaY === 0) return
-      updateWalkLookByDelta(deltaX, deltaY)
+
+      const viewer = viewerRef.current
+      const controls = viewer?.context?.ifcCamera?.cameraControls as
+        | {
+            getPosition?: (out: Vector3) => void
+            getTarget?: (out: Vector3) => void
+            setLookAt?: (
+              positionX: number,
+              positionY: number,
+              positionZ: number,
+              targetX: number,
+              targetY: number,
+              targetZ: number,
+              enableTransition?: boolean
+            ) => void
+          }
+        | undefined
+      if (!controls?.getPosition || !controls?.getTarget || !controls?.setLookAt) return
+
+      const position = new Vector3()
+      const target = new Vector3()
+      const forward = new Vector3()
+      const right = new Vector3()
+      const up = new Vector3(0, 1, 0)
+      controls.getPosition(position)
+      controls.getTarget(target)
+
+      forward.subVectors(target, position)
+      forward.y = 0
+      if (forward.lengthSq() > 1e-8) {
+        forward.normalize()
+        walkHeadingRef.current.copy(forward)
+      } else {
+        forward.copy(walkHeadingRef.current)
+      }
+      right.crossVectors(forward, up).normalize()
+
+      const move = new Vector3()
+      move.addScaledVector(right, deltaX * WALK_DRAG_MOVE_PER_PIXEL)
+      move.addScaledVector(forward, -deltaY * WALK_DRAG_MOVE_PER_PIXEL)
+      position.add(move)
+      target.add(move)
+
+      controls.setLookAt(
+        position.x,
+        position.y,
+        position.z,
+        target.x,
+        target.y,
+        target.z,
+        false
+      )
       event.preventDefault()
     }
 
     const stopLook = (event?: PointerEvent) => {
-      if (event && event.button !== 2) return
+      if (event && event.button !== 1) return
       if (event && walkLookPointerIdRef.current !== null && event.pointerId !== walkLookPointerIdRef.current) {
         return
       }
@@ -1782,7 +2391,26 @@ const IfcViewer = ({
       walkLookActiveRef.current = false
       walkLookPointerIdRef.current = null
       walkLookLastPointerRef.current = null
-      setWalkOverlaySuppressed(walkMoveActiveRef.current)
+      setWalkOverlaySuppressed(walkMoveActiveRef.current || walkDragActiveRef.current)
+      if (pointerId !== null) {
+        try {
+          container.releasePointerCapture(pointerId)
+        } catch {
+          // Ignore release errors for unsupported platforms.
+        }
+      }
+    }
+
+    const stopDragMove = (event?: PointerEvent) => {
+      if (event && event.button !== 2) return
+      if (event && walkDragPointerIdRef.current !== null && event.pointerId !== walkDragPointerIdRef.current) {
+        return
+      }
+      const pointerId = walkDragPointerIdRef.current
+      walkDragActiveRef.current = false
+      walkDragPointerIdRef.current = null
+      walkDragLastPointerRef.current = null
+      setWalkOverlaySuppressed(walkMoveActiveRef.current || walkLookActiveRef.current)
       if (pointerId !== null) {
         try {
           container.releasePointerCapture(pointerId)
@@ -1799,20 +2427,24 @@ const IfcViewer = ({
 
     const handleWindowBlur = () => {
       stopLook()
+      stopDragMove()
     }
 
     container.addEventListener('pointerdown', handlePointerDown)
     container.addEventListener('pointermove', handlePointerMove)
     container.addEventListener('contextmenu', handleContextMenu)
     window.addEventListener('pointerup', stopLook)
+    window.addEventListener('pointerup', stopDragMove)
     window.addEventListener('blur', handleWindowBlur)
     return () => {
       container.removeEventListener('pointerdown', handlePointerDown)
       container.removeEventListener('pointermove', handlePointerMove)
       container.removeEventListener('contextmenu', handleContextMenu)
       window.removeEventListener('pointerup', stopLook)
+      window.removeEventListener('pointerup', stopDragMove)
       window.removeEventListener('blur', handleWindowBlur)
       stopLook()
+      stopDragMove()
     }
   }, [isWalkMode, setWalkOverlaySuppressed, updateWalkLookByDelta])
 
@@ -1823,8 +2455,7 @@ const IfcViewer = ({
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return
       void handlePick({
-        autoFocus: !isWalkMode,
-        allowedIfcTypes: isWalkMode ? WALK_ALLOWED_IFC_SELECTION_TYPES : undefined
+        autoFocus: false
       })
     }
 
@@ -1832,7 +2463,28 @@ const IfcViewer = ({
     return () => {
       container.removeEventListener('pointerdown', handlePointerDown)
     }
-  }, [handlePick, isWalkMode])
+  }, [handlePick])
+
+  useEffect(() => {
+    if (isWalkMode) return
+    const container = containerRef.current
+    if (!container) return
+
+    const handleWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || event.metaKey) return
+      const deltaMultiplier = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 120 : 1
+      const normalizedDelta = event.deltaY * deltaMultiplier
+      const changed = moveCameraAlongView(normalizedDelta)
+      if (changed) {
+        event.preventDefault()
+      }
+    }
+
+    container.addEventListener('wheel', handleWheel, { passive: false })
+    return () => {
+      container.removeEventListener('wheel', handleWheel)
+    }
+  }, [isWalkMode, moveCameraAlongView])
 
   useEffect(() => {
     const container = containerRef.current

@@ -9,6 +9,8 @@ type SpatialNode = {
   children?: SpatialNode[]
   type?: string
   category?: string | null
+  ifcClass?: string | null
+  _category?: string | null
   Name?: { value?: string }
   name?: string
 }
@@ -18,7 +20,7 @@ const CUSTOM_ROOT_PREFIX = 'custom-root-'
 const CUSTOM_NODE_PREFIX = 'custom-node-'
 const CUSTOM_ROOT_LABEL = 'Vlastni objekty'
 
-const parseSpatialExpressId = (raw: unknown): number | null => {
+const parseSpatialId = (raw: unknown): number | null => {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
     return Math.trunc(raw)
   }
@@ -29,18 +31,28 @@ const parseSpatialExpressId = (raw: unknown): number | null => {
     }
   }
   if (raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)) {
-    return parseSpatialExpressId((raw as { value?: unknown }).value)
+    return parseSpatialId((raw as { value?: unknown }).value)
   }
   return null
 }
 
-const getSpatialLocalId = (node: SpatialNode): number | null => {
-  return parseSpatialExpressId(node.localId)
+const getSpatialNodeId = (node: SpatialNode): number | null => {
+  const directExpress = parseSpatialId(node.expressID)
+  if (directExpress !== null) return directExpress
+  const directExpressAlt = parseSpatialId(node.expressId)
+  if (directExpressAlt !== null) return directExpressAlt
+  return parseSpatialId(node.localId)
 }
 
 const normalizeSpatialType = (node: SpatialNode): string => {
-  const raw = node.type ?? node.category ?? ''
-  const normalized = String(raw).trim().toUpperCase()
+  const raw = node.type ?? node.ifcClass ?? node.category ?? node._category ?? ''
+  const value =
+    typeof raw === 'string'
+      ? raw
+      : raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)
+        ? String((raw as { value?: unknown }).value ?? '')
+        : String(raw)
+  const normalized = value.trim().toUpperCase()
   return normalized || 'UNKNOWN'
 }
 
@@ -53,18 +65,105 @@ const normalizeIfcType = (type?: string): string => (type ?? '').toUpperCase()
 const isIfcType = (node: ObjectTreeNode, target: string): boolean =>
   node.nodeType === 'ifc' && normalizeIfcType(node.type) === target
 
-const makeIfcNodeId = (
-  modelID: number,
-  localId: number,
-  acc: ObjectTree,
-): string => {
-  const baseId = `ifc-${modelID}-${localId}`
-  if (!acc.nodes[baseId]) return baseId
-  let suffix = 1
-  while (acc.nodes[`${baseId}-${suffix}`]) {
-    suffix += 1
+const makeIfcNodeId = (modelID: number, ifcId: number): string => `ifc-${modelID}-${ifcId}`
+
+const getSpatialChildren = (node: SpatialNode): SpatialNode[] =>
+  Array.isArray(node.children) ? node.children : []
+
+const resolveEffectiveSpatialNode = (node: SpatialNode): {
+  ifcId: number | null
+  type: string
+  children: SpatialNode[]
+} => {
+  const ifcId = getSpatialNodeId(node)
+  const type = normalizeSpatialType(node)
+  const children = getSpatialChildren(node)
+
+  if (ifcId === null) {
+    return { ifcId: null, type, children }
   }
-  return `${baseId}-${suffix}`
+
+  if (type !== 'UNKNOWN') {
+    return { ifcId, type, children }
+  }
+
+  // Typical converted structure: wrapper keeps localId, child keeps IFC category/type.
+  if (children.length === 1) {
+    const onlyChild = children[0]
+    const childType = normalizeSpatialType(onlyChild)
+    const childIfcId = getSpatialNodeId(onlyChild)
+    if (childType !== 'UNKNOWN' && childIfcId !== null) {
+      return {
+        ifcId: childIfcId,
+        type: childType,
+        children: getSpatialChildren(onlyChild)
+      }
+    }
+  }
+
+  return { ifcId, type, children }
+}
+
+type BuildIndex = {
+  idByIfcId: Map<number, string>
+  edgeKeys: Set<string>
+}
+
+const ensureIfcNode = (
+  modelID: number,
+  ifcId: number,
+  type: string,
+  parentId: string | null,
+  acc: ObjectTree,
+  index: BuildIndex
+): string => {
+  const existingId = index.idByIfcId.get(ifcId)
+  if (existingId) {
+    const existing = acc.nodes[existingId]
+    if (existing) {
+      const shouldUpgradeType = normalizeIfcType(existing.type) === 'UNKNOWN' && normalizeIfcType(type) !== 'UNKNOWN'
+      if (shouldUpgradeType) {
+        existing.type = type
+        existing.label = buildLabel(type)
+      }
+      if (existing.parentId === null && parentId) {
+        existing.parentId = parentId
+      }
+    }
+    return existingId
+  }
+
+  const id = makeIfcNodeId(modelID, ifcId)
+  acc.nodes[id] = {
+    id,
+    modelID,
+    expressID: ifcId,
+    label: buildLabel(type),
+    type,
+    nodeType: 'ifc',
+    parentId,
+    children: []
+  }
+  index.idByIfcId.set(ifcId, id)
+  return id
+}
+
+const connectParentChild = (parentId: string | null, childId: string, acc: ObjectTree, index: BuildIndex) => {
+  if (!parentId) return
+  const parent = acc.nodes[parentId]
+  const child = acc.nodes[childId]
+  if (!parent || !child) return
+
+  // Keep one canonical parent per IFC node; duplicated relation paths are ignored.
+  if (child.parentId !== null && child.parentId !== parentId) {
+    return
+  }
+
+  child.parentId = parentId
+  const edgeKey = `${parentId}->${childId}`
+  if (index.edgeKeys.has(edgeKey)) return
+  index.edgeKeys.add(edgeKey)
+  parent.children.push(childId)
 }
 
 const traverseSpatial = (
@@ -72,45 +171,28 @@ const traverseSpatial = (
   modelID: number,
   parentId: string | null,
   acc: ObjectTree,
-  visited: WeakSet<object>
+  visited: WeakSet<object>,
+  index: BuildIndex
 ): string[] => {
   if (!node || typeof node !== 'object') return []
   if (visited.has(node as object)) return []
   visited.add(node as object)
 
-  const localId = getSpatialLocalId(node)
-  const type = normalizeSpatialType(node)
-  const children = Array.isArray(node.children) ? node.children : []
-  const isUnknown = type === 'UNKNOWN'
-
-  if (isUnknown || localId === null) {
+  const { ifcId, type, children } = resolveEffectiveSpatialNode(node)
+  if (ifcId === null) {
     const promoted: string[] = []
     children.forEach((child) => {
-      promoted.push(...traverseSpatial(child, modelID, parentId, acc, visited))
+      promoted.push(...traverseSpatial(child, modelID, parentId, acc, visited, index))
     })
     return promoted
   }
 
-  const id = makeIfcNodeId(modelID, localId, acc)
-  const label = buildLabel(type)
-
-  const treeNode: ObjectTreeNode = {
-    id,
-    modelID,
-    expressID: localId,
-    label,
-    type,
-    nodeType: 'ifc',
-    parentId,
-    children: []
-  }
-
-  acc.nodes[id] = treeNode
+  const id = ensureIfcNode(modelID, ifcId, type, parentId, acc, index)
+  connectParentChild(parentId, id, acc, index)
 
   if (children.length > 0) {
     children.forEach((child) => {
-      const childIds = traverseSpatial(child, modelID, id, acc, visited)
-      treeNode.children.push(...childIds)
+      traverseSpatial(child, modelID, id, acc, visited, index)
     })
   }
 
@@ -121,8 +203,26 @@ export const buildIfcTree = (spatialRoot: SpatialNode | null | undefined, modelI
   if (!spatialRoot) return emptyTree
   const acc: ObjectTree = { nodes: {}, roots: [] }
   const visited = new WeakSet<object>()
-  const rootIds = traverseSpatial(spatialRoot, modelID, null, acc, visited)
-  acc.roots.push(...rootIds)
+  const index: BuildIndex = {
+    idByIfcId: new Map<number, string>(),
+    edgeKeys: new Set<string>()
+  }
+  const rootIds = traverseSpatial(spatialRoot, modelID, null, acc, visited, index)
+  const dedupRoots = new Set<string>()
+  rootIds.forEach((id) => {
+    const node = acc.nodes[id]
+    if (node && node.parentId === null) {
+      dedupRoots.add(id)
+    }
+  })
+  if (dedupRoots.size === 0) {
+    Object.values(acc.nodes).forEach((node) => {
+      if (node.parentId === null) {
+        dedupRoots.add(node.id)
+      }
+    })
+  }
+  acc.roots.push(...Array.from(dedupRoots))
   return acc
 }
 
@@ -184,6 +284,93 @@ export const groupIfcTreeByRoomNumber = (
   })
 
   return changed ? { nodes: nextNodes, roots: tree.roots } : tree
+}
+
+const IFC_SPATIAL_TYPES = new Set([
+  'IFCPROJECT',
+  'IFCSITE',
+  'IFCBUILDING',
+  'IFCBUILDINGSTOREY',
+  'IFCSPACE'
+])
+
+export const groupIfcTreeBySpatialContainment = (
+  tree: ObjectTree,
+  containingSpaceByElement: Map<number, number>
+): ObjectTree => {
+  if (containingSpaceByElement.size === 0) return tree
+
+  const nextNodes: ObjectTree['nodes'] = { ...tree.nodes }
+  const nodeIdByExpressId = new Map<number, string>()
+  Object.values(tree.nodes).forEach((node) => {
+    if (node.nodeType !== 'ifc' || node.expressID === null) return
+    if (!nodeIdByExpressId.has(node.expressID)) {
+      nodeIdByExpressId.set(node.expressID, node.id)
+    }
+  })
+
+  let changed = false
+  containingSpaceByElement.forEach((spaceExpressId, elementExpressId) => {
+    const elementNodeId = nodeIdByExpressId.get(elementExpressId)
+    const spaceNodeId = nodeIdByExpressId.get(spaceExpressId)
+    if (!elementNodeId || !spaceNodeId || elementNodeId === spaceNodeId) return
+
+    const elementNode = nextNodes[elementNodeId] ?? tree.nodes[elementNodeId]
+    const spaceNode = nextNodes[spaceNodeId] ?? tree.nodes[spaceNodeId]
+    if (!elementNode || !spaceNode) return
+    if (elementNode.nodeType !== 'ifc' || spaceNode.nodeType !== 'ifc') return
+    if (normalizeIfcType(spaceNode.type) !== 'IFCSPACE') return
+
+    const elementType = normalizeIfcType(elementNode.type)
+    if (IFC_SPATIAL_TYPES.has(elementType) || elementType.startsWith('IFCREL')) return
+    if (elementNode.parentId === spaceNodeId) return
+
+    // Prevent accidental cycle when broken source data references descendants.
+    let cursor: string | null = spaceNodeId
+    while (cursor) {
+      if (cursor === elementNodeId) return
+      const cursorNode: ObjectTreeNode | undefined = nextNodes[cursor] ?? tree.nodes[cursor]
+      cursor = cursorNode?.parentId ?? null
+    }
+
+    if (elementNode.parentId) {
+      const previousParent = nextNodes[elementNode.parentId] ?? tree.nodes[elementNode.parentId]
+      if (previousParent && previousParent.children.includes(elementNodeId)) {
+        nextNodes[previousParent.id] = {
+          ...previousParent,
+          children: previousParent.children.filter((childId) => childId !== elementNodeId)
+        }
+      }
+    }
+
+    const targetSpace = nextNodes[spaceNodeId] ?? tree.nodes[spaceNodeId]
+    const nextChildren = targetSpace.children.includes(elementNodeId)
+      ? targetSpace.children
+      : [...targetSpace.children, elementNodeId]
+    nextNodes[spaceNodeId] = {
+      ...targetSpace,
+      children: nextChildren
+    }
+    nextNodes[elementNodeId] = {
+      ...elementNode,
+      parentId: spaceNodeId
+    }
+    changed = true
+  })
+
+  if (!changed) return tree
+
+  const rootSet = new Set<string>()
+  Object.values(nextNodes).forEach((node) => {
+    if (node.parentId === null) {
+      rootSet.add(node.id)
+    }
+  })
+
+  return {
+    nodes: nextNodes,
+    roots: Array.from(rootSet)
+  }
 }
 
 const buildCustomRoot = (modelID: number): ObjectTreeNode => ({
