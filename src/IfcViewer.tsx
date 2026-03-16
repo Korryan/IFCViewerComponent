@@ -73,6 +73,7 @@ type IfcLoadFacadeLike = {
 
 const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
+const MOVE_DELTA_CUSTOM_KEY = '__bakaMoveDeltaJson'
 const POSITION_EPSILON = 1e-4
 const WALK_MOVE_SPEED = 2.8
 const WALK_LOOK_SENSITIVITY = 0.00125
@@ -719,10 +720,22 @@ const sanitizeMetadataEntries = (entries: MetadataEntry[]): MetadataEntry[] => {
         })
       }
       const resolvedType = typeof entry.type === 'string' ? entry.type : undefined
+      const resolvedMoveDelta =
+        entry.moveDelta &&
+        Number.isFinite(entry.moveDelta.x) &&
+        Number.isFinite(entry.moveDelta.y) &&
+        Number.isFinite(entry.moveDelta.z)
+          ? {
+              x: Number(entry.moveDelta.x),
+              y: Number(entry.moveDelta.y),
+              z: Number(entry.moveDelta.z)
+            }
+          : undefined
       return {
         ...entry,
         type: resolvedType,
-        custom: sanitizedCustom
+        custom: sanitizedCustom,
+        moveDelta: resolvedMoveDelta
       }
     })
 }
@@ -821,6 +834,8 @@ const IfcViewer = ({
     clearIfcHighlight,
     highlightIfcGroup,
     hasRenderableExpressId,
+    getIfcElementBasePosition,
+    getIfcElementTranslationDelta,
     getElementWorldPosition,
     moveSelectedTo,
     getSelectedWorldPosition,
@@ -1404,16 +1419,51 @@ const IfcViewer = ({
         y: offsetInputs.dy,
         z: offsetInputs.dz
       }
+    const translationDelta = getIfcElementTranslationDelta(selectedElement.modelID, selectedElement.expressID)
+    const base = getIfcElementBasePosition(selectedElement.modelID, selectedElement.expressID) ?? resolved
     upsertMetadataEntry(selectedElement.expressID, (existing) => {
       const resolvedType =
         typeof selectedElement.type === 'string' ? selectedElement.type : existing.type
       const prev = existing.position
+      const previousDelta = (() => {
+        const raw = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
+        if (!raw) return { dx: 0, dy: 0, dz: 0 }
+        try {
+          const parsed = JSON.parse(raw) as { dx?: number; dy?: number; dz?: number }
+          return {
+            dx: Number.isFinite(parsed.dx) ? Number(parsed.dx) : 0,
+            dy: Number.isFinite(parsed.dy) ? Number(parsed.dy) : 0,
+            dz: Number.isFinite(parsed.dz) ? Number(parsed.dz) : 0
+          }
+        } catch {
+          return { dx: 0, dy: 0, dz: 0 }
+        }
+      })()
+      const nextDelta = translationDelta
+        ? {
+            dx: translationDelta.x,
+            dy: translationDelta.y,
+            dz: translationDelta.z
+          }
+        : prev
+          ? {
+              dx: previousDelta.dx + (resolved.x - prev.x),
+              dy: previousDelta.dy + (resolved.y - prev.y),
+              dz: previousDelta.dz + (resolved.z - prev.z)
+            }
+          : {
+              dx: resolved.x - base.x,
+              dy: resolved.y - base.y,
+              dz: resolved.z - base.z
+            }
+      const moveDeltaJson = JSON.stringify(nextDelta)
       const isSamePosition =
         prev &&
         Math.abs(prev.x - resolved.x) < POSITION_EPSILON &&
         Math.abs(prev.y - resolved.y) < POSITION_EPSILON &&
         Math.abs(prev.z - resolved.z) < POSITION_EPSILON
-      if (isSamePosition && existing.type === resolvedType) {
+      const currentDeltaJson = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
+      if (isSamePosition && existing.type === resolvedType && currentDeltaJson === moveDeltaJson) {
         return existing
       }
       return {
@@ -1421,10 +1471,25 @@ const IfcViewer = ({
         ifcId: selectedElement.expressID,
         type: resolvedType,
         position: resolved,
-        custom: existing.custom ?? {}
+        moveDelta: {
+          x: nextDelta.dx,
+          y: nextDelta.dy,
+          z: nextDelta.dz
+        },
+        custom: {
+          ...(existing.custom ?? {}),
+          [MOVE_DELTA_CUSTOM_KEY]: moveDeltaJson
+        }
       }
     })
-  }, [getElementWorldPosition, offsetInputs, selectedElement, upsertMetadataEntry])
+  }, [
+    getElementWorldPosition,
+    getIfcElementBasePosition,
+    getIfcElementTranslationDelta,
+    offsetInputs,
+    selectedElement,
+    upsertMetadataEntry
+  ])
 
   const handlePropertyFieldChange = useCallback(
     (key: string, value: string) => {
@@ -1564,10 +1629,7 @@ const IfcViewer = ({
       suppressMetadataNotifyRef.current = false
       return
     }
-    const timer = window.setTimeout(() => {
-      onMetadataChange(metadataEntries)
-    }, 500)
-    return () => window.clearTimeout(timer)
+    onMetadataChange(metadataEntries)
   }, [isHydrated, metadataEntries, onMetadataChange])
 
   useEffect(() => {

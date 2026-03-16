@@ -208,6 +208,8 @@ type UseSelectionOffsetsResult = {
     options?: { anchorExpressID?: number | null }
   ) => void
   hasRenderableExpressId: (modelID: number, expressID: number) => boolean
+  getIfcElementBasePosition: (modelID: number, expressID: number) => Point3D | null
+  getIfcElementTranslationDelta: (modelID: number, expressID: number) => Point3D | null
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
   applyIfcElementOffset: (modelID: number, expressID: number, targetOffset: OffsetVector) => void
@@ -244,6 +246,7 @@ export const useSelectionOffsets = (
   const spaceBiasSubsetsRef = useRef<Map<number, Mesh>>(new Map())
   const spaceBiasIdsRef = useRef<Map<number, Set<number>>>(new Map())
   const spaceBiasAppliedRef = useRef<Map<number, Set<number>>>(new Map())
+  const hiddenIdsRef = useRef<Map<number, Set<number>>>(new Map())
   const elementOffsetsRef = useRef<Map<string, OffsetVector>>(new Map())
   const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
   const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
@@ -728,6 +731,39 @@ export const useSelectionOffsets = (
     [getBaseCenter, getElementKey, getModelBaseOffset]
   )
 
+  const getIfcElementBasePosition = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        const cube = cubeRegistryRef.current.get(expressID)
+        return cube ? { x: cube.position.x, y: cube.position.y, z: cube.position.z } : null
+      }
+      const baseCenter = getBaseCenter(modelID, expressID)
+      if (!baseCenter) return null
+      return { x: baseCenter.x, y: baseCenter.y, z: baseCenter.z }
+    },
+    [getBaseCenter]
+  )
+
+  const getIfcElementTranslationDelta = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        return null
+      }
+      const key = getElementKey(modelID, expressID)
+      const offset = elementOffsetsRef.current.get(key)
+      const baseOffset = getModelBaseOffset(modelID)
+      if (!offset) {
+        return { x: 0, y: 0, z: 0 }
+      }
+      return {
+        x: offset.dx - baseOffset.dx,
+        y: offset.dy - baseOffset.dy,
+        z: offset.dz - baseOffset.dz
+      }
+    },
+    [getElementKey, getModelBaseOffset]
+  )
+
   const ensureBaseSubset = useCallback(
     (modelID: number) => {
       // Build one subset per model to hide originals and enable per-item offsets
@@ -947,6 +983,7 @@ export const useSelectionOffsets = (
         }
         spaceBiasIdsRef.current.delete(id)
         spaceBiasAppliedRef.current.delete(id)
+        hiddenIdsRef.current.delete(id)
         expressIdCacheRef.current.delete(id)
         Array.from(baseCentersRef.current.keys())
           .filter((key) => key.startsWith(`${id}:`))
@@ -959,6 +996,7 @@ export const useSelectionOffsets = (
         baseCentersRef.current.clear()
         spaceBiasIdsRef.current.clear()
         spaceBiasAppliedRef.current.clear()
+        hiddenIdsRef.current.clear()
         selectionSubsetsRef.current.clear()
         highlightedIfcRef.current = null
       }
@@ -980,12 +1018,20 @@ export const useSelectionOffsets = (
       const manager = viewer.IFC.loader.ifcManager
       const scene = viewer.context.getScene()
       const movedIds = getMovedIdsForModel(modelID)
+      const hiddenIds = hiddenIdsRef.current.get(modelID) ?? new Set<number>()
 
       const baseSubset = ensureBaseSubset(modelID)
       const modelMesh = manager.state?.models?.[modelID]?.mesh as Mesh | undefined
       const filterSubset = filterSubsetsRef.current.get(modelID)
 
-      if (!allowedIds) {
+      const effectiveAllowed =
+        allowedIds === null
+          ? hiddenIds.size === 0
+            ? null
+            : new Set(getAllExpressIdsForModel(modelID).filter((id) => !hiddenIds.has(id)))
+          : new Set(Array.from(allowedIds).filter((id) => !hiddenIds.has(id)))
+
+      if (!effectiveAllowed) {
         if (filterSubset) {
           scene.remove(filterSubset)
           removePickable(viewer, filterSubset)
@@ -1007,7 +1053,7 @@ export const useSelectionOffsets = (
         return
       }
 
-      if (allowedIds.size === 0) {
+      if (effectiveAllowed.size === 0) {
         if (filterSubset) {
           scene.remove(filterSubset)
           removePickable(viewer, filterSubset)
@@ -1024,7 +1070,7 @@ export const useSelectionOffsets = (
             subset.visible = false
           }
         })
-        updateSpaceBiasSubset(modelID, allowedIds)
+        updateSpaceBiasSubset(modelID, effectiveAllowed)
         return
       }
 
@@ -1038,11 +1084,11 @@ export const useSelectionOffsets = (
         if (!key.startsWith(`${modelID}:`)) return
         const expressId = Number(key.split(':')[1])
         if (Number.isFinite(expressId)) {
-          subset.visible = allowedIds.has(expressId)
+          subset.visible = effectiveAllowed.has(expressId)
         }
       })
 
-      const idsToShow = Array.from(allowedIds).filter((id) => !movedIds.has(id))
+      const idsToShow = Array.from(effectiveAllowed).filter((id) => !movedIds.has(id))
       if (idsToShow.length === 0) {
         if (filterSubset) {
           scene.remove(filterSubset)
@@ -1050,7 +1096,7 @@ export const useSelectionOffsets = (
           manager.removeSubset(modelID, undefined, getFilterSubsetId(modelID))
           filterSubsetsRef.current.delete(modelID)
         }
-        updateSpaceBiasSubset(modelID, allowedIds)
+        updateSpaceBiasSubset(modelID, effectiveAllowed)
         return
       }
 
@@ -1069,11 +1115,12 @@ export const useSelectionOffsets = (
         filterSubsetsRef.current.set(modelID, subset as Mesh)
         registerPickable(viewer, subset as Mesh, modelID)
       }
-      updateSpaceBiasSubset(modelID, allowedIds)
+      updateSpaceBiasSubset(modelID, effectiveAllowed)
     },
     [
       ensureBaseSubset,
       getFilterSubsetId,
+      getAllExpressIdsForModel,
       getMovedIdsForModel,
       registerPickable,
       removePickable,
@@ -1711,15 +1758,18 @@ export const useSelectionOffsets = (
     (modelID: number, expressID: number) => {
       const viewer = viewerRef.current
       if (!viewer) return
-      // Soft delete: remove the element from the visible subsets, keep IFC data intact.
+      // Soft delete: keep subset/material graph intact and hide via visibility filtering.
       ensureBaseSubset(modelID)
       const manager = viewer.IFC.loader.ifcManager
       const scene = viewer.context.getScene()
       const key = getElementKey(modelID, expressID)
 
-      manager.removeFromSubset(modelID, [expressID], BASE_SUBSET_ID)
-      manager.removeFromSubset(modelID, [expressID], getFilterSubsetId(modelID))
-      manager.removeFromSubset(modelID, [expressID], getSpaceBiasSubsetId(modelID))
+      let hidden = hiddenIdsRef.current.get(modelID)
+      if (!hidden) {
+        hidden = new Set<number>()
+        hiddenIdsRef.current.set(modelID, hidden)
+      }
+      hidden.add(expressID)
 
       const moved = movedSubsetsRef.current.get(key)
       if (moved) {
@@ -1742,8 +1792,6 @@ export const useSelectionOffsets = (
       clearIfcSelectionHighlight,
       ensureBaseSubset,
       getElementKey,
-      getFilterSubsetId,
-      getSpaceBiasSubsetId,
       removePickable,
       updateVisibilityForModel,
       viewerRef
@@ -1899,6 +1947,8 @@ export const useSelectionOffsets = (
     highlightIfcGroup,
     hasRenderableExpressId,
     removeCustomCube,
+    getIfcElementBasePosition,
+    getIfcElementTranslationDelta,
     getElementWorldPosition,
     moveSelectedTo,
     hideIfcElement,
