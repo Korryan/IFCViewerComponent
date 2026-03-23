@@ -3,8 +3,10 @@ import { useCallback, useRef, useState } from 'react'
 import {
   BoxGeometry,
   DoubleSide,
+  Euler,
   Float32BufferAttribute,
   FrontSide,
+  Matrix4,
   Mesh,
   MeshStandardMaterial,
   Quaternion,
@@ -210,9 +212,12 @@ type UseSelectionOffsetsResult = {
   hasRenderableExpressId: (modelID: number, expressID: number) => boolean
   getIfcElementBasePosition: (modelID: number, expressID: number) => Point3D | null
   getIfcElementTranslationDelta: (modelID: number, expressID: number) => Point3D | null
+  getIfcElementRotationDelta: (modelID: number, expressID: number) => Point3D | null
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
   applyIfcElementOffset: (modelID: number, expressID: number, targetOffset: OffsetVector) => void
+  applyIfcElementRotation: (modelID: number, expressID: number, targetRotation: Point3D) => void
+  rotateSelectedTo: (targetRotation: Point3D) => void
   hideIfcElement: (modelID: number, expressID: number) => void
   setCustomCubeRoomNumber: (expressID: number, roomNumber?: string | null) => void
   ensureCustomCubesPickable: () => void
@@ -248,6 +253,7 @@ export const useSelectionOffsets = (
   const spaceBiasAppliedRef = useRef<Map<number, Set<number>>>(new Map())
   const hiddenIdsRef = useRef<Map<number, Set<number>>>(new Map())
   const elementOffsetsRef = useRef<Map<string, OffsetVector>>(new Map())
+  const elementRotationsRef = useRef<Map<string, Point3D>>(new Map())
   const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
   const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
   const filterSubsetsRef = useRef<Map<number, Mesh>>(new Map())
@@ -463,6 +469,23 @@ export const useSelectionOffsets = (
 
   const getElementKey = useCallback((modelID: number, expressID: number) => {
     return `${modelID}:${expressID}`
+  }, [])
+
+  const normalizeRotation = useCallback((rotation: Point3D | null | undefined): Point3D => {
+    return {
+      x: Number.isFinite(rotation?.x) ? Number(rotation?.x) : 0,
+      y: Number.isFinite(rotation?.y) ? Number(rotation?.y) : 0,
+      z: Number.isFinite(rotation?.z) ? Number(rotation?.z) : 0
+    }
+  }, [])
+
+  const isZeroRotation = useCallback((rotation: Point3D | null | undefined) => {
+    if (!rotation) return true
+    return (
+      Math.abs(rotation.x) < COORD_EPSILON &&
+      Math.abs(rotation.y) < COORD_EPSILON &&
+      Math.abs(rotation.z) < COORD_EPSILON
+    )
   }, [])
 
   const getFilterSubsetId = useCallback((modelID: number) => {
@@ -720,15 +743,12 @@ export const useSelectionOffsets = (
       const key = getElementKey(modelID, expressID)
       const baseCenter = getBaseCenter(modelID, expressID)
       if (!baseCenter) return null
-      const baseOffset = getModelBaseOffset(modelID)
-      const offset = elementOffsetsRef.current.get(key) ?? baseOffset
-      return {
-        x: baseCenter.x + (offset.dx - baseOffset.dx),
-        y: baseCenter.y + (offset.dy - baseOffset.dy),
-        z: baseCenter.z + (offset.dz - baseOffset.dz)
-      }
+      const offset = elementOffsetsRef.current.get(key)
+      return offset
+        ? { x: offset.dx, y: offset.dy, z: offset.dz }
+        : { x: baseCenter.x, y: baseCenter.y, z: baseCenter.z }
     },
-    [getBaseCenter, getElementKey, getModelBaseOffset]
+    [getBaseCenter, getElementKey]
   )
 
   const getIfcElementBasePosition = useCallback(
@@ -751,17 +771,39 @@ export const useSelectionOffsets = (
       }
       const key = getElementKey(modelID, expressID)
       const offset = elementOffsetsRef.current.get(key)
-      const baseOffset = getModelBaseOffset(modelID)
+      const baseCenter = getBaseCenter(modelID, expressID)
+      if (!baseCenter) return null
       if (!offset) {
         return { x: 0, y: 0, z: 0 }
       }
       return {
-        x: offset.dx - baseOffset.dx,
-        y: offset.dy - baseOffset.dy,
-        z: offset.dz - baseOffset.dz
+        x: offset.dx - baseCenter.x,
+        y: offset.dy - baseCenter.y,
+        z: offset.dz - baseCenter.z
       }
     },
-    [getElementKey, getModelBaseOffset]
+    [getBaseCenter, getElementKey]
+  )
+
+  const getIfcElementRotationDelta = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        const cube = cubeRegistryRef.current.get(expressID)
+        if (!cube) return null
+        return {
+          x: cube.rotation.x,
+          y: cube.rotation.y,
+          z: cube.rotation.z
+        }
+      }
+      const key = getElementKey(modelID, expressID)
+      const stored = elementRotationsRef.current.get(key)
+      if (stored) {
+        return { x: stored.x, y: stored.y, z: stored.z }
+      }
+      return { x: 0, y: 0, z: 0 }
+    },
+    [getElementKey]
   )
 
   const ensureBaseSubset = useCallback(
@@ -966,6 +1008,7 @@ export const useSelectionOffsets = (
           }
           movedSubsetsRef.current.delete(key)
           elementOffsetsRef.current.delete(key)
+          elementRotationsRef.current.delete(key)
         })
 
         const baseSubset = baseSubsetsRef.current.get(id)
@@ -997,6 +1040,7 @@ export const useSelectionOffsets = (
         spaceBiasIdsRef.current.clear()
         spaceBiasAppliedRef.current.clear()
         hiddenIdsRef.current.clear()
+        elementRotationsRef.current.clear()
         selectionSubsetsRef.current.clear()
         highlightedIfcRef.current = null
       }
@@ -1026,7 +1070,7 @@ export const useSelectionOffsets = (
 
       const effectiveAllowed =
         allowedIds === null
-          ? hiddenIds.size === 0
+          ? hiddenIds.size === 0 && movedIds.size === 0
             ? null
             : new Set(getAllExpressIdsForModel(modelID).filter((id) => !hiddenIds.has(id)))
           : new Set(Array.from(allowedIds).filter((id) => !hiddenIds.has(id)))
@@ -1286,8 +1330,18 @@ export const useSelectionOffsets = (
         if (resolvedFocus) {
           setOffsetInputs({ dx: resolvedFocus.x, dy: resolvedFocus.y, dz: resolvedFocus.z })
         } else {
-          const fallbackOffset = elementOffsetsRef.current.get(key) ?? getModelBaseOffset(modelID)
-          setOffsetInputs(fallbackOffset)
+          const fallbackCenter =
+            elementOffsetsRef.current.get(key) ??
+            (() => {
+              const baseCenter = getBaseCenter(modelID, expressID)
+              if (!baseCenter) return getModelBaseOffset(modelID)
+              return {
+                dx: baseCenter.x,
+                dy: baseCenter.y,
+                dz: baseCenter.z
+              }
+            })()
+          setOffsetInputs(fallbackCenter)
         }
         setPropertyFields(buildPropertyFields(properties))
       } catch (err) {
@@ -1392,56 +1446,144 @@ export const useSelectionOffsets = (
   }, [])
 
   const pickCandidatesAt = useCallback(
-    (clientX: number, clientY: number, container: HTMLElement, maxDistance = 0.5): PickCandidate[] => {
+    (
+      clientX: number,
+      clientY: number,
+      container: HTMLElement,
+      maxDistance = 0.02
+    ): PickCandidate[] => {
       const viewer = viewerRef.current
       if (!viewer) return []
       const rect = container.getBoundingClientRect()
       if (rect.width === 0 || rect.height === 0) return []
 
-      const ndc = new Vector2(
-        ((clientX - rect.left) / rect.width) * 2 - 1,
-        -((clientY - rect.top) / rect.height) * 2 + 1
-      )
-      const raycaster = new Raycaster()
-      raycaster.setFromCamera(ndc, viewer.context.getCamera())
+      const toNdc = (sampleX: number, sampleY: number) =>
+        new Vector2(
+          ((sampleX - rect.left) / rect.width) * 2 - 1,
+          -((sampleY - rect.top) / rect.height) * 2 + 1
+        )
 
-      const pickables = viewer.context.items.pickableIfcModels as unknown as Mesh[]
-      const cubeMeshes = Array.from(cubeRegistryRef.current.values())
-      const merged = cubeMeshes.length
-        ? [...new Set<Mesh>([...pickables, ...cubeMeshes])]
-        : pickables
-      const hits = raycaster.intersectObjects(merged, true)
-      if (hits.length === 0) return []
+      const collectSampleCandidates = (sampleX: number, sampleY: number): PickCandidate[] => {
+        if (
+          sampleX < rect.left ||
+          sampleX > rect.right ||
+          sampleY < rect.top ||
+          sampleY > rect.bottom
+        ) {
+          return []
+        }
 
-      const limit = hits[0].distance + Math.max(0, maxDistance)
-      const seen = new Set<string>()
-      const candidates: PickCandidate[] = []
+        const ndc = toNdc(sampleX, sampleY)
+        const raycaster = new Raycaster()
+        raycaster.setFromCamera(ndc, viewer.context.getCamera())
 
-      for (const hit of hits) {
-        if (hit.distance > limit) break
-        const hitObject: any = hit.object
-        const modelID = hitObject?.modelID
-        if (typeof modelID !== 'number') continue
-        const expressID = getExpressIdFromHit(hit as any)
-        if (expressID === null) continue
-        const key = `${modelID}:${expressID}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        candidates.push({
-          modelID,
-          expressID,
-          kind: modelID === CUSTOM_CUBE_MODEL_ID ? 'custom' : 'ifc',
+        const cubeHits = raycaster.intersectObjects(Array.from(cubeRegistryRef.current.values()), true)
+        const cubeCandidates: PickCandidate[] = []
+        const localSeen = new Set<string>()
+        for (const hit of cubeHits) {
+          const hitObject: any = hit.object
+          const modelID = hitObject?.modelID
+          if (typeof modelID !== 'number') continue
+          const expressID = getExpressIdFromHit(hit as any)
+          if (expressID === null) continue
+          const key = `${modelID}:${expressID}`
+          if (localSeen.has(key)) continue
+          localSeen.add(key)
+          cubeCandidates.push({
+            modelID,
+            expressID,
+            kind: 'custom',
+            distance: hit.distance
+          })
+        }
+
+        const ifcCandidates = viewer.context.castRayIfcCandidates(ndc).map((hit) => ({
+          modelID: hit.modelID,
+          expressID: hit.id,
+          kind: 'ifc' as const,
           distance: hit.distance
-        })
+        }))
+
+        return [...cubeCandidates, ...ifcCandidates].sort((left, right) => left.distance - right.distance)
       }
 
-      return candidates
+      const addWithinLimit = (
+        source: PickCandidate[],
+        limit: number,
+        target: PickCandidate[],
+        seenKeys: Set<string>
+      ) => {
+        for (const candidate of source) {
+          if (candidate.distance > limit) break
+          const key = `${candidate.modelID}:${candidate.expressID}`
+          if (seenKeys.has(key)) continue
+          seenKeys.add(key)
+          target.push(candidate)
+        }
+      }
+
+      const centerCandidates = collectSampleCandidates(clientX, clientY)
+      if (centerCandidates.length === 0) {
+        const fallbackOffsets = [
+          { x: -6, y: 0 },
+          { x: 6, y: 0 },
+          { x: 0, y: -6 },
+          { x: 0, y: 6 },
+          { x: -4, y: -4 },
+          { x: 4, y: -4 },
+          { x: -4, y: 4 },
+          { x: 4, y: 4 }
+        ]
+        const fallbackResults: PickCandidate[] = []
+        const fallbackSeen = new Set<string>()
+        fallbackOffsets.forEach((offset) => {
+          const local = collectSampleCandidates(clientX + offset.x, clientY + offset.y)
+          if (local.length === 0) return
+          addWithinLimit(local, local[0].distance + maxDistance, fallbackResults, fallbackSeen)
+        })
+        return fallbackResults
+      }
+
+      const results: PickCandidate[] = []
+      const seenKeys = new Set<string>()
+      const anchorDistance = centerCandidates[0].distance
+      const centerLimit = anchorDistance + Math.max(maxDistance, anchorDistance * 0.02)
+      addWithinLimit(centerCandidates, centerLimit, results, seenKeys)
+
+      if (results.length > 1) {
+        return results
+      }
+
+      const overlapOffsets = [
+        { x: -6, y: 0 },
+        { x: 6, y: 0 },
+        { x: 0, y: -6 },
+        { x: 0, y: 6 },
+        { x: -4, y: -4 },
+        { x: 4, y: -4 },
+        { x: -4, y: 4 },
+        { x: 4, y: 4 }
+      ]
+      const overlapLimit = anchorDistance + Math.max(maxDistance, anchorDistance * 0.02)
+
+      overlapOffsets.forEach((offset) => {
+        const local = collectSampleCandidates(clientX + offset.x, clientY + offset.y)
+        if (local.length === 0) return
+        addWithinLimit(local, overlapLimit, results, seenKeys)
+      })
+
+      return results
     },
     [getExpressIdFromHit, viewerRef]
   )
 
-  const applyIfcElementOffset = useCallback(
-    (modelID: number, expressID: number, targetOffset: OffsetVector) => {
+  const applyIfcElementTransform = useCallback(
+    (
+      modelID: number,
+      expressID: number,
+      targetOffset: OffsetVector,
+      targetRotation?: Point3D | null
+    ) => {
       const viewer = viewerRef.current
       if (!viewer) return
       if (!hasRenderableExpressId(modelID, expressID)) {
@@ -1457,19 +1599,13 @@ export const useSelectionOffsets = (
         return
       }
 
-      const baseOffset = getModelBaseOffset(modelID)
       const baseCenter = getBaseCenter(modelID, expressID)
       if (!baseCenter) {
         return
       }
-      const resolvedOffset = {
-        dx: baseOffset.dx + (targetOffset.dx - baseCenter.x),
-        dy: baseOffset.dy + (targetOffset.dy - baseCenter.y),
-        dz: baseOffset.dz + (targetOffset.dz - baseCenter.z)
-      }
+      const resolvedRotation = normalizeRotation(targetRotation ?? elementRotationsRef.current.get(key))
 
       const previous = movedSubsetsRef.current.get(key)
-      const hadMovedSubset = Boolean(previous)
       if (previous) {
         scene.remove(previous)
         removePickable(viewer, previous)
@@ -1477,36 +1613,15 @@ export const useSelectionOffsets = (
         movedSubsetsRef.current.delete(key)
       }
 
-      const basePos = new Vector3()
-      const baseQuat = baseSubset ? baseSubset.quaternion.clone() : new Vector3()
-      const baseScale = baseSubset ? baseSubset.scale.clone() : new Vector3(1, 1, 1)
-      if (baseSubset) {
-        baseSubset.matrix.decompose(basePos, baseQuat as any, baseScale)
-      }
-
       const isZeroOffset =
         Math.abs(targetOffset.dx - baseCenter.x) < COORD_EPSILON &&
         Math.abs(targetOffset.dy - baseCenter.y) < COORD_EPSILON &&
         Math.abs(targetOffset.dz - baseCenter.z) < COORD_EPSILON
+      const hasRotation = !isZeroRotation(resolvedRotation)
 
-      if (isZeroOffset) {
-        const isSpaceBiasTarget = spaceBiasIdsRef.current.get(modelID)?.has(expressID) ?? false
-        // Only restore to base subset when the element was actually moved out of it.
-        // Otherwise repeated zero-offset updates duplicate faces and cause z-fighting.
-        if (!isSpaceBiasTarget && hadMovedSubset) {
-          const restored = manager.createSubset({
-            modelID,
-            ids: [expressID],
-            scene,
-            removePrevious: false,
-            customID: BASE_SUBSET_ID
-          }) as Mesh | null
-          if (restored && baseSubset) {
-            restored.matrix.copy(baseSubset.matrix)
-            restored.matrixAutoUpdate = false
-          }
-        }
+      if (isZeroOffset && !hasRotation) {
         elementOffsetsRef.current.delete(key)
+        elementRotationsRef.current.delete(key)
         const activeFilter = filterIdsRef.current.get(modelID) ?? null
         updateVisibilityForModel(modelID, activeFilter)
         const activeHighlight = highlightedIfcRef.current
@@ -1520,8 +1635,6 @@ export const useSelectionOffsets = (
         return
       }
 
-      manager.removeFromSubset(modelID, [expressID], BASE_SUBSET_ID)
-
       const moved = manager.createSubset({
         modelID,
         ids: [expressID],
@@ -1534,17 +1647,46 @@ export const useSelectionOffsets = (
         return
       }
 
+      const baseMatrix = new Matrix4()
       if (baseSubset) {
-        moved.quaternion.copy(baseQuat as any)
-        moved.scale.copy(baseScale)
+        baseMatrix.copy(baseSubset.matrix)
+      } else {
+        const modelMesh = manager.state?.models?.[modelID]?.mesh as Mesh | undefined
+        if (modelMesh) {
+          baseMatrix.copy(modelMesh.matrix)
+        } else {
+          baseMatrix.identity()
+        }
       }
 
-      moved.position.set(resolvedOffset.dx, resolvedOffset.dy, resolvedOffset.dz)
+      const baseQuaternion = new Quaternion()
+      const baseScale = new Vector3(1, 1, 1)
+      baseMatrix.decompose(new Vector3(), baseQuaternion, baseScale)
+
+      const baseInverse = new Matrix4().copy(baseMatrix).invert()
+      const localPivot = new Vector3(baseCenter.x, baseCenter.y, baseCenter.z).applyMatrix4(baseInverse)
+
+      const deltaQuat = new Quaternion().setFromEuler(
+        new Euler(resolvedRotation.x, resolvedRotation.y, resolvedRotation.z, 'XYZ')
+      )
+      const worldQuaternion = deltaQuat.clone().multiply(baseQuaternion)
+      const pivotOffset = localPivot.clone().multiply(baseScale).applyQuaternion(worldQuaternion)
+      const targetCenter = new Vector3(targetOffset.dx, targetOffset.dy, targetOffset.dz)
+      const resolvedPosition = targetCenter.clone().sub(pivotOffset)
+
+      moved.quaternion.copy(worldQuaternion)
+      moved.scale.copy(baseScale)
+      moved.position.copy(resolvedPosition)
       moved.updateMatrix()
       moved.matrixAutoUpdate = false
 
       movedSubsetsRef.current.set(key, moved as Mesh)
-      elementOffsetsRef.current.set(key, resolvedOffset)
+      elementOffsetsRef.current.set(key, targetOffset)
+      if (hasRotation) {
+        elementRotationsRef.current.set(key, resolvedRotation)
+      } else {
+        elementRotationsRef.current.delete(key)
+      }
       registerPickable(viewer, moved as Mesh)
       const activeFilter = filterIdsRef.current.get(modelID) ?? null
       updateVisibilityForModel(modelID, activeFilter)
@@ -1558,13 +1700,36 @@ export const useSelectionOffsets = (
       ensureBaseSubset,
       getBaseCenter,
       getElementKey,
-      getModelBaseOffset,
       hasRenderableExpressId,
+      isZeroRotation,
+      normalizeRotation,
       registerPickable,
       removePickable,
       updateVisibilityForModel,
       viewerRef
     ]
+  )
+
+  const applyIfcElementOffset = useCallback(
+    (modelID: number, expressID: number, targetOffset: OffsetVector) => {
+      const key = getElementKey(modelID, expressID)
+      applyIfcElementTransform(modelID, expressID, targetOffset, elementRotationsRef.current.get(key))
+    },
+    [applyIfcElementTransform, getElementKey]
+  )
+
+  const applyIfcElementRotation = useCallback(
+    (modelID: number, expressID: number, targetRotation: Point3D) => {
+      const center = getElementWorldPosition(modelID, expressID) ?? getBaseCenter(modelID, expressID)
+      if (!center) return
+      applyIfcElementTransform(
+        modelID,
+        expressID,
+        { dx: center.x, dy: center.y, dz: center.z },
+        targetRotation
+      )
+    },
+    [applyIfcElementTransform, getBaseCenter, getElementWorldPosition]
   )
 
   const moveSelectedTo = useCallback(
@@ -1727,7 +1892,15 @@ export const useSelectionOffsets = (
           : (() => {
               const fallbackOffset =
                 elementOffsetsRef.current.get(getElementKey(modelID, expressID)) ??
-                getModelBaseOffset(modelID)
+                (() => {
+                  const baseCenter = getBaseCenter(modelID, expressID)
+                  if (!baseCenter) return getModelBaseOffset(modelID)
+                  return {
+                    dx: baseCenter.x,
+                    dy: baseCenter.y,
+                    dz: baseCenter.z
+                  }
+                })()
               return { x: fallbackOffset.dx, y: fallbackOffset.dy, z: fallbackOffset.dz }
             })()
         if (shouldAutoFocus && selectionPoint) {
@@ -1750,6 +1923,42 @@ export const useSelectionOffsets = (
       hasRenderableExpressId,
       isIfcSelectionAllowed,
       resetSelection,
+      viewerRef
+    ]
+  )
+
+  const rotateSelectedTo = useCallback(
+    (targetRotation: Point3D) => {
+      const viewer = viewerRef.current
+      if (!viewer || !selectedElement) return
+      const normalized = normalizeRotation(targetRotation)
+
+      if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+        const cube = cubeRegistryRef.current.get(selectedElement.expressID)
+        if (!cube) return
+        cube.rotation.set(normalized.x, normalized.y, normalized.z)
+        cube.updateMatrix()
+        cube.matrixAutoUpdate = false
+        return
+      }
+
+      const center =
+        getElementWorldPosition(selectedElement.modelID, selectedElement.expressID) ??
+        getBaseCenter(selectedElement.modelID, selectedElement.expressID)
+      if (!center) return
+      applyIfcElementTransform(
+        selectedElement.modelID,
+        selectedElement.expressID,
+        { dx: center.x, dy: center.y, dz: center.z },
+        normalized
+      )
+    },
+    [
+      applyIfcElementTransform,
+      getBaseCenter,
+      getElementWorldPosition,
+      normalizeRotation,
+      selectedElement,
       viewerRef
     ]
   )
@@ -1779,6 +1988,7 @@ export const useSelectionOffsets = (
         movedSubsetsRef.current.delete(key)
       }
       elementOffsetsRef.current.delete(key)
+      elementRotationsRef.current.delete(key)
       spaceBiasIdsRef.current.get(modelID)?.delete(expressID)
       spaceBiasAppliedRef.current.get(modelID)?.delete(expressID)
       const activeFilter = filterIdsRef.current.get(modelID) ?? null
@@ -1949,6 +2159,7 @@ export const useSelectionOffsets = (
     removeCustomCube,
     getIfcElementBasePosition,
     getIfcElementTranslationDelta,
+    getIfcElementRotationDelta,
     getElementWorldPosition,
     moveSelectedTo,
     hideIfcElement,
@@ -1961,6 +2172,8 @@ export const useSelectionOffsets = (
     spawnCube,
     spawnUploadedModel,
     applyIfcElementOffset,
+    applyIfcElementRotation,
+    rotateSelectedTo,
     applyVisibilityFilter,
     configureSpaceBiasTargets
   }

@@ -34,6 +34,8 @@ export type MetadataEntry = {
   custom?: Record<string, string>
   position?: Point3D
   moveDelta?: Point3D
+  rotation?: Point3D
+  rotateDelta?: Point3D
   deleted?: boolean
   updatedAt?: string
 }

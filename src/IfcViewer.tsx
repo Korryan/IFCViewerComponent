@@ -74,13 +74,17 @@ type IfcLoadFacadeLike = {
 const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
 const MOVE_DELTA_CUSTOM_KEY = '__bakaMoveDeltaJson'
+const ROTATE_DELTA_CUSTOM_KEY = '__bakaRotateDeltaJson'
 const POSITION_EPSILON = 1e-4
+const ROTATION_EPSILON = 1e-4
+const ROTATE_DRAG_SENSITIVITY = 0.02
 const WALK_MOVE_SPEED = 2.8
 const WALK_LOOK_SENSITIVITY = 0.00125
 const WALK_PITCH_LIMIT = Math.PI / 2 - 0.05
 const WALK_DRAG_MOVE_PER_PIXEL = 0.02
 const FREE_WHEEL_MOVE_FACTOR = 0.0067
 const FREE_WHEEL_MAX_DELTA = 240
+const ROOM_SELECT_Y_OFFSET = 1
 const MODEL_LOAD_TIMEOUT_MS = 60_000
 const IFC_LOADER_SETTINGS = {
   COORDINATE_TO_ORIGIN: true,
@@ -105,9 +109,10 @@ const SHORTCUTS = [
   { keys: 'Right Mouse Drag (walk)', label: 'Move in floor plane' },
   { keys: 'A (free mode)', label: 'Open insert menu at cursor' },
   { keys: 'G', label: 'Start move mode' },
-  { keys: 'X / Y / Z', label: 'Lock axis while moving' },
+  { keys: 'R', label: 'Start rotate mode' },
+  { keys: 'X / Y / Z', label: 'Lock axis while moving / rotating' },
   { keys: 'F', label: 'Move in floor plane (keep height)' },
-  { keys: 'K', label: 'Pick overlapping elements near cursor' },
+  { keys: 'Left Click', label: 'Pick element / open overlap menu' },
   { keys: 'Esc', label: 'Cancel drag / close menus' },
   { keys: '? / H', label: 'Toggle shortcuts help' }
 ]
@@ -731,11 +736,35 @@ const sanitizeMetadataEntries = (entries: MetadataEntry[]): MetadataEntry[] => {
               z: Number(entry.moveDelta.z)
             }
           : undefined
+      const resolvedRotation =
+        entry.rotation &&
+        Number.isFinite(entry.rotation.x) &&
+        Number.isFinite(entry.rotation.y) &&
+        Number.isFinite(entry.rotation.z)
+          ? {
+              x: Number(entry.rotation.x),
+              y: Number(entry.rotation.y),
+              z: Number(entry.rotation.z)
+            }
+          : undefined
+      const resolvedRotateDelta =
+        entry.rotateDelta &&
+        Number.isFinite(entry.rotateDelta.x) &&
+        Number.isFinite(entry.rotateDelta.y) &&
+        Number.isFinite(entry.rotateDelta.z)
+          ? {
+              x: Number(entry.rotateDelta.x),
+              y: Number(entry.rotateDelta.y),
+              z: Number(entry.rotateDelta.z)
+            }
+          : undefined
       return {
         ...entry,
         type: resolvedType,
         custom: sanitizedCustom,
-        moveDelta: resolvedMoveDelta
+        moveDelta: resolvedMoveDelta,
+        rotation: resolvedRotation,
+        rotateDelta: resolvedRotateDelta
       }
     })
 }
@@ -788,6 +817,11 @@ const IfcViewer = ({
   const dragPlaneRef = useRef<Plane | null>(null)
   const dragStartPointRef = useRef<Vector3 | null>(null)
   const dragStartOffsetRef = useRef<OffsetVector | null>(null)
+  const [isRotating, setIsRotating] = useState(false)
+  const [rotateAxisLock, setRotateAxisLock] = useState<'x' | 'y' | 'z' | null>(null)
+  const rotateStartPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const rotateStartValueRef = useRef<Point3D | null>(null)
+  const rotateCurrentValueRef = useRef<Point3D | null>(null)
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false)
   const [isPickMenuOpen, setIsPickMenuOpen] = useState(false)
   const [pickMenuAnchor, setPickMenuAnchor] = useState<{ x: number; y: number } | null>(null)
@@ -828,7 +862,6 @@ const IfcViewer = ({
     handleOffsetInputChange,
     applyOffsetToSelectedElement,
     handleFieldChange,
-    handlePick,
     selectById,
     selectCustomCube,
     clearIfcHighlight,
@@ -836,8 +869,10 @@ const IfcViewer = ({
     hasRenderableExpressId,
     getIfcElementBasePosition,
     getIfcElementTranslationDelta,
+    getIfcElementRotationDelta,
     getElementWorldPosition,
     moveSelectedTo,
+    rotateSelectedTo,
     getSelectedWorldPosition,
     hideIfcElement,
     setCustomCubeRoomNumber,
@@ -849,6 +884,7 @@ const IfcViewer = ({
     removeCustomCube,
     spawnUploadedModel,
     applyIfcElementOffset,
+    applyIfcElementRotation,
     applyVisibilityFilter
   } = useSelectionOffsets(viewerRef)
 
@@ -1402,14 +1438,17 @@ const IfcViewer = ({
     if (!selectedElement || selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) return
     const pos = getSelectedWorldPosition()
     if (!pos) return
+    const rotation = getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID)
     upsertFurnitureItem({
       id: `${CUBE_ITEM_PREFIX}${selectedElement.expressID}`,
       model: 'cube',
       position: { x: pos.x, y: pos.y, z: pos.z },
-      rotation: { x: 0, y: 0, z: 0 },
+      rotation: rotation
+        ? { x: rotation.x, y: rotation.y, z: rotation.z }
+        : { x: 0, y: 0, z: 0 },
       scale: { x: 1, y: 1, z: 1 }
     })
-  }, [getSelectedWorldPosition, selectedElement, upsertFurnitureItem])
+  }, [getIfcElementRotationDelta, getSelectedWorldPosition, selectedElement, upsertFurnitureItem])
 
   const syncSelectedIfcPosition = useCallback(() => {
     if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) return
@@ -1420,6 +1459,7 @@ const IfcViewer = ({
         z: offsetInputs.dz
       }
     const translationDelta = getIfcElementTranslationDelta(selectedElement.modelID, selectedElement.expressID)
+    const rotationDelta = getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID)
     const base = getIfcElementBasePosition(selectedElement.modelID, selectedElement.expressID) ?? resolved
     upsertMetadataEntry(selectedElement.expressID, (existing) => {
       const resolvedType =
@@ -1456,14 +1496,39 @@ const IfcViewer = ({
               dy: resolved.y - base.y,
               dz: resolved.z - base.z
             }
+      const nextRotation = rotationDelta
+        ? {
+            x: rotationDelta.x,
+            y: rotationDelta.y,
+            z: rotationDelta.z
+          }
+        : {
+            x: 0,
+            y: 0,
+            z: 0
+          }
       const moveDeltaJson = JSON.stringify(nextDelta)
+      const rotateDeltaJson = JSON.stringify(nextRotation)
       const isSamePosition =
         prev &&
         Math.abs(prev.x - resolved.x) < POSITION_EPSILON &&
         Math.abs(prev.y - resolved.y) < POSITION_EPSILON &&
         Math.abs(prev.z - resolved.z) < POSITION_EPSILON
+      const prevRotation = existing.rotation
+      const isSameRotation =
+        prevRotation &&
+        Math.abs(prevRotation.x - nextRotation.x) < ROTATION_EPSILON &&
+        Math.abs(prevRotation.y - nextRotation.y) < ROTATION_EPSILON &&
+        Math.abs(prevRotation.z - nextRotation.z) < ROTATION_EPSILON
       const currentDeltaJson = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
-      if (isSamePosition && existing.type === resolvedType && currentDeltaJson === moveDeltaJson) {
+      const currentRotateDeltaJson = existing.custom?.[ROTATE_DELTA_CUSTOM_KEY]
+      if (
+        isSamePosition &&
+        isSameRotation &&
+        existing.type === resolvedType &&
+        currentDeltaJson === moveDeltaJson &&
+        currentRotateDeltaJson === rotateDeltaJson
+      ) {
         return existing
       }
       return {
@@ -1476,15 +1541,19 @@ const IfcViewer = ({
           y: nextDelta.dy,
           z: nextDelta.dz
         },
+        rotation: nextRotation,
+        rotateDelta: nextRotation,
         custom: {
           ...(existing.custom ?? {}),
-          [MOVE_DELTA_CUSTOM_KEY]: moveDeltaJson
+          [MOVE_DELTA_CUSTOM_KEY]: moveDeltaJson,
+          [ROTATE_DELTA_CUSTOM_KEY]: rotateDeltaJson
         }
       }
     })
   }, [
     getElementWorldPosition,
     getIfcElementBasePosition,
+    getIfcElementRotationDelta,
     getIfcElementTranslationDelta,
     offsetInputs,
     selectedElement,
@@ -1533,6 +1602,44 @@ const IfcViewer = ({
     syncSelectedCubePosition,
     syncSelectedIfcPosition
   ])
+
+  const finishRotateMode = useCallback(
+    (options?: { commit?: boolean; revert?: boolean }) => {
+      const shouldCommit = options?.commit ?? false
+      const shouldRevert = options?.revert ?? false
+      const start = rotateStartValueRef.current
+      const current = rotateCurrentValueRef.current
+
+      if (shouldRevert && start) {
+        rotateSelectedTo(start)
+      } else if (shouldCommit && start && current) {
+        const changed =
+          Math.abs(current.x - start.x) >= ROTATION_EPSILON ||
+          Math.abs(current.y - start.y) >= ROTATION_EPSILON ||
+          Math.abs(current.z - start.z) >= ROTATION_EPSILON
+        if (changed) {
+          syncSelectedCubePosition()
+          syncSelectedIfcPosition()
+          if (selectedElement && selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
+            pushHistoryEntry(selectedElement.expressID, 'Rotation updated')
+          }
+        }
+      }
+
+      setIsRotating(false)
+      setRotateAxisLock(null)
+      rotateStartPointerRef.current = null
+      rotateStartValueRef.current = null
+      rotateCurrentValueRef.current = null
+    },
+    [
+      pushHistoryEntry,
+      rotateSelectedTo,
+      selectedElement,
+      syncSelectedCubePosition,
+      syncSelectedIfcPosition
+    ]
+  )
 
   const handleDeleteSelected = useCallback(() => {
     if (!selectedElement) return
@@ -1775,24 +1882,39 @@ const IfcViewer = ({
     if (offsetsRestoredRef.current === activeModelId) return
     metadataEntries.forEach((entry) => {
       if (entry.deleted) return
-      if (!entry.position) return
-      const current = getElementWorldPosition(activeModelId, entry.ifcId)
-      if (
-        current &&
-        Math.abs(current.x - entry.position.x) < POSITION_EPSILON &&
-        Math.abs(current.y - entry.position.y) < POSITION_EPSILON &&
-        Math.abs(current.z - entry.position.z) < POSITION_EPSILON
-      ) {
-        return
+      if (entry.position) {
+        const current = getElementWorldPosition(activeModelId, entry.ifcId)
+        if (
+          !current ||
+          Math.abs(current.x - entry.position.x) >= POSITION_EPSILON ||
+          Math.abs(current.y - entry.position.y) >= POSITION_EPSILON ||
+          Math.abs(current.z - entry.position.z) >= POSITION_EPSILON
+        ) {
+          applyIfcElementOffset(activeModelId, entry.ifcId, {
+            dx: entry.position.x,
+            dy: entry.position.y,
+            dz: entry.position.z
+          })
+        }
       }
-      applyIfcElementOffset(activeModelId, entry.ifcId, {
-        dx: entry.position.x,
-        dy: entry.position.y,
-        dz: entry.position.z
-      })
+      const rotation = entry.rotateDelta ?? entry.rotation
+      if (rotation) {
+        applyIfcElementRotation(activeModelId, entry.ifcId, {
+          x: rotation.x,
+          y: rotation.y,
+          z: rotation.z
+        })
+      }
     })
     offsetsRestoredRef.current = activeModelId
-  }, [activeModelId, applyIfcElementOffset, getElementWorldPosition, isHydrated, metadataEntries])
+  }, [
+    activeModelId,
+    applyIfcElementOffset,
+    applyIfcElementRotation,
+    getElementWorldPosition,
+    isHydrated,
+    metadataEntries
+  ])
 
   useEffect(() => {
     if (activeModelId === null) {
@@ -2196,8 +2318,11 @@ const IfcViewer = ({
         setSelectedNodeId(nodeId)
       }
       const target = await resolveNodeInsertTarget(nodeId, { autoFocus: true })
-      if (!moveCameraToPoint(target)) {
-        teleportCameraToPoint(target)
+      const roomFocusPoint = target
+        ? { x: target.x, y: target.y + ROOM_SELECT_Y_OFFSET, z: target.z }
+        : null
+      if (!moveCameraToPoint(roomFocusPoint)) {
+        teleportCameraToPoint(roomFocusPoint)
       }
       if (isWalkMode) {
         clearIfcHighlight()
@@ -2514,18 +2639,64 @@ const IfcViewer = ({
     const container = containerRef.current
     if (!container) return
 
+    const handleSelectClick = (clientX: number, clientY: number) => {
+      const rect = container.getBoundingClientRect()
+      const candidates = pickCandidatesAt(clientX, clientY, container, 0.02)
+
+      if (candidates.length > 1) {
+        setPickCandidates(candidates)
+        setIsPickMenuOpen(true)
+        setPickMenuAnchor({
+          x: Math.max(0, Math.min(clientX - rect.left + 12, rect.width - 12)),
+          y: Math.max(0, Math.min(clientY - rect.top + 12, rect.height - 12))
+        })
+        return
+      }
+
+      if (candidates.length === 1) {
+        closePickMenu()
+        const only = candidates[0]
+        if (only.kind === 'custom') {
+          selectCustomCube(only.expressID)
+        } else {
+          void selectById(only.modelID, only.expressID, { autoFocus: false })
+        }
+        return
+      }
+
+      closePickMenu()
+      resetSelection()
+    }
+
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return
-      void handlePick({
-        autoFocus: false
-      })
+      if (isRotating) {
+        finishRotateMode({ commit: true })
+        event.preventDefault()
+      }
+    }
+
+    const handleClick = (event: MouseEvent) => {
+      if (event.button !== 0) return
+      handleSelectClick(event.clientX, event.clientY)
+      event.preventDefault()
     }
 
     container.addEventListener('pointerdown', handlePointerDown)
+    container.addEventListener('click', handleClick)
     return () => {
       container.removeEventListener('pointerdown', handlePointerDown)
+      container.removeEventListener('click', handleClick)
     }
-  }, [handlePick])
+  }, [
+    closePickMenu,
+    finishRotateMode,
+    isRotating,
+    pickCandidatesAt,
+    resetSelection,
+    selectById,
+    selectCustomCube
+  ])
 
   useEffect(() => {
     if (isWalkMode) return
@@ -2560,7 +2731,33 @@ const IfcViewer = ({
           y: Math.max(0, Math.min(event.clientY - rect.top, rect.height))
         }
       }
-      if (isDragging) {
+      if (isRotating) {
+        const startPointer = rotateStartPointerRef.current
+        const startRotation = rotateStartValueRef.current
+        if (!startPointer || !startRotation) {
+          return
+        }
+        const deltaX = event.clientX - startPointer.x
+        const deltaY = event.clientY - startPointer.y
+        const nextRotation = {
+          x: startRotation.x,
+          y: startRotation.y,
+          z: startRotation.z
+        }
+        if (rotateAxisLock === 'x') {
+          nextRotation.x += deltaY * ROTATE_DRAG_SENSITIVITY
+        } else if (rotateAxisLock === 'y') {
+          nextRotation.y += deltaX * ROTATE_DRAG_SENSITIVITY
+        } else if (rotateAxisLock === 'z') {
+          nextRotation.z += deltaX * ROTATE_DRAG_SENSITIVITY
+        } else {
+          nextRotation.x += deltaY * ROTATE_DRAG_SENSITIVITY
+          nextRotation.y += deltaX * ROTATE_DRAG_SENSITIVITY
+        }
+        rotateCurrentValueRef.current = nextRotation
+        rotateSelectedTo(nextRotation)
+        event.preventDefault()
+      } else if (isDragging) {
         // Dragging: project cursor onto the active drag plane and apply axis lock.
         const viewer = viewerRef.current
         const plane = dragPlaneRef.current
@@ -2603,7 +2800,7 @@ const IfcViewer = ({
     return () => {
       container.removeEventListener('pointermove', handlePointerMove)
     }
-  }, [dragAxisLock, isDragging, moveSelectedTo, updateHoverCoords])
+  }, [dragAxisLock, isDragging, isRotating, moveSelectedTo, rotateAxisLock, rotateSelectedTo, updateHoverCoords])
 
   useEffect(() => {
     if (!selectedElement) {
@@ -2642,6 +2839,44 @@ const IfcViewer = ({
         toggleNavigationMode()
         return
       }
+      if (key === 'r') {
+        if (!selectedElement) return
+        const container = containerRef.current
+        if (container) {
+          const rect = container.getBoundingClientRect()
+          rotateStartPointerRef.current = {
+            x: rect.left + lastPointerPosRef.current.x,
+            y: rect.top + lastPointerPosRef.current.y
+          }
+        } else {
+          rotateStartPointerRef.current = { x: 0, y: 0 }
+        }
+        const startRotation =
+          getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID) ?? {
+            x: 0,
+            y: 0,
+            z: 0
+          }
+        rotateStartValueRef.current = {
+          x: startRotation.x,
+          y: startRotation.y,
+          z: startRotation.z
+        }
+        rotateCurrentValueRef.current = {
+          x: startRotation.x,
+          y: startRotation.y,
+          z: startRotation.z
+        }
+        setIsDragging(false)
+        setDragAxisLock(null)
+        dragPlaneRef.current = null
+        dragStartPointRef.current = null
+        dragStartOffsetRef.current = null
+        setIsRotating(true)
+        setRotateAxisLock(null)
+        event.preventDefault()
+        return
+      }
       if (!isWalkMode && key === 'a') {
         // Pop insert menu near cursor and cache the casted target point
         const container = containerRef.current
@@ -2667,35 +2902,6 @@ const IfcViewer = ({
           }
         setInsertTargetCoords(point ? { x: point.x, y: point.y, z: point.z } : null)
         setIsInsertMenuOpen(true)
-      }
-      if (key === 'k') {
-        const container = containerRef.current
-        if (!container) return
-        const rect = container.getBoundingClientRect()
-        const clientX = rect.left + lastPointerPosRef.current.x
-        const clientY = rect.top + lastPointerPosRef.current.y
-        const candidates = pickCandidatesAt(clientX, clientY, container, 0.5)
-        if (candidates.length === 0) {
-          closePickMenu()
-          return
-        }
-        if (candidates.length === 1) {
-          closePickMenu()
-          const only = candidates[0]
-          if (only.kind === 'custom') {
-            selectCustomCube(only.expressID)
-          } else {
-            selectById(only.modelID, only.expressID)
-          }
-          return
-        }
-
-        setPickCandidates(candidates)
-        setIsPickMenuOpen(true)
-        setPickMenuAnchor({
-          x: Math.max(0, Math.min(lastPointerPosRef.current.x + 12, rect.width - 12)),
-          y: Math.max(0, Math.min(lastPointerPosRef.current.y + 12, rect.height - 12))
-        })
       }
       if (key === 'g') {
         if (!selectedElement) return
@@ -2756,6 +2962,9 @@ const IfcViewer = ({
         }
         setDragAxisLock(null)
       }
+      if (isRotating && (key === 'x' || key === 'y' || key === 'z')) {
+        setRotateAxisLock(key as 'x' | 'y' | 'z')
+      }
       if (isDragging && (key === 'x' || key === 'y' || key === 'z')) {
         setDragAxisLock(key as 'x' | 'y' | 'z')
       }
@@ -2768,6 +2977,7 @@ const IfcViewer = ({
         dragPlaneRef.current = null
         dragStartPointRef.current = null
         dragStartOffsetRef.current = null
+        finishRotateMode({ revert: true })
         setIsShortcutsOpen(false)
         closePickMenu()
       }
@@ -2782,6 +2992,9 @@ const IfcViewer = ({
 
     const handleWindowBlur = () => {
       walkKeyStateRef.current = { ...emptyWalkKeyState }
+      if (isRotating) {
+        finishRotateMode({ revert: true })
+      }
     }
 
     const handlePointerUp = () => {
@@ -2812,16 +3025,19 @@ const IfcViewer = ({
     }
   }, [
     closePickMenu,
+    finishRotateMode,
+    getIfcElementRotationDelta,
     getSelectedWorldPosition,
     hoverCoords,
+    isRotating,
     isWalkMode,
     isDragging,
     offsetInputs,
     pickCandidatesAt,
-    selectedElement,
-    pushHistoryEntry,
     selectById,
     selectCustomCube,
+    selectedElement,
+    pushHistoryEntry,
     showShortcuts,
     syncSelectedCubePosition,
     syncSelectedIfcPosition,

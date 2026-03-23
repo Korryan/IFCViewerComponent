@@ -421,7 +421,8 @@ export class IfcViewerAPI {
     items: { ifcModels: IfcModelLike[]; pickableIfcModels: Object3D[] }
     getScene: () => Scene
     getCamera: () => PerspectiveCamera
-    castRayIfc: () => Intersection<Object3D> | null
+    castRayIfc: () => PickResult | null
+    castRayIfcCandidates: (pointer?: Vector2) => PickResult[]
     fitToFrame: () => Promise<void>
   }
 
@@ -587,28 +588,38 @@ export class IfcViewerAPI {
       }
     }
 
-    const castRayIfc = () => {
+    const castRayIfcCandidates = (pointer?: Vector2): PickResult[] => {
       const pickables = this.context.items.pickableIfcModels
-      if (pickables.length === 0) return null
-      this.raycaster.setFromCamera(this.mousePosition, this.perspectiveCamera)
+      if (pickables.length === 0) return []
+      this.raycaster.setFromCamera(pointer ?? this.mousePosition, this.perspectiveCamera)
       const hits = this.raycaster.intersectObjects(pickables, true)
-      return hits[0] ?? null
+      const results: PickResult[] = []
+      const seen = new Set<string>()
+      for (const hit of hits) {
+        const modelID = this.resolveModelID(hit.object)
+        if (modelID === null || modelID < 0) continue
+        const expressID = this.resolveExpressID(modelID, hit)
+        if (!Number.isFinite(expressID) || expressID <= 0) continue
+        const key = `${modelID}:${expressID}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        results.push({
+          id: expressID,
+          modelID,
+          point: hit.point.clone(),
+          distance: hit.distance,
+          object: hit.object
+        })
+      }
+      return results
+    }
+
+    const castRayIfc = () => {
+      return castRayIfcCandidates()[0] ?? null
     }
 
     const pickIfcItem = async (): Promise<PickResult | null> => {
-      const hit = castRayIfc()
-      if (!hit) return null
-      const modelID = this.resolveModelID(hit.object)
-      if (modelID === null || modelID < 0) return null
-      const expressID = this.resolveExpressID(modelID, hit)
-      if (!Number.isFinite(expressID) || expressID <= 0) return null
-      return {
-        id: expressID,
-        modelID,
-        point: hit.point.clone(),
-        distance: hit.distance,
-        object: hit.object
-      }
+      return castRayIfcCandidates()[0] ?? null
     }
 
     this.context = {
@@ -626,6 +637,7 @@ export class IfcViewerAPI {
       getScene: () => this.scene,
       getCamera: () => this.perspectiveCamera,
       castRayIfc,
+      castRayIfcCandidates,
       fitToFrame: async () => this.fitToFrame()
     }
 
@@ -1316,7 +1328,6 @@ export class IfcViewerAPI {
     const nextIds = new Set<number>(subset.ids)
     uniqueNumbers(ids).forEach((id) => nextIds.delete(id))
 
-    const previousMaterial = subset.mesh.material as Material | Material[]
     const targetScene = (subset.mesh.parent as Scene | null) ?? this.scene
 
     this.detachSubset(record, subsetId)
@@ -1325,7 +1336,10 @@ export class IfcViewerAPI {
       return
     }
 
-    const rebuilt = this.buildMeshFromCache(record, Array.from(nextIds), previousMaterial)
+    // Rebuild materials from geometry cache for current ids.
+    // Reusing the previous merged material array can desync group->material indices
+    // after ids change, which swaps colors/materials between elements.
+    const rebuilt = this.buildMeshFromCache(record, Array.from(nextIds))
     if (!rebuilt) return
 
     targetScene.add(rebuilt)

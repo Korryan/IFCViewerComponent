@@ -26,6 +26,7 @@ type RenderNodeArgs = {
 }
 
 const indentSize = 12
+const normalizeIfcType = (value: string) => value.trim().toUpperCase()
 
 const TreeNode = ({
   nodeId,
@@ -48,6 +49,7 @@ const TreeNode = ({
   const ifcDisplayId =
     node.nodeType === 'ifc' && node.expressID !== null ? `#${String(node.expressID)}` : null
   const showTypeBadge = node.label.trim().toLocaleLowerCase() !== localizedType.trim().toLocaleLowerCase()
+  const canAddChild = node.nodeType === 'ifc' && normalizeIfcType(node.type) === 'IFCSPACE'
 
   return (
     <div className="tree-node" style={{ paddingLeft: depth * indentSize }}>
@@ -78,22 +80,24 @@ const TreeNode = ({
           <span className="tree-node__name">{node.label}</span>
           {ifcDisplayId && <span className="tree-node__id">{ifcDisplayId}</span>}
         </button>
-        <button
-          type="button"
-          className="tree-node__add"
-          onClick={(event) => {
-            event.stopPropagation()
-            const button = event.currentTarget as HTMLButtonElement
-            const row = button.closest('.tree-node__row') as HTMLDivElement | null
-            const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
-            const anchorX = row ? rect.left + rect.width / 2 : rect.left
-            onOpenMenu(nodeId, { x: anchorX, y: rect.bottom })
-          }}
-          aria-label="Add child object"
-          title="Add child object"
-        >
-          +
-        </button>
+        {canAddChild && (
+          <button
+            type="button"
+            className="tree-node__add"
+            onClick={(event) => {
+              event.stopPropagation()
+              const button = event.currentTarget as HTMLButtonElement
+              const row = button.closest('.tree-node__row') as HTMLDivElement | null
+              const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
+              const anchorX = row ? rect.left + rect.width / 2 : rect.left
+              onOpenMenu(nodeId, { x: anchorX, y: rect.bottom })
+            }}
+            aria-label="Add child object"
+            title="Add child object"
+          >
+            +
+          </button>
+        )}
       </div>
       {hasChildren && isExpanded && (
         <div className="tree-node__children">
@@ -147,13 +151,6 @@ export const ObjectTreePanel = ({
       setViewMode('tree')
     }
   }, [rooms.length, viewMode])
-  const roomNodeIds = useMemo(() => new Set(rooms.map((room) => room.nodeId)), [rooms])
-  useEffect(() => {
-    if (viewMode !== 'rooms') return
-    if (!selectedNodeId) return
-    if (roomNodeIds.has(selectedNodeId)) return
-    setViewMode('tree')
-  }, [roomNodeIds, selectedNodeId, viewMode])
 
   const { selectionPath, selectionTrail } = useMemo(() => {
     const ids: string[] = []
