@@ -73,6 +73,7 @@ type IfcLoadFacadeLike = {
 
 const wasmRootPath = '/ifc/'
 const CUBE_ITEM_PREFIX = 'cube-'
+const UPLOADED_ITEM_PREFIX = 'uploaded-'
 const MOVE_DELTA_CUSTOM_KEY = '__bakaMoveDeltaJson'
 const ROTATE_DELTA_CUSTOM_KEY = '__bakaRotateDeltaJson'
 const POSITION_EPSILON = 1e-4
@@ -116,6 +117,18 @@ const SHORTCUTS = [
   { keys: 'Esc', label: 'Cancel drag / close menus' },
   { keys: '? / H', label: 'Toggle shortcuts help' }
 ]
+
+const buildUploadedFurnitureId = (fileName: string) => {
+  const slug =
+    fileName
+      .toLowerCase()
+      .replace(/\.ifc$/i, '')
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'asset'
+  return `${UPLOADED_ITEM_PREFIX}${slug}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const buildUploadedFurnitureName = (fileName: string) => fileName.replace(/\.ifc$/i, '') || fileName
 
 const isSameLoadSource = (left: LoadSource, right: LoadSource): boolean => {
   if (left.kind !== right.kind) return false
@@ -1410,28 +1423,66 @@ const IfcViewer = ({
       next[index] = {
         ...prev[index],
         ...nextItem,
+        name: nextItem.name ?? prev[index].name,
         position: nextItem.position,
         rotation: nextItem.rotation ?? prev[index].rotation,
         scale: nextItem.scale ?? prev[index].scale,
-        roomNumber: nextItem.roomNumber ?? prev[index].roomNumber
+        roomNumber: nextItem.roomNumber ?? prev[index].roomNumber,
+        spaceIfcId: nextItem.spaceIfcId ?? prev[index].spaceIfcId,
+        custom: nextItem.custom ?? prev[index].custom,
+        geometry: nextItem.geometry ?? prev[index].geometry
       }
       return next
     })
   }, [])
 
   const registerCubeFurniture = useCallback(
-    (info: { expressID: number; position: Point3D }, roomNumber?: string | null) => {
+    (
+      info: { expressID: number; position: Point3D },
+      roomNumber?: string | null,
+      spaceIfcId?: number | null
+    ) => {
       setCustomCubeRoomNumber(info.expressID, roomNumber)
       upsertFurnitureItem({
         id: `${CUBE_ITEM_PREFIX}${info.expressID}`,
         model: 'cube',
+        name: `Cube #${info.expressID}`,
         position: info.position,
         rotation: { x: 0, y: 0, z: 0 },
         scale: { x: 1, y: 1, z: 1 },
-        roomNumber: roomNumber ?? undefined
+        roomNumber: roomNumber ?? undefined,
+        spaceIfcId: spaceIfcId ?? undefined
       })
     },
     [setCustomCubeRoomNumber, upsertFurnitureItem]
+  )
+
+  const registerUploadedFurniture = useCallback(
+    (
+      file: File,
+      info: Awaited<ReturnType<typeof spawnUploadedModel>>,
+      roomNumber?: string | null,
+      spaceIfcId?: number | null
+    ) => {
+      if (!info) return null
+      const itemId = buildUploadedFurnitureId(file.name)
+      upsertFurnitureItem({
+        id: itemId,
+        model: 'uploaded-ifc',
+        name: buildUploadedFurnitureName(file.name),
+        position: info.position,
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+        roomNumber: roomNumber ?? undefined,
+        spaceIfcId: spaceIfcId ?? undefined,
+        geometry: info.geometry ?? undefined,
+        custom: {
+          sourceFileName: file.name
+        }
+      })
+      return itemId
+    },
+    [upsertFurnitureItem]
   )
 
   const syncSelectedCubePosition = useCallback(() => {
@@ -1818,6 +1869,27 @@ const IfcViewer = ({
     [tree.nodes]
   )
 
+  const resolveSpaceIfcIdForNode = useCallback(
+    (nodeId: string | null | undefined): number | null => {
+      if (!nodeId) return null
+      let currentId: string | null | undefined = nodeId
+      while (currentId) {
+        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
+        if (!node) break
+        if (
+          node.nodeType === 'ifc' &&
+          node.expressID !== null &&
+          node.type.toUpperCase() === 'IFCSPACE'
+        ) {
+          return node.expressID
+        }
+        currentId = node.parentId
+      }
+      return null
+    },
+    [tree.nodes]
+  )
+
   useEffect(() => {
     if (!isHydrated || furnitureRestoredRef.current) return
     const viewer = ensureViewer()
@@ -1950,7 +2022,8 @@ const IfcViewer = ({
     const info = spawnCube(target, { focus: true })
     if (!info) return
     const roomNumber = resolveRoomNumberForNode(selectedNodeId)
-    registerCubeFurniture(info, roomNumber)
+    const spaceIfcId = resolveSpaceIfcIdForNode(selectedNodeId)
+    registerCubeFurniture(info, roomNumber, spaceIfcId)
     addCustomNode({
       modelID: CUSTOM_CUBE_MODEL_ID,
       expressID: info.expressID,
@@ -1963,6 +2036,7 @@ const IfcViewer = ({
     hoverCoords,
     insertTargetCoords,
     registerCubeFurniture,
+    resolveSpaceIfcIdForNode,
     resolveRoomNumberForNode,
     selectedNodeId,
     spawnCube
@@ -1971,9 +2045,32 @@ const IfcViewer = ({
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File) => {
       const target = insertTargetCoords || hoverCoords || { x: 0, y: 0, z: 0 }
-      await spawnUploadedModel(uploadFile, target, { focus: true })
+      const info = await spawnUploadedModel(uploadFile, target, { focus: true })
+      if (!info) return
+      const roomNumber = resolveRoomNumberForNode(selectedNodeId)
+      const spaceIfcId = resolveSpaceIfcIdForNode(selectedNodeId)
+      const parentId = findSpaceNodeIdByRoomNumber(roomNumber) ?? selectedNodeId
+      registerUploadedFurniture(uploadFile, info, roomNumber, spaceIfcId)
+      const newNodeId = addCustomNode({
+        modelID: info.modelID,
+        expressID: null,
+        label: buildUploadedFurnitureName(uploadFile.name),
+        type: 'IFC',
+        parentId
+      })
+      setSelectedNodeId(newNodeId)
     },
-    [hoverCoords, insertTargetCoords, spawnUploadedModel]
+    [
+      addCustomNode,
+      findSpaceNodeIdByRoomNumber,
+      hoverCoords,
+      insertTargetCoords,
+      registerUploadedFurniture,
+      resolveSpaceIfcIdForNode,
+      resolveRoomNumberForNode,
+      selectedNodeId,
+      spawnUploadedModel
+    ]
   )
 
   const resolveIfcNodeType = useCallback(
@@ -2347,7 +2444,8 @@ const IfcViewer = ({
       const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
       const roomNumber = resolveRoomNumberForNode(nodeId)
-      registerCubeFurniture(info, roomNumber)
+      const spaceIfcId = resolveSpaceIfcIdForNode(nodeId)
+      registerCubeFurniture(info, roomNumber, spaceIfcId)
       const newNodeId = addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
         expressID: info.expressID,
@@ -2361,6 +2459,7 @@ const IfcViewer = ({
     [
       addCustomNode,
       registerCubeFurniture,
+      resolveSpaceIfcIdForNode,
       resolveNodeInsertTarget,
       resolveRoomNumberForNode,
       selectCustomCube,
@@ -3303,13 +3402,16 @@ const IfcViewer = ({
           const inputFile = event.target.files?.[0]
           const parentId = pendingTreeUploadRef.current
           if (inputFile && parentId) {
-            const resolvedTarget = { x: 0, y: 0, z: 0 }
+            const resolvedTarget = await resolveNodeInsertTarget(parentId)
+            const roomNumber = resolveRoomNumberForNode(parentId)
+            const spaceIfcId = resolveSpaceIfcIdForNode(parentId)
             const info = await spawnUploadedModel(inputFile, resolvedTarget, { focus: true })
             if (info) {
+              registerUploadedFurniture(inputFile, info, roomNumber, spaceIfcId)
               const newNodeId = addCustomNode({
                 modelID: info.modelID,
                 expressID: null,
-                label: inputFile.name,
+                label: buildUploadedFurnitureName(inputFile.name),
                 type: 'IFC',
                 parentId
               })

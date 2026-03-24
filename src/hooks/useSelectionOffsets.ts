@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 // Encapsulates selection, IFC property fetching, and offset/subset handling
 import {
+  BufferGeometry,
   BoxGeometry,
   DoubleSide,
   Euler,
@@ -15,7 +16,13 @@ import {
   Vector3
 } from 'three'
 import type { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
-import type { OffsetVector, Point3D, PropertyField, SelectedElement } from '../ifcViewerTypes'
+import type {
+  FurnitureGeometry,
+  OffsetVector,
+  Point3D,
+  PropertyField,
+  SelectedElement
+} from '../ifcViewerTypes'
 
 const BASE_SUBSET_ID = 'base-offset-subset'
 const MOVED_SUBSET_PREFIX = 'moved-offset-'
@@ -181,6 +188,86 @@ type SpawnCubeOptions = {
 type SpawnedModelInfo = {
   modelID: number
   position: Point3D
+  geometry: FurnitureGeometry | null
+}
+
+const serializeMeshGeometry = (
+  mesh: Mesh
+): { geometry: FurnitureGeometry | null; center: Point3D } => {
+  const geometry = mesh.geometry as BufferGeometry | undefined
+  if (!geometry) {
+    return {
+      geometry: null,
+      center: { x: 0, y: 0, z: 0 }
+    }
+  }
+  const positions = geometry.getAttribute('position')
+  if (!positions || typeof positions.getX !== 'function') {
+    return {
+      geometry: null,
+      center: { x: 0, y: 0, z: 0 }
+    }
+  }
+
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  for (let index = 0; index < positions.count; index += 1) {
+    const x = Number(positions.getX(index))
+    const y = Number(positions.getY(index))
+    const z = Number(positions.getZ(index))
+    if (x < minX) minX = x
+    if (y < minY) minY = y
+    if (z < minZ) minZ = z
+    if (x > maxX) maxX = x
+    if (y > maxY) maxY = y
+    if (z > maxZ) maxZ = z
+  }
+  const centerVector = new Vector3(
+    Number.isFinite(minX) && Number.isFinite(maxX) ? (minX + maxX) * 0.5 : 0,
+    Number.isFinite(minY) && Number.isFinite(maxY) ? (minY + maxY) * 0.5 : 0,
+    Number.isFinite(minZ) && Number.isFinite(maxZ) ? (minZ + maxZ) * 0.5 : 0
+  )
+  const center = { x: centerVector.x, y: centerVector.y, z: centerVector.z }
+
+  const serializedPositions: number[] = []
+  for (let index = 0; index < positions.count; index += 1) {
+    serializedPositions.push(
+      Number(positions.getX(index) - center.x),
+      Number(positions.getY(index) - center.y),
+      Number(positions.getZ(index) - center.z)
+    )
+  }
+
+  const serializedIndices: number[] = []
+  const indexAttr = geometry.index
+  if (indexAttr && typeof indexAttr.getX === 'function') {
+    for (let index = 0; index < indexAttr.count; index += 1) {
+      serializedIndices.push(Math.trunc(indexAttr.getX(index)))
+    }
+  } else {
+    for (let index = 0; index < positions.count; index += 1) {
+      serializedIndices.push(index)
+    }
+  }
+
+  if (serializedPositions.length < 9 || serializedIndices.length < 3) {
+    return {
+      geometry: null,
+      center
+    }
+  }
+
+  return {
+    geometry: {
+      positions: serializedPositions,
+      indices: serializedIndices
+    },
+    center
+  }
 }
 
 type SelectionTypeFilterOptions = {
@@ -2123,14 +2210,20 @@ export const useSelectionOffsets = (
         const model = (await viewer.IFC.loadIfc(file, false)) as Mesh | undefined
         if (model) {
           tuneIfcModelMaterials(model)
-          model.position.set(resolved.x, resolved.y, resolved.z)
+          const serialized = serializeMeshGeometry(model)
+          model.position.set(
+            resolved.x - serialized.center.x,
+            resolved.y - serialized.center.y,
+            resolved.z - serialized.center.z
+          )
           model.updateMatrix()
+          model.updateMatrixWorld(true)
           if (options?.focus) {
             focusOnPoint(resolved)
           }
           const modelId = (model as { modelID?: number }).modelID
           if (typeof modelId === 'number') {
-            return { modelID: modelId, position: resolved }
+            return { modelID: modelId, position: resolved, geometry: serialized.geometry }
           }
         }
       } catch (err) {

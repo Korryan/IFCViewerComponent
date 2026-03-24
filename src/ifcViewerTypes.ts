@@ -43,11 +43,20 @@ export type MetadataEntry = {
 export type FurnitureItem = {
   id: string
   model: string
+  name?: string
   position: Point3D
   rotation?: Point3D
   scale?: Point3D
   roomNumber?: string
+  spaceIfcId?: number
+  custom?: Record<string, string>
+  geometry?: FurnitureGeometry
   updatedAt?: string
+}
+
+export type FurnitureGeometry = {
+  positions: number[]
+  indices: number[]
 }
 
 export type ObjectTreeNode = {

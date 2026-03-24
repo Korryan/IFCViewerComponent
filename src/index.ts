@@ -1,5 +1,6 @@
 export { default as IfcViewer } from './IfcViewer'
 export type {
+  FurnitureGeometry,
   FurnitureItem,
   HistoryEntry,
   MetadataEntry,
