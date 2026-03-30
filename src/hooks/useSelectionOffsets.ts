@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 // Encapsulates selection, IFC property fetching, and offset/subset handling
 import {
+  Group,
   BufferGeometry,
   BoxGeometry,
   DoubleSide,
@@ -23,6 +24,7 @@ import type {
   PropertyField,
   SelectedElement
 } from '../ifcViewerTypes'
+import { buildUploadedFurnitureName } from '../ifcViewer.utils'
 
 const BASE_SUBSET_ID = 'base-offset-subset'
 const MOVED_SUBSET_PREFIX = 'moved-offset-'
@@ -37,6 +39,7 @@ const IFC_SELECTION_EMISSIVE = 0x6a3d00
 const COORD_EPSILON = 1e-4
 const COORD_DISPLAY_EPSILON = 1e-3
 export const CUSTOM_CUBE_MODEL_ID = -999
+const CUSTOM_HIGHLIGHT_EMISSIVE = 0x6a3d00
 
 const normalizeCoordinateValue = (value: number): number => {
   if (!Number.isFinite(value)) return 0
@@ -64,6 +67,131 @@ const normalizeIfcIds = (ids: number[]): number[] => {
     dedup.add(Math.trunc(rawId))
   })
   return Array.from(dedup)
+}
+
+const readIfcNumericValue = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Number(value)
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  if (value && typeof value === 'object' && 'value' in value) {
+    return readIfcNumericValue((value as { value?: unknown }).value)
+  }
+  return null
+}
+
+const readIfcNumberTuple = (value: unknown): number[] | null => {
+  if (Array.isArray(value)) {
+    const parsed = value
+      .map((entry) => readIfcNumericValue(entry))
+      .filter((entry): entry is number => entry !== null)
+    return parsed.length > 0 ? parsed : null
+  }
+  if (!value || typeof value !== 'object') return null
+
+  const candidate = value as {
+    value?: unknown
+    Coordinates?: unknown
+    DirectionRatios?: unknown
+  }
+  return (
+    readIfcNumberTuple(candidate.Coordinates) ??
+    readIfcNumberTuple(candidate.DirectionRatios) ??
+    readIfcNumberTuple(candidate.value)
+  )
+}
+
+const unwrapIfcEntity = (value: unknown): Record<string, any> | null => {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as { value?: unknown }
+  if (candidate.value && typeof candidate.value === 'object' && !Array.isArray(candidate.value)) {
+    return candidate.value as Record<string, any>
+  }
+  return value as Record<string, any>
+}
+
+const buildAxisPlacementMatrix = (value: unknown): Matrix4 | null => {
+  const placement = unwrapIfcEntity(value)
+  if (!placement) return null
+
+  const locationTuple = readIfcNumberTuple(placement.Location ?? placement)
+  if (!locationTuple || locationTuple.length < 2) {
+    return null
+  }
+
+  const origin = new Vector3(
+    locationTuple[0] ?? 0,
+    locationTuple[1] ?? 0,
+    locationTuple[2] ?? 0
+  )
+
+  const axisTuple = readIfcNumberTuple(placement.Axis) ?? [0, 0, 1]
+  const refTuple = readIfcNumberTuple(placement.RefDirection) ?? [1, 0, 0]
+
+  const zAxis = new Vector3(axisTuple[0] ?? 0, axisTuple[1] ?? 0, axisTuple[2] ?? 1)
+  if (zAxis.lengthSq() <= 1e-12) {
+    zAxis.set(0, 0, 1)
+  } else {
+    zAxis.normalize()
+  }
+
+  const xAxis = new Vector3(refTuple[0] ?? 1, refTuple[1] ?? 0, refTuple[2] ?? 0)
+  if (xAxis.lengthSq() <= 1e-12) {
+    xAxis.set(1, 0, 0)
+  }
+  xAxis.addScaledVector(zAxis, -xAxis.dot(zAxis))
+  if (xAxis.lengthSq() <= 1e-12) {
+    const fallback = Math.abs(zAxis.z) < 0.99 ? new Vector3(0, 0, 1) : new Vector3(0, 1, 0)
+    xAxis.copy(fallback).cross(zAxis)
+  }
+  xAxis.normalize()
+
+  const yAxis = new Vector3().crossVectors(zAxis, xAxis)
+  if (yAxis.lengthSq() <= 1e-12) {
+    yAxis.set(0, 1, 0)
+  } else {
+    yAxis.normalize()
+  }
+
+  xAxis.crossVectors(yAxis, zAxis).normalize()
+
+  const matrix = new Matrix4().makeBasis(xAxis, yAxis, zAxis)
+  matrix.setPosition(origin)
+  return matrix
+}
+
+const buildObjectPlacementMatrix = (
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>()
+): Matrix4 | null => {
+  const placement = unwrapIfcEntity(value)
+  if (!placement) return null
+  if (depth > 24) return null
+  if (seen.has(placement)) return null
+
+  seen.add(placement)
+  try {
+    const localMatrix = buildAxisPlacementMatrix(placement.RelativePlacement ?? placement)
+    if (!localMatrix) return null
+
+    const parentPlacement = unwrapIfcEntity(placement.PlacementRelTo)
+    if (!parentPlacement) {
+      return localMatrix
+    }
+
+    const parentMatrix = buildObjectPlacementMatrix(parentPlacement, depth + 1, seen)
+    if (!parentMatrix) {
+      return localMatrix
+    }
+
+    return parentMatrix.multiply(localMatrix)
+  } finally {
+    seen.delete(placement)
+  }
 }
 
 const tuneSpaceBiasSubsetMesh = (_mesh: Mesh | null | undefined) => {}
@@ -207,27 +335,24 @@ type SpawnCubeOptions = {
 
 type SpawnedModelInfo = {
   modelID: number
+  expressID: number
   position: Point3D
   geometry: FurnitureGeometry | null
+}
+
+type CustomObjectState = {
+  itemId?: string
+  model: string
+  name?: string
+  roomNumber?: string
+  spaceIfcId?: number
+  sourceFileName?: string
 }
 
 const serializeMeshGeometry = (
   mesh: Mesh
 ): { geometry: FurnitureGeometry | null; center: Point3D } => {
-  const geometry = mesh.geometry as BufferGeometry | undefined
-  if (!geometry) {
-    return {
-      geometry: null,
-      center: { x: 0, y: 0, z: 0 }
-    }
-  }
-  const positions = geometry.getAttribute('position')
-  if (!positions || typeof positions.getX !== 'function') {
-    return {
-      geometry: null,
-      center: { x: 0, y: 0, z: 0 }
-    }
-  }
+  mesh.updateMatrixWorld(true)
 
   let minX = Number.POSITIVE_INFINITY
   let minY = Number.POSITIVE_INFINITY
@@ -235,17 +360,61 @@ const serializeMeshGeometry = (
   let maxX = Number.NEGATIVE_INFINITY
   let maxY = Number.NEGATIVE_INFINITY
   let maxZ = Number.NEGATIVE_INFINITY
-  for (let index = 0; index < positions.count; index += 1) {
-    const x = Number(positions.getX(index))
-    const y = Number(positions.getY(index))
-    const z = Number(positions.getZ(index))
-    if (x < minX) minX = x
-    if (y < minY) minY = y
-    if (z < minZ) minZ = z
-    if (x > maxX) maxX = x
-    if (y > maxY) maxY = y
-    if (z > maxZ) maxZ = z
+  const worldPositions: number[] = []
+  const serializedIndices: number[] = []
+  let vertexOffset = 0
+
+  mesh.traverse((node) => {
+    const candidate = node as Mesh & { isMesh?: boolean }
+    if (!candidate?.isMesh) return
+
+    const sourceGeometry = candidate.geometry as BufferGeometry | undefined
+    if (!sourceGeometry) return
+
+    const geometry = sourceGeometry.clone()
+    geometry.applyMatrix4(candidate.matrixWorld)
+
+    const positions = geometry.getAttribute('position')
+    if (!positions || typeof positions.getX !== 'function') {
+      geometry.dispose()
+      return
+    }
+
+    for (let index = 0; index < positions.count; index += 1) {
+      const x = Number(positions.getX(index))
+      const y = Number(positions.getY(index))
+      const z = Number(positions.getZ(index))
+      worldPositions.push(x, y, z)
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (z < minZ) minZ = z
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+      if (z > maxZ) maxZ = z
+    }
+
+    const indexAttr = geometry.index
+    if (indexAttr && typeof indexAttr.getX === 'function') {
+      for (let index = 0; index < indexAttr.count; index += 1) {
+        serializedIndices.push(vertexOffset + Math.trunc(indexAttr.getX(index)))
+      }
+    } else {
+      for (let index = 0; index < positions.count; index += 1) {
+        serializedIndices.push(vertexOffset + index)
+      }
+    }
+
+    vertexOffset += positions.count
+    geometry.dispose()
+  })
+
+  if (worldPositions.length < 9 || serializedIndices.length < 3) {
+    return {
+      geometry: null,
+      center: { x: 0, y: 0, z: 0 }
+    }
   }
+
   const centerVector = new Vector3(
     Number.isFinite(minX) && Number.isFinite(maxX) ? (minX + maxX) * 0.5 : 0,
     Number.isFinite(minY) && Number.isFinite(maxY) ? (minY + maxY) * 0.5 : 0,
@@ -254,31 +423,12 @@ const serializeMeshGeometry = (
   const center = { x: centerVector.x, y: centerVector.y, z: centerVector.z }
 
   const serializedPositions: number[] = []
-  for (let index = 0; index < positions.count; index += 1) {
+  for (let index = 0; index < worldPositions.length; index += 3) {
     serializedPositions.push(
-      Number(positions.getX(index) - center.x),
-      Number(positions.getY(index) - center.y),
-      Number(positions.getZ(index) - center.z)
+      Number(worldPositions[index] - center.x),
+      Number(worldPositions[index + 1] - center.y),
+      Number(worldPositions[index + 2] - center.z)
     )
-  }
-
-  const serializedIndices: number[] = []
-  const indexAttr = geometry.index
-  if (indexAttr && typeof indexAttr.getX === 'function') {
-    for (let index = 0; index < indexAttr.count; index += 1) {
-      serializedIndices.push(Math.trunc(indexAttr.getX(index)))
-    }
-  } else {
-    for (let index = 0; index < positions.count; index += 1) {
-      serializedIndices.push(index)
-    }
-  }
-
-  if (serializedPositions.length < 9 || serializedIndices.length < 3) {
-    return {
-      geometry: null,
-      center
-    }
   }
 
   return {
@@ -288,6 +438,56 @@ const serializeMeshGeometry = (
     },
     center
   }
+}
+
+const tagCustomGeometryExpressId = (geometry: BufferGeometry, expressID: number) => {
+  const positionAttr = geometry.getAttribute('position')
+  const vertexCount = positionAttr ? positionAttr.count : 0
+  if (vertexCount <= 0) return
+  const ids = new Float32Array(vertexCount)
+  ids.fill(expressID)
+  geometry.setAttribute('expressID', new Float32BufferAttribute(ids, 1))
+}
+
+const buildCenteredCustomObject = (
+  source: Mesh,
+  center: Point3D,
+  expressID: number
+): Group | null => {
+  source.updateMatrixWorld(true)
+  const root = new Group()
+  let meshCount = 0
+
+  source.traverse((candidate) => {
+    const mesh = candidate as Mesh & {
+      geometry?: BufferGeometry
+      material?: MeshStandardMaterial | MeshStandardMaterial[]
+      isMesh?: boolean
+    }
+    if (!mesh?.isMesh || !mesh.geometry) return
+
+    const geometry = mesh.geometry.clone()
+    geometry.applyMatrix4(mesh.matrixWorld)
+    geometry.translate(-center.x, -center.y, -center.z)
+    tagCustomGeometryExpressId(geometry, expressID)
+
+    const material = Array.isArray(mesh.material)
+      ? mesh.material.map((entry) => entry?.clone?.() ?? entry)
+      : mesh.material?.clone?.() ?? mesh.material
+
+    const clone = new Mesh(geometry, material as MeshStandardMaterial | MeshStandardMaterial[])
+    ;(clone as any).modelID = CUSTOM_CUBE_MODEL_ID
+    root.add(clone)
+    meshCount += 1
+  })
+
+  if (meshCount === 0) {
+    return null
+  }
+
+  root.position.set(center.x, center.y, center.z)
+  ;(root as any).modelID = CUSTOM_CUBE_MODEL_ID
+  return root
 }
 
 type SelectionTypeFilterOptions = {
@@ -318,6 +518,8 @@ type UseSelectionOffsetsResult = {
   ) => void
   hasRenderableExpressId: (modelID: number, expressID: number) => boolean
   getIfcElementBasePosition: (modelID: number, expressID: number) => Point3D | null
+  getIfcElementPlacementPosition: (modelID: number, expressID: number) => Point3D | null
+  ensureIfcPlacementPosition: (modelID: number, expressID: number) => Promise<Point3D | null>
   getIfcElementTranslationDelta: (modelID: number, expressID: number) => Point3D | null
   getIfcElementRotationDelta: (modelID: number, expressID: number) => Point3D | null
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
@@ -327,6 +529,9 @@ type UseSelectionOffsetsResult = {
   rotateSelectedTo: (targetRotation: Point3D) => void
   hideIfcElement: (modelID: number, expressID: number) => void
   setCustomCubeRoomNumber: (expressID: number, roomNumber?: string | null) => void
+  setCustomObjectSpaceIfcId: (expressID: number, spaceIfcId?: number | null) => void
+  setCustomObjectItemId: (expressID: number, itemId?: string | null) => void
+  getCustomObjectState: (expressID: number) => CustomObjectState | null
   ensureCustomCubesPickable: () => void
   pickCandidatesAt: (
     clientX: number,
@@ -363,6 +568,8 @@ export const useSelectionOffsets = (
   const elementRotationsRef = useRef<Map<string, Point3D>>(new Map())
   const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
   const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
+  const placementOriginsRef = useRef<Map<string, Point3D>>(new Map())
+  const coordinationMatrixRef = useRef<Map<number, Matrix4 | null>>(new Map())
   const filterSubsetsRef = useRef<Map<number, Mesh>>(new Map())
   const filterIdsRef = useRef<Map<number, Set<number> | null>>(new Map())
   const cubeRegistryRef = useRef<Map<number, Mesh>>(new Map())
@@ -373,6 +580,11 @@ export const useSelectionOffsets = (
   const selectionMaterialRef = useRef<MeshStandardMaterial | null>(null)
   const focusOffsetRef = useRef<Point3D | null>(null)
   const customCubeRoomsRef = useRef<Map<number, string>>(new Map())
+  const customObjectSpaceIfcIdsRef = useRef<Map<number, number>>(new Map())
+  const customObjectModelsRef = useRef<Map<number, string>>(new Map())
+  const customObjectNamesRef = useRef<Map<number, string>>(new Map())
+  const customObjectItemIdsRef = useRef<Map<number, string>>(new Map())
+  const customObjectSourceFilesRef = useRef<Map<number, string>>(new Map())
 
   const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null)
   const [offsetInputs, setOffsetInputs] = useState<OffsetVector>(zeroOffset)
@@ -529,13 +741,48 @@ export const useSelectionOffsets = (
   )
 
   const setCubeHighlight = useCallback((expressID: number | null) => {
-    // Toggle cube color to indicate selection
+    const restoreMaterials = (object: Mesh | undefined) => {
+      object?.traverse((entry: any) => {
+        const materials = Array.isArray(entry?.material) ? entry.material : [entry?.material]
+        materials.forEach((material: any) => {
+          if (!material) return
+          const userData = (material.userData ??= {})
+          if (material.color && typeof userData.__bakaBaseColor === 'number') {
+            material.color.set(userData.__bakaBaseColor)
+          }
+          if (material.emissive && typeof userData.__bakaBaseEmissive === 'number') {
+            material.emissive.set(userData.__bakaBaseEmissive)
+          }
+          material.needsUpdate = true
+        })
+      })
+    }
+
+    const applyHighlight = (object: Mesh | undefined) => {
+      object?.traverse((entry: any) => {
+        const materials = Array.isArray(entry?.material) ? entry.material : [entry?.material]
+        materials.forEach((material: any) => {
+          if (!material) return
+          const userData = (material.userData ??= {})
+          if (material.color && typeof userData.__bakaBaseColor !== 'number') {
+            userData.__bakaBaseColor = material.color.getHex()
+          }
+          if (material.emissive && typeof userData.__bakaBaseEmissive !== 'number') {
+            userData.__bakaBaseEmissive = material.emissive.getHex()
+          }
+          if (material.color) {
+            material.color.set(CUBE_HIGHLIGHT_COLOR)
+          }
+          if (material.emissive) {
+            material.emissive.set(CUSTOM_HIGHLIGHT_EMISSIVE)
+          }
+          material.needsUpdate = true
+        })
+      })
+    }
+
     if (highlightedCubeRef.current !== null && highlightedCubeRef.current !== expressID) {
-      const prevCube = cubeRegistryRef.current.get(highlightedCubeRef.current)
-      const prevMaterial = prevCube?.material as MeshStandardMaterial
-      if (prevMaterial?.color) {
-        prevMaterial.color.set(CUBE_BASE_COLOR)
-      }
+      restoreMaterials(cubeRegistryRef.current.get(highlightedCubeRef.current))
     }
 
     if (expressID === null) {
@@ -543,19 +790,15 @@ export const useSelectionOffsets = (
       return
     }
 
-    const cube = cubeRegistryRef.current.get(expressID)
-    const material = cube?.material as MeshStandardMaterial
-    if (material?.color) {
-      material.color.set(CUBE_HIGHLIGHT_COLOR)
-      highlightedCubeRef.current = expressID
-    }
+    applyHighlight(cubeRegistryRef.current.get(expressID))
+    highlightedCubeRef.current = expressID
   }, [])
 
   const getSelectedWorldPosition = useCallback((): Vector3 | null => {
     if (!selectedElement) return null
     if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
-      const cube = cubeRegistryRef.current.get(selectedElement.expressID)
-      return cube ? cube.position.clone() : null
+      const customObject = cubeRegistryRef.current.get(selectedElement.expressID)
+      return customObject ? customObject.position.clone() : null
     }
     return new Vector3(offsetInputs.dx, offsetInputs.dy, offsetInputs.dz)
   }, [offsetInputs, selectedElement])
@@ -577,6 +820,63 @@ export const useSelectionOffsets = (
   const getElementKey = useCallback((modelID: number, expressID: number) => {
     return `${modelID}:${expressID}`
   }, [])
+
+  const getModelCoordinationMatrix = useCallback(
+    async (modelID: number): Promise<Matrix4 | null> => {
+      if (coordinationMatrixRef.current.has(modelID)) {
+        return coordinationMatrixRef.current.get(modelID) ?? null
+      }
+
+      const viewer = viewerRef.current
+      const getCoordinationMatrix = (viewer?.IFC.loader.ifcManager as any)?.ifcAPI?.GetCoordinationMatrix
+      if (typeof getCoordinationMatrix !== 'function') {
+        coordinationMatrixRef.current.set(modelID, null)
+        return null
+      }
+
+      try {
+        const rawMatrix = await Promise.resolve(getCoordinationMatrix(modelID))
+        if (Array.isArray(rawMatrix) && rawMatrix.length === 16) {
+          const matrix = new Matrix4().fromArray(rawMatrix.map((value) => Number(value) || 0))
+          coordinationMatrixRef.current.set(modelID, matrix)
+          return matrix
+        }
+      } catch (error) {
+        console.warn('Failed to read IFC coordination matrix', error)
+      }
+
+      coordinationMatrixRef.current.set(modelID, null)
+      return null
+    },
+    [viewerRef]
+  )
+
+  const primeIfcPlacementOrigin = useCallback(
+    async (modelID: number, expressID: number, properties?: any): Promise<Point3D | null> => {
+      const key = getElementKey(modelID, expressID)
+      const cached = placementOriginsRef.current.get(key)
+      if (cached) {
+        return cached
+      }
+
+      const resolvedProperties = properties && typeof properties === 'object' ? properties : null
+      const placementMatrix = buildObjectPlacementMatrix(resolvedProperties?.ObjectPlacement)
+      if (!placementMatrix) {
+        return null
+      }
+
+      const origin = new Vector3(0, 0, 0).applyMatrix4(placementMatrix)
+      const coordinationMatrix = await getModelCoordinationMatrix(modelID)
+      if (coordinationMatrix) {
+        origin.applyMatrix4(coordinationMatrix)
+      }
+
+      const point = { x: origin.x, y: origin.y, z: origin.z }
+      placementOriginsRef.current.set(key, point)
+      return point
+    },
+    [getElementKey, getModelCoordinationMatrix]
+  )
 
   const normalizeRotation = useCallback((rotation: Point3D | null | undefined): Point3D => {
     return {
@@ -844,8 +1144,10 @@ export const useSelectionOffsets = (
   const getElementWorldPosition = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       if (modelID === CUSTOM_CUBE_MODEL_ID) {
-        const cube = cubeRegistryRef.current.get(expressID)
-        return cube ? { x: cube.position.x, y: cube.position.y, z: cube.position.z } : null
+        const customObject = cubeRegistryRef.current.get(expressID)
+        return customObject
+          ? { x: customObject.position.x, y: customObject.position.y, z: customObject.position.z }
+          : null
       }
       const key = getElementKey(modelID, expressID)
       const baseCenter = getBaseCenter(modelID, expressID)
@@ -861,8 +1163,10 @@ export const useSelectionOffsets = (
   const getIfcElementBasePosition = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       if (modelID === CUSTOM_CUBE_MODEL_ID) {
-        const cube = cubeRegistryRef.current.get(expressID)
-        return cube ? { x: cube.position.x, y: cube.position.y, z: cube.position.z } : null
+        const customObject = cubeRegistryRef.current.get(expressID)
+        return customObject
+          ? { x: customObject.position.x, y: customObject.position.y, z: customObject.position.z }
+          : null
       }
       const baseCenter = getBaseCenter(modelID, expressID)
       if (!baseCenter) return null
@@ -871,12 +1175,100 @@ export const useSelectionOffsets = (
     [getBaseCenter]
   )
 
+  const getIfcElementPlacementPosition = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        return null
+      }
+
+      const key = getElementKey(modelID, expressID)
+      const basePlacement = placementOriginsRef.current.get(key)
+      if (!basePlacement) {
+        return null
+      }
+
+      const moved = movedSubsetsRef.current.get(key)
+      if (moved) {
+        const baseSubset = baseSubsetsRef.current.get(modelID)
+        const modelMesh = viewerRef.current?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh as
+          | Mesh
+          | undefined
+        const baseMatrix = new Matrix4()
+        if (baseSubset) {
+          baseSubset.updateMatrixWorld(true)
+          baseMatrix.copy(baseSubset.matrixWorld)
+        } else if (modelMesh) {
+          modelMesh.updateMatrixWorld(true)
+          baseMatrix.copy(modelMesh.matrixWorld)
+        } else {
+          baseMatrix.identity()
+        }
+
+        const baseInverse = new Matrix4().copy(baseMatrix).invert()
+        const localOrigin = new Vector3(basePlacement.x, basePlacement.y, basePlacement.z).applyMatrix4(
+          baseInverse
+        )
+        moved.updateMatrixWorld(true)
+        const currentOrigin = localOrigin.applyMatrix4(moved.matrixWorld)
+        return { x: currentOrigin.x, y: currentOrigin.y, z: currentOrigin.z }
+      }
+
+      const offset = elementOffsetsRef.current.get(key)
+      const baseCenter = getBaseCenter(modelID, expressID)
+      if (offset && baseCenter) {
+        return {
+          x: basePlacement.x + (offset.dx - baseCenter.x),
+          y: basePlacement.y + (offset.dy - baseCenter.y),
+          z: basePlacement.z + (offset.dz - baseCenter.z)
+        }
+      }
+
+      return { x: basePlacement.x, y: basePlacement.y, z: basePlacement.z }
+    },
+    [getBaseCenter, getElementKey, viewerRef]
+  )
+
+  const ensureIfcPlacementPosition = useCallback(
+    async (modelID: number, expressID: number): Promise<Point3D | null> => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        return null
+      }
+
+      const cached = getIfcElementPlacementPosition(modelID, expressID)
+      if (cached) {
+        return cached
+      }
+
+      const viewer = viewerRef.current
+      if (!viewer) return null
+
+      try {
+        const properties = await viewer.IFC.getProperties(modelID, expressID, false, true)
+        return await primeIfcPlacementOrigin(modelID, expressID, properties)
+      } catch (error) {
+        console.warn('Failed to ensure IFC placement position', modelID, expressID, error)
+        return null
+      }
+    },
+    [getIfcElementPlacementPosition, primeIfcPlacementOrigin, viewerRef]
+  )
+
   const getIfcElementTranslationDelta = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       if (modelID === CUSTOM_CUBE_MODEL_ID) {
         return null
       }
       const key = getElementKey(modelID, expressID)
+      const basePlacement = placementOriginsRef.current.get(key)
+      const currentPlacement = getIfcElementPlacementPosition(modelID, expressID)
+      if (basePlacement && currentPlacement) {
+        return {
+          x: currentPlacement.x - basePlacement.x,
+          y: currentPlacement.y - basePlacement.y,
+          z: currentPlacement.z - basePlacement.z
+        }
+      }
+
       const offset = elementOffsetsRef.current.get(key)
       const baseCenter = getBaseCenter(modelID, expressID)
       if (!baseCenter) return null
@@ -889,18 +1281,18 @@ export const useSelectionOffsets = (
         z: offset.dz - baseCenter.z
       }
     },
-    [getBaseCenter, getElementKey]
+    [getBaseCenter, getElementKey, getIfcElementPlacementPosition]
   )
 
   const getIfcElementRotationDelta = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       if (modelID === CUSTOM_CUBE_MODEL_ID) {
-        const cube = cubeRegistryRef.current.get(expressID)
-        if (!cube) return null
+        const customObject = cubeRegistryRef.current.get(expressID)
+        if (!customObject) return null
         return {
-          x: cube.rotation.x,
-          y: cube.rotation.y,
-          z: cube.rotation.z
+          x: customObject.rotation.x,
+          y: customObject.rotation.y,
+          z: customObject.rotation.z
         }
       }
       const key = getElementKey(modelID, expressID)
@@ -1138,12 +1530,18 @@ export const useSelectionOffsets = (
         Array.from(baseCentersRef.current.keys())
           .filter((key) => key.startsWith(`${id}:`))
           .forEach((key) => baseCentersRef.current.delete(key))
+        Array.from(placementOriginsRef.current.keys())
+          .filter((key) => key.startsWith(`${id}:`))
+          .forEach((key) => placementOriginsRef.current.delete(key))
+        coordinationMatrixRef.current.delete(id)
         if (highlightedIfcRef.current?.modelID === id) {
           highlightedIfcRef.current = null
         }
       })
       if (typeof modelID !== 'number') {
         baseCentersRef.current.clear()
+        placementOriginsRef.current.clear()
+        coordinationMatrixRef.current.clear()
         spaceBiasIdsRef.current.clear()
         spaceBiasAppliedRef.current.clear()
         hiddenIdsRef.current.clear()
@@ -1417,6 +1815,7 @@ export const useSelectionOffsets = (
               : typeof properties.type === 'number'
                 ? String(properties.type)
                 : undefined
+        await primeIfcPlacementOrigin(modelID, expressID, properties)
         setSelectedElement({
           modelID,
           expressID,
@@ -1470,7 +1869,14 @@ export const useSelectionOffsets = (
         }
       }
     },
-    [buildPropertyFields, getElementKey, getElementWorldPosition, getModelBaseOffset, viewerRef]
+    [
+      buildPropertyFields,
+      getElementKey,
+      getElementWorldPosition,
+      getModelBaseOffset,
+      primeIfcPlacementOrigin,
+      viewerRef
+    ]
   )
 
   const handleFieldChange = useCallback((key: string, value: string) => {
@@ -1493,6 +1899,56 @@ export const useSelectionOffsets = (
     customCubeRoomsRef.current.set(expressID, roomNumber)
   }, [])
 
+  const setCustomObjectSpaceIfcId = useCallback((expressID: number, spaceIfcId?: number | null) => {
+    if (!Number.isFinite(expressID)) return
+    if (typeof spaceIfcId !== 'number' || !Number.isFinite(spaceIfcId)) {
+      customObjectSpaceIfcIdsRef.current.delete(expressID)
+      return
+    }
+    customObjectSpaceIfcIdsRef.current.set(expressID, Math.trunc(spaceIfcId))
+  }, [])
+
+  const setCustomObjectItemId = useCallback((expressID: number, itemId?: string | null) => {
+    if (!Number.isFinite(expressID)) return
+    if (!itemId) {
+      customObjectItemIdsRef.current.delete(expressID)
+      return
+    }
+    customObjectItemIdsRef.current.set(expressID, itemId)
+  }, [])
+
+  const getCustomObjectState = useCallback((expressID: number): CustomObjectState | null => {
+    if (!Number.isFinite(expressID)) return null
+    const model = customObjectModelsRef.current.get(expressID)
+    if (!model) return null
+    return {
+      itemId: customObjectItemIdsRef.current.get(expressID),
+      model,
+      name: customObjectNamesRef.current.get(expressID),
+      roomNumber: customCubeRoomsRef.current.get(expressID),
+      spaceIfcId: customObjectSpaceIfcIdsRef.current.get(expressID),
+      sourceFileName: customObjectSourceFilesRef.current.get(expressID)
+    }
+  }, [])
+
+  const rememberCustomObjectState = useCallback(
+    (expressID: number, state: Omit<CustomObjectState, 'itemId' | 'roomNumber'>) => {
+      if (!Number.isFinite(expressID)) return
+      customObjectModelsRef.current.set(expressID, state.model)
+      if (state.name) {
+        customObjectNamesRef.current.set(expressID, state.name)
+      } else {
+        customObjectNamesRef.current.delete(expressID)
+      }
+      if (state.sourceFileName) {
+        customObjectSourceFilesRef.current.set(expressID, state.sourceFileName)
+      } else {
+        customObjectSourceFilesRef.current.delete(expressID)
+      }
+    },
+    []
+  )
+
   const ensureCustomCubesPickable = useCallback(() => {
     const viewer = viewerRef.current
     if (!viewer) return
@@ -1504,21 +1960,25 @@ export const useSelectionOffsets = (
     })
   }, [viewerRef])
 
-  const buildCubePropertyFields = useCallback(
-    (expressID: number, pos?: Vector3 | null): PropertyField[] => {
+  const buildCustomPropertyFields = useCallback(
+    (expressID: number): PropertyField[] => {
+      const state = getCustomObjectState(expressID)
+      if (!state) {
+        return [{ key: 'name', label: 'Name', value: `Object #${expressID}` }]
+      }
+
       const fields: PropertyField[] = [
-        { key: 'type', label: 'Type', value: 'CUBE' },
-        { key: 'x', label: 'X', value: pos ? pos.x.toFixed(3) : '0' },
-        { key: 'y', label: 'Y', value: pos ? pos.y.toFixed(3) : '0' },
-        { key: 'z', label: 'Z', value: pos ? pos.z.toFixed(3) : '0' }
+        { key: 'name', label: 'Name', value: state.name || `Object #${expressID}` }
       ]
-      const roomNumber = customCubeRoomsRef.current.get(expressID)
-      if (roomNumber) {
-        fields.push({ key: 'roomNumber', label: 'Room', value: roomNumber })
+      if (state.roomNumber) {
+        fields.push({ key: 'roomNumber', label: 'Room', value: state.roomNumber })
+      }
+      if (state.sourceFileName) {
+        fields.push({ key: 'sourceFileName', label: 'Source file', value: state.sourceFileName })
       }
       return fields
     },
-    []
+    [getCustomObjectState]
   )
 
   const getExpressIdFromHit = useCallback((hit: {
@@ -1851,11 +2311,11 @@ export const useSelectionOffsets = (
       if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
         focusOffsetRef.current = null
         const key = `cube:${selectedElement.expressID}`
-        const cube = cubeRegistryRef.current.get(selectedElement.expressID)
-        if (cube) {
-          cube.position.set(normalizedTarget.dx, normalizedTarget.dy, normalizedTarget.dz)
-          cube.updateMatrix()
-          cube.matrixAutoUpdate = false
+        const customObject = cubeRegistryRef.current.get(selectedElement.expressID)
+        if (customObject) {
+          customObject.position.set(normalizedTarget.dx, normalizedTarget.dy, normalizedTarget.dz)
+          customObject.updateMatrix()
+          customObject.matrixAutoUpdate = false
           elementOffsetsRef.current.set(key, normalizedTarget)
         }
         return
@@ -1895,8 +2355,8 @@ export const useSelectionOffsets = (
       const pointer = viewer.context.mouse.position
       const raycaster = new Raycaster()
       raycaster.setFromCamera(pointer, camera)
-      const cubeMeshes = Array.from(cubeRegistryRef.current.values())
-      const cubeHit = cubeMeshes.length ? raycaster.intersectObjects(cubeMeshes, true)[0] : undefined
+      const customMeshes = Array.from(cubeRegistryRef.current.values())
+      const cubeHit = customMeshes.length ? raycaster.intersectObjects(customMeshes, true)[0] : undefined
       const ifcHit = viewer.context.castRayIfc()
       const resolvedHit =
         cubeHit && (!ifcHit || cubeHit.distance <= ifcHit.distance) ? cubeHit : ifcHit
@@ -1908,11 +2368,16 @@ export const useSelectionOffsets = (
         const hitExpressId = getExpressIdFromHit(resolvedHit as any) ?? cubeIdCounterRef.current
 
         const key = `cube:${hitExpressId}`
-        setSelectedElement({ modelID: CUSTOM_CUBE_MODEL_ID, expressID: hitExpressId, type: 'CUBE' })
+        const customState = getCustomObjectState(hitExpressId)
+        setSelectedElement({
+          modelID: CUSTOM_CUBE_MODEL_ID,
+          expressID: hitExpressId,
+          type: customState?.model?.toUpperCase() ?? 'CUSTOM'
+        })
         const cube = cubeRegistryRef.current.get(hitExpressId)
         const pos = cube?.position
         setOffsetInputs(pos ? pointToOffsetVector(pos) : zeroOffset)
-        setPropertyFields(buildCubePropertyFields(hitExpressId, pos))
+        setPropertyFields(buildCustomPropertyFields(hitExpressId))
         elementOffsetsRef.current.set(key, pos ? pointToOffsetVector(pos) : zeroOffset)
         setCubeHighlight(hitExpressId)
         return
@@ -1952,10 +2417,12 @@ export const useSelectionOffsets = (
       resetSelection()
     }
   }, [
+    buildCustomPropertyFields,
     fetchProperties,
     applyIfcSelectionHighlight,
     clearIfcSelectionHighlight,
     focusOnPoint,
+    getCustomObjectState,
     getElementWorldPosition,
     getExpressIdFromHit,
     isIfcSelectionAllowed,
@@ -2042,11 +2509,11 @@ export const useSelectionOffsets = (
       const normalized = normalizeRotation(targetRotation)
 
       if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
-        const cube = cubeRegistryRef.current.get(selectedElement.expressID)
-        if (!cube) return
-        cube.rotation.set(normalized.x, normalized.y, normalized.z)
-        cube.updateMatrix()
-        cube.matrixAutoUpdate = false
+        const customObject = cubeRegistryRef.current.get(selectedElement.expressID)
+        if (!customObject) return
+        customObject.rotation.set(normalized.x, normalized.y, normalized.z)
+        customObject.updateMatrix()
+        customObject.matrixAutoUpdate = false
         return
       }
 
@@ -2118,19 +2585,24 @@ export const useSelectionOffsets = (
 
   const selectCustomCube = useCallback(
     (expressID: number) => {
-      const cube = cubeRegistryRef.current.get(expressID)
-      if (!cube) return
+      const customObject = cubeRegistryRef.current.get(expressID)
+      if (!customObject) return
       clearIfcSelectionHighlight()
       viewerRef.current?.IFC.selector.unpickIfcItems()
-      const pos = cube.position
-      setSelectedElement({ modelID: CUSTOM_CUBE_MODEL_ID, expressID, type: 'CUBE' })
+      const pos = customObject.position
+      const customState = getCustomObjectState(expressID)
+      setSelectedElement({
+        modelID: CUSTOM_CUBE_MODEL_ID,
+        expressID,
+        type: customState?.model?.toUpperCase() ?? 'CUSTOM'
+      })
       setOffsetInputs(pointToOffsetVector(pos))
-      setPropertyFields(buildCubePropertyFields(expressID, pos))
+      setPropertyFields(buildCustomPropertyFields(expressID))
       setPropertyError(null)
       setIsFetchingProperties(false)
       setCubeHighlight(expressID)
     },
-    [buildCubePropertyFields, clearIfcSelectionHighlight, setCubeHighlight, viewerRef]
+    [buildCustomPropertyFields, clearIfcSelectionHighlight, getCustomObjectState, setCubeHighlight, viewerRef]
   )
 
   const clearIfcHighlight = useCallback(() => {
@@ -2141,12 +2613,18 @@ export const useSelectionOffsets = (
   const removeCustomCube = useCallback(
     (expressID: number) => {
       const viewer = viewerRef.current
-      const cube = cubeRegistryRef.current.get(expressID)
-      if (!viewer || !cube) return
+      const customObject = cubeRegistryRef.current.get(expressID)
+      if (!viewer || !customObject) return
       const scene = viewer.context.getScene()
-      scene.remove(cube)
-      removePickable(viewer, cube)
+      scene.remove(customObject)
+      removePickable(viewer, customObject)
       cubeRegistryRef.current.delete(expressID)
+      customCubeRoomsRef.current.delete(expressID)
+      customObjectSpaceIfcIdsRef.current.delete(expressID)
+      customObjectModelsRef.current.delete(expressID)
+      customObjectNamesRef.current.delete(expressID)
+      customObjectItemIdsRef.current.delete(expressID)
+      customObjectSourceFilesRef.current.delete(expressID)
       if (highlightedCubeRef.current === expressID) {
         highlightedCubeRef.current = null
       }
@@ -2194,12 +2672,16 @@ export const useSelectionOffsets = (
       ;(cube as any).modelID = CUSTOM_CUBE_MODEL_ID
 
       cubeRegistryRef.current.set(cubeExpressId, cube)
+      rememberCustomObjectState(cubeExpressId, {
+        model: 'cube',
+        name: `Cube #${cubeExpressId}`
+      })
       scene.add(cube)
       viewer.context.items.pickableIfcModels.push(cube as any)
 
       return { expressID: cubeExpressId, position }
     },
-    [viewerRef]
+    [rememberCustomObjectState, viewerRef]
   )
 
   const spawnCube = useCallback(
@@ -2231,20 +2713,34 @@ export const useSelectionOffsets = (
         const model = (await viewer.IFC.loadIfc(file, false)) as Mesh | undefined
         if (model) {
           tuneIfcModelMaterials(model)
-          const serialized = serializeMeshGeometry(model)
-          model.position.set(
-            resolved.x - serialized.center.x,
-            resolved.y - serialized.center.y,
-            resolved.z - serialized.center.z
-          )
-          model.updateMatrix()
-          model.updateMatrixWorld(true)
+          const initialSerialized = serializeMeshGeometry(model)
+          const expressID = cubeIdCounterRef.current++
+          const customObject = buildCenteredCustomObject(model, initialSerialized.center, expressID)
+          const sourceModelId = (model as { modelID?: number }).modelID
+          if (typeof sourceModelId === 'number') {
+            viewer.IFC.removeIfcModel(sourceModelId)
+          }
+          if (!customObject) {
+            return null
+          }
+          customObject.position.set(resolved.x, resolved.y, resolved.z)
+          customObject.updateMatrixWorld(true)
+          cubeRegistryRef.current.set(expressID, customObject as unknown as Mesh)
+          viewer.context.getScene().add(customObject)
+          viewer.context.items.pickableIfcModels.push(customObject as any)
           if (options?.focus) {
             focusOnPoint(resolved)
           }
-          const modelId = (model as { modelID?: number }).modelID
-          if (typeof modelId === 'number') {
-            return { modelID: modelId, position: resolved, geometry: serialized.geometry }
+          rememberCustomObjectState(expressID, {
+            model: 'uploaded-ifc',
+            name: buildUploadedFurnitureName(file.name),
+            sourceFileName: file.name
+          })
+          return {
+            modelID: CUSTOM_CUBE_MODEL_ID,
+            expressID,
+            position: resolved,
+            geometry: initialSerialized.geometry
           }
         }
       } catch (err) {
@@ -2252,7 +2748,7 @@ export const useSelectionOffsets = (
       }
       return null
     },
-    [focusOnPoint, viewerRef]
+    [focusOnPoint, rememberCustomObjectState, viewerRef]
   )
 
   return {
@@ -2272,12 +2768,17 @@ export const useSelectionOffsets = (
     hasRenderableExpressId,
     removeCustomCube,
     getIfcElementBasePosition,
+    getIfcElementPlacementPosition,
+    ensureIfcPlacementPosition,
     getIfcElementTranslationDelta,
     getIfcElementRotationDelta,
     getElementWorldPosition,
     moveSelectedTo,
     hideIfcElement,
     setCustomCubeRoomNumber,
+    setCustomObjectSpaceIfcId,
+    setCustomObjectItemId,
+    getCustomObjectState,
     ensureCustomCubesPickable,
     pickCandidatesAt,
     getSelectedWorldPosition,

@@ -19,6 +19,7 @@ type SpawnCube = (
 
 type SpawnUploadedModelInfo = {
   modelID: number
+  expressID: number
   position: Point3D
   geometry: FurnitureGeometry | null
 } | null
@@ -33,20 +34,23 @@ type RegisterCubeFurniture = (
   info: { expressID: number; position: Point3D },
   roomNumber?: string | null,
   spaceIfcId?: number | null
-) => void
+) => Promise<void>
 
 type RegisterUploadedFurniture = (
   file: File,
   info: SpawnUploadedModelInfo,
   roomNumber?: string | null,
   spaceIfcId?: number | null
-) => string | null
+) => Promise<string | null>
 
 type SelectById = (
   modelID: number,
   expressID: number,
   options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }
 ) => Promise<Point3D | null>
+
+type GetIfcElementPlacementPosition = (modelID: number, expressID: number) => Point3D | null
+type EnsureIfcPlacementPosition = (modelID: number, expressID: number) => Promise<Point3D | null>
 
 type UseInsertActionsArgs = {
   tree: ObjectTree
@@ -59,6 +63,8 @@ type UseInsertActionsArgs = {
   registerCubeFurniture: RegisterCubeFurniture
   registerUploadedFurniture: RegisterUploadedFurniture
   selectById: SelectById
+  getIfcElementPlacementPosition: GetIfcElementPlacementPosition
+  ensureIfcPlacementPosition: EnsureIfcPlacementPosition
   selectCustomCube: (expressID: number) => void
   spawnCube: SpawnCube
   spawnUploadedModel: SpawnUploadedModel
@@ -73,7 +79,7 @@ type UseInsertActionsResult = {
     nodeId: string,
     options?: { autoFocus?: boolean }
   ) => Promise<Point3D>
-  spawnUnitCube: () => void
+  spawnUnitCube: () => Promise<void>
   spawnUploadedModelAt: (uploadFile: File) => Promise<void>
   handleTreeAddCube: (nodeId: string) => Promise<void>
   handleTreeUploadModel: (nodeId: string) => void
@@ -91,12 +97,35 @@ export const useInsertActions = ({
   registerCubeFurniture,
   registerUploadedFurniture,
   selectById,
+  getIfcElementPlacementPosition,
+  ensureIfcPlacementPosition,
   selectCustomCube,
   spawnCube,
   spawnUploadedModel
 }: UseInsertActionsArgs): UseInsertActionsResult => {
   const treeUploadInputRef = useRef<HTMLInputElement | null>(null)
   const pendingTreeUploadRef = useRef<string | null>(null)
+
+  const resolveSpaceNodeForNode = useCallback(
+    (nodeId: string | null | undefined): ObjectTree['nodes'][string] | null => {
+      if (!nodeId) return null
+      let currentId: string | null | undefined = nodeId
+      while (currentId) {
+        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
+        if (!node) break
+        if (
+          node.nodeType === 'ifc' &&
+          node.expressID !== null &&
+          node.type.toUpperCase() === 'IFCSPACE'
+        ) {
+          return node
+        }
+        currentId = node.parentId
+      }
+      return null
+    },
+    [tree.nodes]
+  )
 
   const resolveRoomNumberForNode = useCallback(
     (nodeId: string | null | undefined): string | null => {
@@ -159,25 +188,52 @@ export const useInsertActions = ({
   const resolveNodeInsertTarget = useCallback(
     async (nodeId: string, options?: { autoFocus?: boolean }): Promise<Point3D> => {
       const node = tree.nodes[nodeId]
+      const spaceNode =
+        node && node.nodeType === 'ifc' && node.expressID !== null && node.type.toUpperCase() === 'IFCSPACE'
+          ? node
+          : resolveSpaceNodeForNode(nodeId)
+
       if (!node || node.nodeType !== 'ifc' || node.expressID === null) {
+        if (spaceNode) {
+          return (
+            getIfcElementPlacementPosition(spaceNode.modelID, spaceNode.expressID!) ??
+            (await ensureIfcPlacementPosition(spaceNode.modelID, spaceNode.expressID!)) ??
+            { x: 0, y: 0, z: 0 }
+          )
+        }
         return { x: 0, y: 0, z: 0 }
       }
 
       const target = await selectById(node.modelID, node.expressID, {
         autoFocus: options?.autoFocus
       })
-      return target ?? { x: 0, y: 0, z: 0 }
+      if (target) {
+        return target
+      }
+
+      if (spaceNode) {
+        return (
+          getIfcElementPlacementPosition(spaceNode.modelID, spaceNode.expressID!) ??
+          (await ensureIfcPlacementPosition(spaceNode.modelID, spaceNode.expressID!)) ??
+          { x: 0, y: 0, z: 0 }
+        )
+      }
+
+      return { x: 0, y: 0, z: 0 }
     },
-    [selectById, tree.nodes]
+    [ensureIfcPlacementPosition, getIfcElementPlacementPosition, resolveSpaceNodeForNode, selectById, tree.nodes]
   )
 
-  const spawnUnitCube = useCallback(() => {
-    const target = insertTargetCoords || hoverCoords || null
+  const spawnUnitCube = useCallback(async () => {
+    const target =
+      insertTargetCoords ||
+      hoverCoords ||
+      (selectedNodeId ? await resolveNodeInsertTarget(selectedNodeId) : null)
     const info = spawnCube(target, { focus: true })
     if (!info) return
     const roomNumber = resolveRoomNumberForNode(selectedNodeId)
     const spaceIfcId = resolveSpaceIfcIdForNode(selectedNodeId)
-    registerCubeFurniture(info, roomNumber, spaceIfcId)
+    await registerCubeFurniture(info, roomNumber, spaceIfcId)
     addCustomNode({
       modelID: CUSTOM_CUBE_MODEL_ID,
       expressID: info.expressID,
@@ -198,21 +254,25 @@ export const useInsertActions = ({
 
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File) => {
-      const target = insertTargetCoords || hoverCoords || { x: 0, y: 0, z: 0 }
+      const target =
+        insertTargetCoords ||
+        hoverCoords ||
+        (selectedNodeId ? await resolveNodeInsertTarget(selectedNodeId) : { x: 0, y: 0, z: 0 })
       const info = await spawnUploadedModel(uploadFile, target, { focus: true })
       if (!info) return
       const roomNumber = resolveRoomNumberForNode(selectedNodeId)
       const spaceIfcId = resolveSpaceIfcIdForNode(selectedNodeId)
       const parentId = findSpaceNodeIdByRoomNumber(roomNumber) ?? selectedNodeId
-      registerUploadedFurniture(uploadFile, info, roomNumber, spaceIfcId)
+      await registerUploadedFurniture(uploadFile, info, roomNumber, spaceIfcId)
       const newNodeId = addCustomNode({
-        modelID: info.modelID,
-        expressID: null,
+        modelID: CUSTOM_CUBE_MODEL_ID,
+        expressID: info.expressID,
         label: buildUploadedFurnitureName(uploadFile.name),
-        type: 'IFC',
+        type: 'FURNITURE',
         parentId
       })
       setSelectedNodeId(newNodeId)
+      selectCustomCube(info.expressID)
     },
     [
       addCustomNode,
@@ -224,6 +284,7 @@ export const useInsertActions = ({
       resolveSpaceIfcIdForNode,
       selectedNodeId,
       setSelectedNodeId,
+      selectCustomCube,
       spawnUploadedModel
     ]
   )
@@ -235,7 +296,7 @@ export const useInsertActions = ({
       if (!info) return
       const roomNumber = resolveRoomNumberForNode(nodeId)
       const spaceIfcId = resolveSpaceIfcIdForNode(nodeId)
-      registerCubeFurniture(info, roomNumber, spaceIfcId)
+      await registerCubeFurniture(info, roomNumber, spaceIfcId)
       const newNodeId = addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
         expressID: info.expressID,
@@ -273,15 +334,16 @@ export const useInsertActions = ({
         const spaceIfcId = resolveSpaceIfcIdForNode(parentId)
         const info = await spawnUploadedModel(inputFile, resolvedTarget, { focus: true })
         if (info) {
-          registerUploadedFurniture(inputFile, info, roomNumber, spaceIfcId)
+          await registerUploadedFurniture(inputFile, info, roomNumber, spaceIfcId)
           const newNodeId = addCustomNode({
-            modelID: info.modelID,
-            expressID: null,
+            modelID: CUSTOM_CUBE_MODEL_ID,
+            expressID: info.expressID,
             label: buildUploadedFurnitureName(inputFile.name),
-            type: 'IFC',
+            type: 'FURNITURE',
             parentId
           })
           setSelectedNodeId(newNodeId)
+          selectCustomCube(info.expressID)
         }
       }
       pendingTreeUploadRef.current = null
@@ -294,6 +356,7 @@ export const useInsertActions = ({
       resolveRoomNumberForNode,
       resolveSpaceIfcIdForNode,
       setSelectedNodeId,
+      selectCustomCube,
       spawnUploadedModel
     ]
   )

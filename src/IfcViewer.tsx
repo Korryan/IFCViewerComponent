@@ -35,14 +35,17 @@ import {
   CUBE_ITEM_PREFIX,
   ENABLE_ROOM_NUMBER_GROUPING,
   IFC_LOADER_SETTINGS,
+  INVERSE_COORDINATION_MATRIX_CUSTOM_KEY,
   MAX_CONTAINMENT_RELATION_LOOKUPS,
   MAX_UNKNOWN_TREE_TYPE_LOOKUPS,
   MODEL_LOAD_TIMEOUT_MS,
   MOVE_DELTA_CUSTOM_KEY,
+  PLACEMENT_POSITION_CUSTOM_KEY,
   POSITION_EPSILON,
   ROOM_SELECT_Y_OFFSET,
   ROTATE_DELTA_CUSTOM_KEY,
   ROTATION_EPSILON,
+  SPACE_RELATIVE_POSITION_CUSTOM_KEY,
   SHORTCUTS,
   UNKNOWN_TREE_TYPE_BATCH_SIZE,
   wasmRootPath
@@ -360,6 +363,7 @@ const IfcViewer = ({
   const offsetsRestoredRef = useRef<number | null>(null)
   const [activeModelId, setActiveModelId] = useState<number | null>(null)
   const roomNumbersRef = useRef<Map<number, string>>(new Map())
+  const activeModelInverseCoordinationMatrixRef = useRef<number[] | null>(null)
   const suppressMetadataNotifyRef = useRef(false)
   const suppressHistoryNotifyRef = useRef(false)
 
@@ -378,6 +382,8 @@ const IfcViewer = ({
     highlightIfcGroup,
     hasRenderableExpressId,
     getIfcElementBasePosition,
+    getIfcElementPlacementPosition,
+    ensureIfcPlacementPosition,
     getIfcElementTranslationDelta,
     getIfcElementRotationDelta,
     getElementWorldPosition,
@@ -386,6 +392,9 @@ const IfcViewer = ({
     getSelectedWorldPosition,
     hideIfcElement,
     setCustomCubeRoomNumber,
+    setCustomObjectSpaceIfcId,
+    setCustomObjectItemId,
+    getCustomObjectState,
     ensureCustomCubesPickable,
     pickCandidatesAt,
     resetSelection,
@@ -398,6 +407,43 @@ const IfcViewer = ({
     applyVisibilityFilter
   } = useSelectionOffsets(viewerRef)
 
+  const buildFurnitureCustom = useCallback(
+    async (args?: {
+      position?: { x: number; y: number; z: number } | null
+      spaceIfcId?: number | null
+      extraCustom?: Record<string, string>
+    }) => {
+      const custom: Record<string, string> = { ...(args?.extraCustom ?? {}) }
+      const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
+      if (Array.isArray(inverseMatrix) && inverseMatrix.length === 16) {
+        custom[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY] = JSON.stringify(inverseMatrix)
+      }
+
+      const position = args?.position ?? null
+      const spaceIfcId = args?.spaceIfcId ?? null
+      if (
+        position &&
+        typeof activeModelId === 'number' &&
+        Number.isFinite(spaceIfcId) &&
+        spaceIfcId !== null
+      ) {
+        const spacePosition =
+          getIfcElementPlacementPosition(activeModelId, spaceIfcId) ??
+          (await ensureIfcPlacementPosition(activeModelId, spaceIfcId))
+        if (spacePosition) {
+          custom[SPACE_RELATIVE_POSITION_CUSTOM_KEY] = JSON.stringify({
+            x: position.x - spacePosition.x,
+            y: position.y - spacePosition.y,
+            z: position.z - spacePosition.z
+          })
+        }
+      }
+
+      return Object.keys(custom).length > 0 ? custom : undefined
+    },
+    [activeModelId, ensureIfcPlacementPosition, getIfcElementPlacementPosition]
+  )
+
   const {
     furnitureEntries,
     setFurnitureEntries,
@@ -409,7 +455,10 @@ const IfcViewer = ({
     furniture,
     isHydrated,
     onFurnitureChange,
-    setCustomCubeRoomNumber
+    setCustomCubeRoomNumber,
+    setCustomObjectSpaceIfcId,
+    setCustomObjectItemId,
+    buildFurnitureCustom
   })
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
@@ -417,6 +466,55 @@ const IfcViewer = ({
     () => new Map(metadataEntries.map((entry) => [entry.ifcId, entry])),
     [metadataEntries]
   )
+
+  useEffect(() => {
+    const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
+    if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return
+    const serializedMatrix = JSON.stringify(inverseMatrix)
+    setFurnitureEntries((prev) => {
+      let changed = false
+      const next = prev.map((item) => {
+        const existingValue = item.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
+        if (typeof existingValue === 'string' && existingValue.trim()) {
+          return item
+        }
+        changed = true
+        return {
+          ...item,
+          custom: {
+            ...(item.custom ?? {}),
+            [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: serializedMatrix
+          }
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [activeModelId, setFurnitureEntries])
+
+  useEffect(() => {
+    const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
+    if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return
+    const serializedMatrix = JSON.stringify(inverseMatrix)
+    setMetadataEntries((prev) => {
+      let changed = false
+      const next = prev.map((entry) => {
+        const existingValue = entry.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
+        if (typeof existingValue === 'string' && existingValue.trim()) {
+          return entry
+        }
+        changed = true
+        return {
+          ...entry,
+          custom: {
+            ...(entry.custom ?? {}),
+            [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: serializedMatrix
+          }
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [activeModelId])
+
   const deletedIfcIds = useMemo(() => {
     const ids = new Set<number>()
     metadataEntries.forEach((entry) => {
@@ -524,6 +622,7 @@ const IfcViewer = ({
       const ifc = viewer.IFC as unknown as IfcLoadFacadeLike
       const loader = ifc.loader
       const ifcManager = loader?.ifcManager
+      activeModelInverseCoordinationMatrixRef.current = null
 
       if (!loader?.loadAsync || !ifcManager?.applyWebIfcConfig || typeof ifc.addIfcModel !== 'function') {
         if (source.file && typeof ifc.loadIfc === 'function') {
@@ -549,6 +648,27 @@ const IfcViewer = ({
         const model = await loader.loadAsync(resolvedUrl)
         if (!model) return null
         ifc.addIfcModel(model)
+
+        const modelId =
+          typeof (model as { modelID?: unknown }).modelID === 'number'
+            ? ((model as { modelID: number }).modelID as number)
+            : null
+        const getCoordinationMatrix = ifcManager.ifcAPI?.GetCoordinationMatrix
+        if (modelId !== null && typeof getCoordinationMatrix === 'function') {
+          try {
+            const rawMatrix = await Promise.resolve(getCoordinationMatrix(modelId))
+            if (Array.isArray(rawMatrix) && rawMatrix.length === 16) {
+              const matrix = new Matrix4().fromArray(
+                rawMatrix.map((value) => Number(value) || 0)
+              )
+              if (Math.abs(matrix.determinant()) > 1e-12) {
+                activeModelInverseCoordinationMatrixRef.current = matrix.clone().invert().toArray()
+              }
+            }
+          } catch (error) {
+            console.warn('Failed to read IFC coordination matrix', error)
+          }
+        }
 
         if (fitToFrame) {
           ifc.context?.fitToFrame?.()
@@ -628,17 +748,42 @@ const IfcViewer = ({
     if (!selectedElement || selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) return
     const pos = getSelectedWorldPosition()
     if (!pos) return
+    const customState = getCustomObjectState(selectedElement.expressID)
+    const itemId = customState?.itemId ?? `${CUBE_ITEM_PREFIX}${selectedElement.expressID}`
+    const model = customState?.model ?? 'cube'
+    const existingItem = furnitureEntries.find((item) => item.id === itemId)
+    const spaceIfcId = existingItem?.spaceIfcId ?? customState?.spaceIfcId
+    const roomNumber = existingItem?.roomNumber ?? customState?.roomNumber
     const rotation = getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID)
-    upsertFurnitureItem({
-      id: `${CUBE_ITEM_PREFIX}${selectedElement.expressID}`,
-      model: 'cube',
-      position: { x: pos.x, y: pos.y, z: pos.z },
-      rotation: rotation
-        ? { x: rotation.x, y: rotation.y, z: rotation.z }
-        : { x: 0, y: 0, z: 0 },
-      scale: { x: 1, y: 1, z: 1 }
-    })
-  }, [getIfcElementRotationDelta, getSelectedWorldPosition, selectedElement, upsertFurnitureItem])
+    void (async () => {
+      const custom = await buildFurnitureCustom({
+        position: { x: pos.x, y: pos.y, z: pos.z },
+        spaceIfcId,
+        extraCustom: existingItem?.custom
+      })
+      upsertFurnitureItem({
+        id: itemId,
+        model,
+        name: customState?.name,
+        position: { x: pos.x, y: pos.y, z: pos.z },
+        rotation: rotation
+          ? { x: rotation.x, y: rotation.y, z: rotation.z }
+          : { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+        roomNumber,
+        spaceIfcId,
+        custom
+      })
+    })()
+  }, [
+    buildFurnitureCustom,
+    furnitureEntries,
+    getCustomObjectState,
+    getIfcElementRotationDelta,
+    getSelectedWorldPosition,
+    selectedElement,
+    upsertFurnitureItem
+  ])
 
   const syncSelectedIfcPosition = useCallback(() => {
     if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) return
@@ -648,6 +793,10 @@ const IfcViewer = ({
         y: offsetInputs.dy,
         z: offsetInputs.dz
       }
+    const placementPosition = getIfcElementPlacementPosition(
+      selectedElement.modelID,
+      selectedElement.expressID
+    )
     const translationDelta = getIfcElementTranslationDelta(selectedElement.modelID, selectedElement.expressID)
     const rotationDelta = getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID)
     const base = getIfcElementBasePosition(selectedElement.modelID, selectedElement.expressID) ?? resolved
@@ -699,6 +848,12 @@ const IfcViewer = ({
           }
       const moveDeltaJson = JSON.stringify(nextDelta)
       const rotateDeltaJson = JSON.stringify(nextRotation)
+      const placementPositionJson = placementPosition ? JSON.stringify(placementPosition) : null
+      const inverseCoordinationMatrixJson = (() => {
+        const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
+        if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return null
+        return JSON.stringify(inverseMatrix)
+      })()
       const isSamePosition =
         prev &&
         Math.abs(prev.x - resolved.x) < POSITION_EPSILON &&
@@ -712,12 +867,16 @@ const IfcViewer = ({
         Math.abs(prevRotation.z - nextRotation.z) < ROTATION_EPSILON
       const currentDeltaJson = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
       const currentRotateDeltaJson = existing.custom?.[ROTATE_DELTA_CUSTOM_KEY]
+      const currentPlacementPositionJson = existing.custom?.[PLACEMENT_POSITION_CUSTOM_KEY]
+      const currentInverseCoordinationJson = existing.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
       if (
         isSamePosition &&
         isSameRotation &&
         existing.type === resolvedType &&
         currentDeltaJson === moveDeltaJson &&
-        currentRotateDeltaJson === rotateDeltaJson
+        currentRotateDeltaJson === rotateDeltaJson &&
+        currentPlacementPositionJson === (placementPositionJson ?? currentPlacementPositionJson) &&
+        currentInverseCoordinationJson === (inverseCoordinationMatrixJson ?? currentInverseCoordinationJson)
       ) {
         return existing
       }
@@ -736,13 +895,20 @@ const IfcViewer = ({
         custom: {
           ...(existing.custom ?? {}),
           [MOVE_DELTA_CUSTOM_KEY]: moveDeltaJson,
-          [ROTATE_DELTA_CUSTOM_KEY]: rotateDeltaJson
+          [ROTATE_DELTA_CUSTOM_KEY]: rotateDeltaJson,
+          ...(placementPositionJson
+            ? { [PLACEMENT_POSITION_CUSTOM_KEY]: placementPositionJson }
+            : {}),
+          ...(inverseCoordinationMatrixJson
+            ? { [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: inverseCoordinationMatrixJson }
+            : {})
         }
       }
     })
   }, [
     getElementWorldPosition,
     getIfcElementBasePosition,
+    getIfcElementPlacementPosition,
     getIfcElementRotationDelta,
     getIfcElementTranslationDelta,
     offsetInputs,
@@ -809,6 +975,8 @@ const IfcViewer = ({
     registerCubeFurniture,
     registerUploadedFurniture,
     selectById,
+    getIfcElementPlacementPosition,
+    ensureIfcPlacementPosition,
     selectCustomCube,
     spawnCube,
     spawnUploadedModel
@@ -819,7 +987,39 @@ const IfcViewer = ({
       const previousValue = propertyFields.find((field) => field.key === key)?.value
       const fieldLabel = propertyFields.find((field) => field.key === key)?.label ?? key
       handleFieldChange(key, value)
-      if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+      if (!selectedElement) {
+        return
+      }
+      if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+        const customState = getCustomObjectState(selectedElement.expressID)
+        const itemId = customState?.itemId ?? `${CUBE_ITEM_PREFIX}${selectedElement.expressID}`
+        const existingItem = furnitureEntries.find((item) => item.id === itemId)
+        upsertFurnitureItem({
+          id: itemId,
+          model: customState?.model ?? 'cube',
+          name:
+            key === 'name'
+              ? value
+              : customState?.name ??
+                propertyFields.find((field) => field.key === 'name')?.value ??
+                `Object #${selectedElement.expressID}`,
+          custom:
+            key === 'name'
+              ? undefined
+              : {
+                  ...(existingItem?.custom ?? {}),
+                  [key]: value
+                },
+          position:
+            existingItem?.position ??
+            getElementWorldPosition(selectedElement.modelID, selectedElement.expressID) ?? {
+              x: offsetInputs.dx,
+              y: offsetInputs.dy,
+              z: offsetInputs.dz
+            },
+          roomNumber: existingItem?.roomNumber ?? customState?.roomNumber,
+          spaceIfcId: existingItem?.spaceIfcId ?? customState?.spaceIfcId
+        })
         return
       }
       if (previousValue !== value) {
@@ -839,7 +1039,18 @@ const IfcViewer = ({
         }
       })
     },
-    [handleFieldChange, propertyFields, pushHistoryEntry, selectedElement, upsertMetadataEntry]
+    [
+      furnitureEntries,
+      getCustomObjectState,
+      getElementWorldPosition,
+      handleFieldChange,
+      offsetInputs,
+      propertyFields,
+      pushHistoryEntry,
+      selectedElement,
+      upsertFurnitureItem,
+      upsertMetadataEntry
+    ]
   )
 
   const applyOffsetAndPersist = useCallback(() => {
@@ -860,17 +1071,15 @@ const IfcViewer = ({
   const handleDeleteSelected = useCallback(() => {
     if (!selectedElement) return
 
-    // Custom cubes: hard delete (remove mesh + tree node + furniture entry).
+    // Custom objects: hard delete (remove mesh + tree node + furniture entry).
     if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
-      const cubeId = selectedElement.expressID
-      removeCustomCube(cubeId)
-      const nextFurniture = furnitureEntries.filter((item) => {
-        const parsedId = parseCubeId(item.id)
-        if (parsedId !== null) {
-          return parsedId !== cubeId
-        }
-        return item.id !== `${CUBE_ITEM_PREFIX}${cubeId}`
-      })
+      const customId = selectedElement.expressID
+      const customState = getCustomObjectState(customId)
+      const fallbackItemId = `${CUBE_ITEM_PREFIX}${customId}`
+      removeCustomCube(customId)
+      const nextFurniture = furnitureEntries.filter(
+        (item) => item.id !== (customState?.itemId ?? fallbackItemId)
+      )
       if (onFurnitureChange) {
         suppressNextFurnitureNotify()
         onFurnitureChange(nextFurniture)
@@ -880,7 +1089,7 @@ const IfcViewer = ({
         (node) =>
           node.nodeType === 'custom' &&
           node.modelID === CUSTOM_CUBE_MODEL_ID &&
-          node.expressID === cubeId
+          node.expressID === customId
       )?.id
       if (nodeId) {
         removeNode(nodeId)
@@ -905,6 +1114,7 @@ const IfcViewer = ({
     setSelectedNodeId(null)
   }, [
     furnitureEntries,
+    getCustomObjectState,
     hideIfcElement,
     onFurnitureChange,
     pushHistoryEntry,
@@ -983,6 +1193,7 @@ const IfcViewer = ({
       const info = spawnCube(item.position, { id: cubeId, focus: false })
       if (!info) return
       setCustomCubeRoomNumber(info.expressID, item.roomNumber)
+      setCustomObjectSpaceIfcId(info.expressID, item.spaceIfcId)
       const parentId = findSpaceNodeIdByRoomNumber(item.roomNumber)
       addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
