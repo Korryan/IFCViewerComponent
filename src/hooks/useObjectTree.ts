@@ -16,9 +16,7 @@ type SpatialNode = {
 }
 
 const emptyTree: ObjectTree = { nodes: {}, roots: [] }
-const CUSTOM_ROOT_PREFIX = 'custom-root-'
 const CUSTOM_NODE_PREFIX = 'custom-node-'
-const CUSTOM_ROOT_LABEL = 'Vlastni objekty'
 
 const parseSpatialId = (raw: unknown): number | null => {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
@@ -61,6 +59,17 @@ const buildLabel = (type: string): string => {
   return 'IFC prvek'
 }
 
+const extractSpatialName = (node: SpatialNode): string | null => {
+  const raw =
+    typeof node.name === 'string'
+      ? node.name
+      : typeof node.Name?.value === 'string'
+        ? node.Name.value
+        : null
+  const trimmed = raw?.trim()
+  return trimmed ? trimmed : null
+}
+
 const normalizeIfcType = (type?: string): string => (type ?? '').toUpperCase()
 const isIfcType = (node: ObjectTreeNode, target: string): boolean =>
   node.nodeType === 'ifc' && normalizeIfcType(node.type) === target
@@ -73,18 +82,20 @@ const getSpatialChildren = (node: SpatialNode): SpatialNode[] =>
 const resolveEffectiveSpatialNode = (node: SpatialNode): {
   ifcId: number | null
   type: string
+  name: string | null
   children: SpatialNode[]
 } => {
   const ifcId = getSpatialNodeId(node)
   const type = normalizeSpatialType(node)
+  const name = extractSpatialName(node)
   const children = getSpatialChildren(node)
 
   if (ifcId === null) {
-    return { ifcId: null, type, children }
+    return { ifcId: null, type, name, children }
   }
 
   if (type !== 'UNKNOWN') {
-    return { ifcId, type, children }
+    return { ifcId, type, name, children }
   }
 
   // Typical converted structure: wrapper keeps localId, child keeps IFC category/type.
@@ -96,12 +107,13 @@ const resolveEffectiveSpatialNode = (node: SpatialNode): {
       return {
         ifcId: childIfcId,
         type: childType,
+        name: extractSpatialName(onlyChild) ?? name,
         children: getSpatialChildren(onlyChild)
       }
     }
   }
 
-  return { ifcId, type, children }
+  return { ifcId, type, name, children }
 }
 
 type BuildIndex = {
@@ -113,6 +125,7 @@ const ensureIfcNode = (
   modelID: number,
   ifcId: number,
   type: string,
+  name: string | null,
   parentId: string | null,
   acc: ObjectTree,
   index: BuildIndex
@@ -125,6 +138,9 @@ const ensureIfcNode = (
       if (shouldUpgradeType) {
         existing.type = type
         existing.label = buildLabel(type)
+      }
+      if (!existing.name && name) {
+        existing.name = name
       }
       if (existing.parentId === null && parentId) {
         existing.parentId = parentId
@@ -139,6 +155,7 @@ const ensureIfcNode = (
     modelID,
     expressID: ifcId,
     label: buildLabel(type),
+    name,
     type,
     nodeType: 'ifc',
     parentId,
@@ -178,7 +195,7 @@ const traverseSpatial = (
   if (visited.has(node as object)) return []
   visited.add(node as object)
 
-  const { ifcId, type, children } = resolveEffectiveSpatialNode(node)
+  const { ifcId, type, name, children } = resolveEffectiveSpatialNode(node)
   if (ifcId === null) {
     const promoted: string[] = []
     children.forEach((child) => {
@@ -187,7 +204,7 @@ const traverseSpatial = (
     return promoted
   }
 
-  const id = ensureIfcNode(modelID, ifcId, type, parentId, acc, index)
+  const id = ensureIfcNode(modelID, ifcId, type, name, parentId, acc, index)
   connectParentChild(parentId, id, acc, index)
 
   if (children.length > 0) {
@@ -373,35 +390,14 @@ export const groupIfcTreeBySpatialContainment = (
   }
 }
 
-const buildCustomRoot = (modelID: number): ObjectTreeNode => ({
-  id: `${CUSTOM_ROOT_PREFIX}${modelID}`,
-  modelID,
-  expressID: null,
-  label: CUSTOM_ROOT_LABEL,
-  type: 'CUSTOM',
-  nodeType: 'custom',
-  parentId: null,
-  children: []
-})
-
-const mergeWithCustomRoot = (tree: ObjectTree, modelID: number): ObjectTree => {
-  const rootId = `${CUSTOM_ROOT_PREFIX}${modelID}`
-  const nextNodes = { ...tree.nodes }
-  const nextRoots = tree.roots.slice()
-  if (!nextNodes[rootId]) {
-    nextNodes[rootId] = buildCustomRoot(modelID)
-    nextRoots.push(rootId)
-  }
-  return { nodes: nextNodes, roots: nextRoots }
-}
-
 // Hook that owns the tree state; UI can subscribe later
 export const useObjectTree = () => {
   const [tree, setTree] = useState<ObjectTree>(emptyTree)
   const customIdCounterRef = useRef(1)
 
   const setIfcTree = useCallback((next: ObjectTree, modelID: number) => {
-    setTree(mergeWithCustomRoot(next, modelID))
+    void modelID
+    setTree(next)
   }, [])
 
   const resetTree = useCallback(() => setTree(emptyTree), [])
@@ -420,15 +416,11 @@ export const useObjectTree = () => {
           : `${CUSTOM_NODE_PREFIX}${payload.modelID}-${customIdCounterRef.current++}`
 
       setTree((prev) => {
-        const next = mergeWithCustomRoot(prev, payload.modelID)
-        const rootId = `${CUSTOM_ROOT_PREFIX}${payload.modelID}`
+        const next = prev
         const resolvedParentId =
-          payload.parentId && next.nodes[payload.parentId] ? payload.parentId : rootId
+          payload.parentId && next.nodes[payload.parentId] ? payload.parentId : null
 
-        const parent = next.nodes[resolvedParentId]
-        if (!parent) {
-          return next
-        }
+        const parent = resolvedParentId ? next.nodes[resolvedParentId] : null
 
         if (next.nodes[nextId]) {
           return next
@@ -439,22 +431,28 @@ export const useObjectTree = () => {
           modelID: payload.modelID,
           expressID: payload.expressID ?? null,
           label: payload.label,
+          name: payload.label,
           type: payload.type ?? 'CUSTOM',
           nodeType: 'custom',
           parentId: resolvedParentId,
           children: []
         }
 
+        const nextRoots = resolvedParentId ? next.roots : [...next.roots, nextId]
         return {
           nodes: {
             ...next.nodes,
             [nextId]: node,
-            [resolvedParentId]: {
-              ...parent,
-              children: [...parent.children, nextId]
-            }
+            ...(resolvedParentId && parent
+              ? {
+                  [resolvedParentId]: {
+                    ...parent,
+                    children: [...parent.children, nextId]
+                  }
+                }
+              : {})
           },
-          roots: next.roots
+          roots: nextRoots
         }
       })
 

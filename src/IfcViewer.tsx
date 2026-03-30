@@ -190,7 +190,14 @@ type IfcSceneLike = {
 
 type NavigationMode = 'free' | 'walk'
 type WalkMoveKey = 'arrowup' | 'arrowleft' | 'arrowdown' | 'arrowright'
-type RoomListEntry = { nodeId: string; label: string; roomNumber?: string | null }
+type RoomListEntry = {
+  nodeId: string
+  label: string
+  ifcId: number
+  roomNumber?: string | null
+  storeyId?: string | null
+  storeyLabel?: string | null
+}
 
 const emptyWalkKeyState: Record<WalkMoveKey, boolean> = {
   arrowup: false,
@@ -917,21 +924,78 @@ const IfcViewer = ({
   }, [metadataEntries])
   const roomOptions = useMemo<RoomListEntry[]>(() => {
     const roomNumbers = roomNumbersRef.current
+    const storeyOrder: string[] = []
+    const visitNode = (nodeId: string) => {
+      const node = tree.nodes[nodeId]
+      if (!node) return
+      if (node.nodeType === 'ifc' && node.type.toUpperCase() === 'IFCBUILDINGSTOREY') {
+        storeyOrder.push(nodeId)
+      }
+      node.children.forEach(visitNode)
+    }
+    tree.roots.forEach(visitNode)
+
+    const fallbackStoreyLabel = (index: number) => (index === 0 ? 'Prizemi' : `${index}. patro`)
+    const storeyLabelById = new Map<string, string>()
+    storeyOrder.forEach((storeyId, index) => {
+      const storey = tree.nodes[storeyId]
+      if (!storey) return
+      const rawName = storey.name?.trim()
+      const shouldUseName =
+        Boolean(rawName) &&
+        rawName!.localeCompare(storey.label, undefined, { sensitivity: 'base' }) !== 0
+      storeyLabelById.set(storeyId, shouldUseName ? rawName! : fallbackStoreyLabel(index))
+    })
+
+    const resolveStorey = (nodeId: string): { id: string | null; label: string | null } => {
+      let currentId: string | null = nodeId
+      while (currentId) {
+        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
+        if (!node) break
+        if (node.nodeType === 'ifc' && node.type.toUpperCase() === 'IFCBUILDINGSTOREY') {
+          return {
+            id: node.id,
+            label: storeyLabelById.get(node.id) ?? node.name?.trim() ?? node.label
+          }
+        }
+        currentId = node.parentId
+      }
+      return { id: null, label: 'Nezarazene' }
+    }
+
     return Object.values(tree.nodes)
       .filter(
         (node) => node.nodeType === 'ifc' && node.expressID !== null && node.type.toUpperCase() === 'IFCSPACE'
       )
-      .map((node) => ({
-        nodeId: node.id,
-        label: node.label,
-        roomNumber: roomNumbers.get(node.expressID!) ?? null
-      }))
+      .map((node) => {
+        const roomNumber = roomNumbers.get(node.expressID!) ?? null
+        const storey = resolveStorey(node.id)
+        return {
+          nodeId: node.id,
+          label: 'Mistnost',
+          ifcId: node.expressID!,
+          roomNumber,
+          storeyId: storey.id,
+          storeyLabel: storey.label
+        }
+      })
       .sort((left, right) => {
+        const leftStoreyIndex =
+          left.storeyId !== null && left.storeyId !== undefined
+            ? storeyOrder.indexOf(left.storeyId)
+            : Number.MAX_SAFE_INTEGER
+        const rightStoreyIndex =
+          right.storeyId !== null && right.storeyId !== undefined
+            ? storeyOrder.indexOf(right.storeyId)
+            : Number.MAX_SAFE_INTEGER
+        if (leftStoreyIndex !== rightStoreyIndex) {
+          return leftStoreyIndex - rightStoreyIndex
+        }
         const leftKey = left.roomNumber?.trim() || left.label
         const rightKey = right.roomNumber?.trim() || right.label
         return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: 'base' })
       })
-  }, [tree.nodes])
+  }, [tree.nodes, tree.roots])
   const treeNodeBySelectionKey = useMemo(() => {
     const byKey = new Map<string, string>()
     Object.values(tree.nodes).forEach((node) => {
@@ -3427,4 +3491,5 @@ const IfcViewer = ({
 }
 
 export default IfcViewer
+
 

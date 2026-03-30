@@ -7,7 +7,13 @@ type ObjectTreePanelProps = {
   tree: ObjectTree
   selectedNodeId: string | null
   onSelectNode: (nodeId: string) => void
-  rooms?: { nodeId: string; label: string; roomNumber?: string | null }[]
+  rooms?: {
+    nodeId: string
+    label: string
+    ifcId: number
+    roomNumber?: string | null
+    storeyLabel?: string | null
+  }[]
   onSelectRoom?: (nodeId: string) => void
   onAddCube: (nodeId: string) => void
   onUploadModel: (nodeId: string) => void
@@ -213,6 +219,19 @@ export const ObjectTreePanel = ({
   const hasContent = useMemo(() => tree.roots.length > 0, [tree.roots])
   const hasRooms = useMemo(() => rooms.length > 0, [rooms])
   const isRoomMode = viewMode === 'rooms'
+  const roomGroups = useMemo(() => {
+    const groups: Array<{ label: string; rooms: typeof rooms }> = []
+    rooms.forEach((room) => {
+      const groupLabel = room.storeyLabel?.trim() || 'Nezařazené'
+      const lastGroup = groups[groups.length - 1]
+      if (!lastGroup || lastGroup.label !== groupLabel) {
+        groups.push({ label: groupLabel, rooms: [room] })
+        return
+      }
+      lastGroup.rooms.push(room)
+    })
+    return groups
+  }, [rooms])
 
   const handleOpenMenu = (nodeId: string, anchor: { x: number; y: number }) => {
     const panel = panelRef.current
@@ -278,25 +297,35 @@ export const ObjectTreePanel = ({
         {isRoomMode ? (
           hasRooms ? (
             <div className="tree-panel__rooms">
-              {rooms.map((room) => (
-                <button
-                  type="button"
-                  key={room.nodeId}
-                  className={[
-                    'tree-panel__room',
-                    selectedNodeId === room.nodeId ? 'tree-panel__room--selected' : ''
-                  ]
-                    .filter(Boolean)
-                    .join(' ')}
-                  onClick={() => {
-                    ;(onSelectRoom ?? onSelectNode)(room.nodeId)
-                  }}
-                  data-room-node-id={room.nodeId}
-                  title={room.label}
-                >
-                  <span className="tree-panel__room-label">{room.label}</span>
-                  {room.roomNumber && <span className="tree-panel__room-number">#{room.roomNumber}</span>}
-                </button>
+              {roomGroups.map((group) => (
+                <div key={group.label} className="tree-panel__room-group">
+                  <p className="tree-panel__room-group-title">{group.label}</p>
+                  {group.rooms.map((room) => (
+                    <button
+                      type="button"
+                      key={room.nodeId}
+                      className={[
+                        'tree-panel__room',
+                        selectedNodeId === room.nodeId ? 'tree-panel__room--selected' : ''
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      onClick={() => {
+                        ;(onSelectRoom ?? onSelectNode)(room.nodeId)
+                      }}
+                      data-room-node-id={room.nodeId}
+                      title={room.label}
+                    >
+                      <span className="tree-panel__room-label-group">
+                        <span className="tree-panel__room-label">{room.label}</span>
+                        <span className="tree-panel__room-number">#{room.ifcId}</span>
+                      </span>
+                      {room.roomNumber && (
+                        <span className="tree-panel__room-meta">c. {room.roomNumber}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
               ))}
             </div>
           ) : (

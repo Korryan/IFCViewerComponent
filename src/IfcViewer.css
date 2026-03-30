@@ -567,7 +567,21 @@
 .tree-panel__rooms {
   display: flex;
   flex-direction: column;
+  gap: 0.8rem;
+}
+
+.tree-panel__room-group {
+  display: flex;
+  flex-direction: column;
   gap: 0.35rem;
+}
+
+.tree-panel__room-group-title {
+  margin: 0;
+  color: #1e3a8a;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: none;
 }
 
 .tree-panel__room {
@@ -601,10 +615,24 @@
   white-space: nowrap;
 }
 
+.tree-panel__room-label-group {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
 .tree-panel__room-number {
   color: #1e3a8a;
   font-size: 0.76rem;
   font-weight: 600;
+}
+
+.tree-panel__room-meta {
+  color: #475569;
+  font-size: 0.76rem;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .tree-panel__status {

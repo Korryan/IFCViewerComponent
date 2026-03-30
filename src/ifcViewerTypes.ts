@@ -64,6 +64,7 @@ export type ObjectTreeNode = {
   modelID: number
   expressID: number | null
   label: string
+  name?: string | null
   type: string
   nodeType: 'ifc' | 'custom'
   parentId: string | null

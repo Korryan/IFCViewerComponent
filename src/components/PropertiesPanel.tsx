@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { HistoryEntry, OffsetVector, PropertyField, SelectedElement } from '../ifcViewerTypes'
 
 type PropertiesPanelProps = {
@@ -34,6 +35,29 @@ export const PropertiesPanel = ({
   propertyFields,
   onFieldChange
 }: PropertiesPanelProps) => {
+  const [draftOffsets, setDraftOffsets] = useState<Record<keyof OffsetVector, string>>({
+    dx: '0',
+    dy: '0',
+    dz: '0'
+  })
+
+  useEffect(() => {
+    setDraftOffsets({
+      dx: String(offsetInputs.dx),
+      dy: String(offsetInputs.dy),
+      dz: String(offsetInputs.dz)
+    })
+  }, [offsetInputs.dx, offsetInputs.dy, offsetInputs.dz, selectedElement?.expressID, selectedElement?.modelID])
+
+  const tryParseOffset = (rawValue: string): number | null => {
+    const normalized = rawValue.replace(',', '.').trim()
+    if (!normalized || normalized === '-' || normalized === '.' || normalized === '-.') {
+      return null
+    }
+    const parsed = Number(normalized)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
   return (
     <aside className="properties-panel">
       <header className="properties-panel__header">
@@ -82,17 +106,27 @@ export const PropertiesPanel = ({
                   <label key={axis} className="offset-panel__field">
                     <span>{axis.toUpperCase()}</span>
                     <input
-                      type="number"
-                      step="0.01"
-                      value={offsetInputs[axis]}
-                      onChange={(event) =>
-                        onOffsetChange(
-                          axis,
-                          Number.isFinite(parseFloat(event.target.value))
-                            ? parseFloat(event.target.value)
-                            : 0
-                        )
-                      }
+                      type="text"
+                      inputMode="decimal"
+                      value={draftOffsets[axis]}
+                      onChange={(event) => {
+                        const rawValue = event.target.value
+                        setDraftOffsets((prev) => ({
+                          ...prev,
+                          [axis]: rawValue
+                        }))
+                        const parsed = tryParseOffset(rawValue)
+                        if (parsed !== null) {
+                          onOffsetChange(axis, parsed)
+                        }
+                      }}
+                      onBlur={() => {
+                        const parsed = tryParseOffset(draftOffsets[axis])
+                        setDraftOffsets((prev) => ({
+                          ...prev,
+                          [axis]: parsed === null ? String(offsetInputs[axis]) : String(parsed)
+                        }))
+                      }}
                     />
                   </label>
                 ))}

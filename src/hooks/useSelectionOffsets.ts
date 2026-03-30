@@ -35,7 +35,27 @@ const CUBE_HIGHLIGHT_COLOR = 0xffb100
 const IFC_SELECTION_COLOR = 0xffbf00
 const IFC_SELECTION_EMISSIVE = 0x6a3d00
 const COORD_EPSILON = 1e-4
+const COORD_DISPLAY_EPSILON = 1e-3
 export const CUSTOM_CUBE_MODEL_ID = -999
+
+const normalizeCoordinateValue = (value: number): number => {
+  if (!Number.isFinite(value)) return 0
+  const rounded = Math.round(value * 1000) / 1000
+  return Math.abs(rounded) < COORD_DISPLAY_EPSILON ? 0 : rounded
+}
+
+const normalizeOffsetVector = (value: OffsetVector): OffsetVector => ({
+  dx: normalizeCoordinateValue(value.dx),
+  dy: normalizeCoordinateValue(value.dy),
+  dz: normalizeCoordinateValue(value.dz)
+})
+
+const pointToOffsetVector = (point: Point3D): OffsetVector =>
+  normalizeOffsetVector({
+    dx: point.x,
+    dy: point.y,
+    dz: point.z
+  })
 
 const normalizeIfcIds = (ids: number[]): number[] => {
   const dedup = new Set<number>()
@@ -1415,7 +1435,7 @@ export const useSelectionOffsets = (
           focusOffsetRef.current = null
         }
         if (resolvedFocus) {
-          setOffsetInputs({ dx: resolvedFocus.x, dy: resolvedFocus.y, dz: resolvedFocus.z })
+          setOffsetInputs(pointToOffsetVector(resolvedFocus))
         } else {
           const fallbackCenter =
             elementOffsetsRef.current.get(key) ??
@@ -1428,7 +1448,7 @@ export const useSelectionOffsets = (
                 dz: baseCenter.z
               }
             })()
-          setOffsetInputs(fallbackCenter)
+          setOffsetInputs(normalizeOffsetVector(fallbackCenter))
         }
         setPropertyFields(buildPropertyFields(properties))
       } catch (err) {
@@ -1460,7 +1480,7 @@ export const useSelectionOffsets = (
   const handleOffsetInputChange = useCallback((axis: keyof OffsetVector, value: number) => {
     setOffsetInputs((prev) => ({
       ...prev,
-      [axis]: Number.isFinite(value) ? value : 0
+      [axis]: normalizeCoordinateValue(value)
     }))
   }, [])
 
@@ -1825,17 +1845,18 @@ export const useSelectionOffsets = (
       const viewer = viewerRef.current
       if (!viewer || !selectedElement) return
 
-      setOffsetInputs(targetOffset)
+      const normalizedTarget = normalizeOffsetVector(targetOffset)
+      setOffsetInputs(normalizedTarget)
 
       if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
         focusOffsetRef.current = null
         const key = `cube:${selectedElement.expressID}`
         const cube = cubeRegistryRef.current.get(selectedElement.expressID)
         if (cube) {
-          cube.position.set(targetOffset.dx, targetOffset.dy, targetOffset.dz)
+          cube.position.set(normalizedTarget.dx, normalizedTarget.dy, normalizedTarget.dz)
           cube.updateMatrix()
           cube.matrixAutoUpdate = false
-          elementOffsetsRef.current.set(key, targetOffset)
+          elementOffsetsRef.current.set(key, normalizedTarget)
         }
         return
       }
@@ -1843,11 +1864,11 @@ export const useSelectionOffsets = (
       const focusOffset = focusOffsetRef.current
       const adjustedTarget = focusOffset
         ? {
-            dx: targetOffset.dx - focusOffset.x,
-            dy: targetOffset.dy - focusOffset.y,
-            dz: targetOffset.dz - focusOffset.z
+            dx: normalizedTarget.dx - focusOffset.x,
+            dy: normalizedTarget.dy - focusOffset.y,
+            dz: normalizedTarget.dz - focusOffset.z
           }
-        : targetOffset
+        : normalizedTarget
 
       applyIfcElementOffset(selectedElement.modelID, selectedElement.expressID, adjustedTarget)
     },
@@ -1890,9 +1911,9 @@ export const useSelectionOffsets = (
         setSelectedElement({ modelID: CUSTOM_CUBE_MODEL_ID, expressID: hitExpressId, type: 'CUBE' })
         const cube = cubeRegistryRef.current.get(hitExpressId)
         const pos = cube?.position
-        setOffsetInputs(pos ? { dx: pos.x, dy: pos.y, dz: pos.z } : zeroOffset)
+        setOffsetInputs(pos ? pointToOffsetVector(pos) : zeroOffset)
         setPropertyFields(buildCubePropertyFields(hitExpressId, pos))
-        elementOffsetsRef.current.set(key, pos ? { dx: pos.x, dy: pos.y, dz: pos.z } : zeroOffset)
+        elementOffsetsRef.current.set(key, pos ? pointToOffsetVector(pos) : zeroOffset)
         setCubeHighlight(hitExpressId)
         return
       }
@@ -2103,7 +2124,7 @@ export const useSelectionOffsets = (
       viewerRef.current?.IFC.selector.unpickIfcItems()
       const pos = cube.position
       setSelectedElement({ modelID: CUSTOM_CUBE_MODEL_ID, expressID, type: 'CUBE' })
-      setOffsetInputs({ dx: pos.x, dy: pos.y, dz: pos.z })
+      setOffsetInputs(pointToOffsetVector(pos))
       setPropertyFields(buildCubePropertyFields(expressID, pos))
       setPropertyError(null)
       setIsFetchingProperties(false)
