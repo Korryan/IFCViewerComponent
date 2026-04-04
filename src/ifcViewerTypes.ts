@@ -28,6 +28,12 @@ export type Point3D = {
   z: number
 }
 
+export type InsertPrefabOption = {
+  prefabId: string
+  fileName: string
+  updatedAt?: string | null
+}
+
 export type MetadataEntry = {
   ifcId: number
   type?: string

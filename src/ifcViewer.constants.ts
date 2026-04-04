@@ -42,7 +42,8 @@ export const SHORTCUTS = [
   { keys: 'R', label: 'Start rotate mode' },
   { keys: 'X / Y / Z', label: 'Lock axis while moving / rotating' },
   { keys: 'F', label: 'Move in floor plane (keep height)' },
+  { keys: 'Left Click (move/rotate)', label: 'Confirm transform' },
   { keys: 'Left Click', label: 'Pick element / open overlap menu' },
-  { keys: 'Esc', label: 'Cancel drag / close menus' },
+  { keys: 'Esc', label: 'Cancel move / rotate / close menus' },
   { keys: '? / H', label: 'Toggle shortcuts help' }
 ]

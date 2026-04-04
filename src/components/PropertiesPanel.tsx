@@ -16,6 +16,8 @@ type PropertiesPanelProps = {
   historyEntries?: HistoryEntry[]
   propertyFields: PropertyField[]
   onFieldChange: (key: string, value: string) => void
+  canTransformSelected: boolean
+  transformGuardReason?: string | null
 }
 
 // Right-hand side inspector for coordinates and editable IFC properties
@@ -33,7 +35,9 @@ export const PropertiesPanel = ({
   elementName,
   historyEntries = [],
   propertyFields,
-  onFieldChange
+  onFieldChange,
+  canTransformSelected,
+  transformGuardReason
 }: PropertiesPanelProps) => {
   const [draftOffsets, setDraftOffsets] = useState<Record<keyof OffsetVector, string>>({
     dx: '0',
@@ -109,6 +113,7 @@ export const PropertiesPanel = ({
                       type="text"
                       inputMode="decimal"
                       value={draftOffsets[axis]}
+                      disabled={!canTransformSelected}
                       onChange={(event) => {
                         const rawValue = event.target.value
                         setDraftOffsets((prev) => ({
@@ -131,7 +136,12 @@ export const PropertiesPanel = ({
                   </label>
                 ))}
               </div>
-              <button type="button" className="offset-panel__apply" onClick={onApplyOffset}>
+              <button
+                type="button"
+                className="offset-panel__apply"
+                onClick={onApplyOffset}
+                disabled={!canTransformSelected}
+              >
                 Apply coordinates
               </button>
               {onDeleteSelected && (
@@ -146,6 +156,9 @@ export const PropertiesPanel = ({
               <p className="properties-panel__hint">
                 Coordinates show the bottom center of the element bounding box.
               </p>
+              {selectedElement && !canTransformSelected && transformGuardReason && (
+                <p className="properties-panel__hint">{transformGuardReason}</p>
+              )}
             </div>
             <form className="properties-form">
               {propertyFields.length > 0 ? (

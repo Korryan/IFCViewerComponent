@@ -1,79 +1,113 @@
+import { useEffect, useRef } from 'react'
+import type { InsertPrefabOption } from '../ifcViewerTypes'
+
 type InsertMenuProps = {
   open: boolean
   anchor: { x: number; y: number } | null
-  onInsertCube: () => void
+  prefabs?: InsertPrefabOption[]
+  onInsertPrefab: (prefabId: string) => void
   onUploadClick: () => void
   onCancel: () => void
   alignX?: 'left' | 'center'
 }
 
-// Small contextual menu for inserting cubes or uploading IFC near the cursor
-const menuStyleBase: React.CSSProperties = {
-  position: 'absolute',
-  padding: '8px 10px',
-  background: 'rgba(17, 24, 39, 0.92)',
-  color: '#fff',
-  borderRadius: 8,
-  display: 'grid',
-  gap: 6,
-  minWidth: 180,
-  zIndex: 2
-}
-
-const primaryBtn: React.CSSProperties = {
-  padding: '6px 10px',
-  background: '#4f46e5',
-  color: '#fff',
-  border: 'none',
-  borderRadius: 6,
-  cursor: 'pointer'
-}
-
-const secondaryBtn: React.CSSProperties = {
-  padding: '6px 10px',
-  background: '#374151',
-  color: '#fff',
-  border: 'none',
-  borderRadius: 6,
-  cursor: 'pointer'
-}
-
-const cancelBtn: React.CSSProperties = {
-  padding: '4px 8px',
-  background: 'transparent',
-  color: '#cbd5e1',
-  border: '1px solid #4b5563',
-  borderRadius: 6,
-  cursor: 'pointer'
-}
-
 export const InsertMenu = ({
   open,
   anchor,
-  onInsertCube,
+  prefabs = [],
+  onInsertPrefab,
   onUploadClick,
   onCancel,
   alignX = 'left'
 }: InsertMenuProps) => {
+  const menuRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      const menu = menuRef.current
+      const target = event.target as Node | null
+      if (!menu || !target || menu.contains(target)) return
+      event.preventDefault()
+      event.stopPropagation()
+      onCancel()
+    }
+
+    const handleOutsideClick = (event: MouseEvent) => {
+      const menu = menuRef.current
+      const target = event.target as Node | null
+      if (!menu || !target || menu.contains(target)) return
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    document.addEventListener('pointerdown', handleOutsidePointerDown, true)
+    document.addEventListener('click', handleOutsideClick, true)
+
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsidePointerDown, true)
+      document.removeEventListener('click', handleOutsideClick, true)
+    }
+  }, [onCancel, open])
+
   if (!open) return null
+
   return (
     <div
-      style={{
-        ...menuStyleBase,
-        top: anchor ? anchor.y : 50,
-        left: anchor ? anchor.x : 8,
-        transform: alignX === 'center' ? 'translateX(-50%)' : 'none'
-      }}
+      className="insert-menu-layer"
+      onClick={onCancel}
+      onPointerDown={onCancel}
     >
-      <button type="button" style={primaryBtn} onClick={onInsertCube}>
-        Insert 1×1×1 cube
-      </button>
-      <button type="button" style={secondaryBtn} onClick={onUploadClick}>
-        Upload IFC model
-      </button>
-      <button type="button" style={cancelBtn} onClick={onCancel}>
-        Cancel
-      </button>
+      <div
+        ref={menuRef}
+        className="insert-menu"
+        style={{
+          top: anchor ? anchor.y : 50,
+          left: anchor ? anchor.x : 8,
+          transform: alignX === 'center' ? 'translateX(-50%)' : 'none'
+        }}
+        onClick={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="insert-menu__header">
+          <div>
+            <h3>Add object</h3>
+            <p>Choose a saved prefab or upload a one-off IFC model.</p>
+          </div>
+          <button type="button" className="insert-menu__close" onClick={onCancel}>
+            Close
+          </button>
+        </div>
+
+        <div className="insert-menu__content">
+          {prefabs.length > 0 ? (
+            <div className="insert-menu__list">
+              {prefabs.map((prefab) => (
+                <button
+                  key={prefab.prefabId}
+                  type="button"
+                  className="insert-menu__item"
+                  onClick={() => onInsertPrefab(prefab.prefabId)}
+                  title={`${prefab.fileName} (${prefab.prefabId})`}
+                >
+                  <span className="insert-menu__item-name">{prefab.fileName}</span>
+                  <span className="insert-menu__item-meta">
+                    {prefab.prefabId}
+                    {prefab.updatedAt ? ` | ${prefab.updatedAt}` : ''}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="insert-menu__empty">No prefabs uploaded yet.</p>
+          )}
+
+          <button type="button" className="insert-menu__upload" onClick={onUploadClick}>
+            Upload IFC model
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

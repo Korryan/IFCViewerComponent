@@ -4,8 +4,10 @@ import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
 import type {
   FurnitureItem,
   HistoryEntry,
+  InsertPrefabOption,
   MetadataEntry,
   ObjectTree,
+  Point3D,
   SelectedElement
 } from './ifcViewerTypes'
 import { useSelectionOffsets, CUSTOM_CUBE_MODEL_ID } from './hooks/useSelectionOffsets'
@@ -26,9 +28,11 @@ import {
   useObjectTree
 } from './hooks/useObjectTree'
 import {
+  buildStoreyInfoMap,
   buildRoomNumberMap,
   collectContainmentCandidateIds,
-  resolveSpaceFromRelationId
+  resolveSpaceFromRelationId,
+  type StoreyInfo
 } from './ifcRoomTree.utils'
 import {
   CONTAINMENT_RELATION_BATCH_SIZE,
@@ -74,10 +78,12 @@ type IfcViewerProps = {
   metadata?: MetadataEntry[]
   furniture?: FurnitureItem[]
   history?: HistoryEntry[]
+  prefabs?: InsertPrefabOption[]
   onMetadataChange?: (entries: MetadataEntry[]) => void
   onFurnitureChange?: (items: FurnitureItem[]) => void
   onHistoryChange?: (items: HistoryEntry[]) => void
   onSelectionChange?: (selection: SelectedElement | null) => void
+  onResolvePrefabFile?: (prefabId: string) => Promise<File | null>
 }
 
 type Loader = (viewer: IfcViewerAPI) => Promise<any>
@@ -144,6 +150,7 @@ type RoomListEntry = {
   roomNumber?: string | null
   storeyId?: string | null
   storeyLabel?: string | null
+  storeyElevation?: number | null
 }
 
 const disposeMeshResources = (mesh: IfcMeshLike | null | undefined) => {
@@ -339,10 +346,12 @@ const IfcViewer = ({
   metadata,
   furniture,
   history,
+  prefabs = [],
   onMetadataChange,
   onFurnitureChange,
   onHistoryChange,
-  onSelectionChange
+  onSelectionChange,
+  onResolvePrefabFile
 }: IfcViewerProps) => {
   // Scene / viewer refs
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -356,12 +365,14 @@ const IfcViewer = ({
   const lastLoadSourceRef = useRef<LoadSource>({ kind: 'none' })
   const { tree, setIfcTree, resetTree, addCustomNode, removeNode } = useObjectTree()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [roomOnlyTransformGuard, setRoomOnlyTransformGuard] = useState(true)
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
   const [isHydrated, setIsHydrated] = useState(false)
   const furnitureRestoredRef = useRef(false)
   const offsetsRestoredRef = useRef<number | null>(null)
   const [activeModelId, setActiveModelId] = useState<number | null>(null)
+  const [storeyInfoByNodeId, setStoreyInfoByNodeId] = useState<Record<string, StoreyInfo>>({})
   const roomNumbersRef = useRef<Map<number, string>>(new Map())
   const activeModelInverseCoordinationMatrixRef = useRef<number[] | null>(null)
   const suppressMetadataNotifyRef = useRef(false)
@@ -394,6 +405,7 @@ const IfcViewer = ({
     setCustomCubeRoomNumber,
     setCustomObjectSpaceIfcId,
     setCustomObjectItemId,
+    findCustomObjectExpressIdByItemId,
     getCustomObjectState,
     ensureCustomCubesPickable,
     pickCandidatesAt,
@@ -402,6 +414,7 @@ const IfcViewer = ({
     spawnCube,
     removeCustomCube,
     spawnUploadedModel,
+    spawnStoredCustomObject,
     applyIfcElementOffset,
     applyIfcElementRotation,
     applyVisibilityFilter
@@ -428,6 +441,7 @@ const IfcViewer = ({
         spaceIfcId !== null
       ) {
         const spacePosition =
+          getElementWorldPosition(activeModelId, spaceIfcId) ??
           getIfcElementPlacementPosition(activeModelId, spaceIfcId) ??
           (await ensureIfcPlacementPosition(activeModelId, spaceIfcId))
         if (spacePosition) {
@@ -441,7 +455,7 @@ const IfcViewer = ({
 
       return Object.keys(custom).length > 0 ? custom : undefined
     },
-    [activeModelId, ensureIfcPlacementPosition, getIfcElementPlacementPosition]
+    [activeModelId, ensureIfcPlacementPosition, getElementWorldPosition, getIfcElementPlacementPosition]
   )
 
   const {
@@ -537,19 +551,41 @@ const IfcViewer = ({
     }
     tree.roots.forEach(visitNode)
 
-    const fallbackStoreyLabel = (index: number) => (index === 0 ? 'Prizemi' : `${index}. patro`)
-    const storeyLabelById = new Map<string, string>()
+    const treeIndexByStoreyId = new Map<string, number>()
     storeyOrder.forEach((storeyId, index) => {
-      const storey = tree.nodes[storeyId]
-      if (!storey) return
-      const rawName = storey.name?.trim()
-      const shouldUseName =
-        Boolean(rawName) &&
-        rawName!.localeCompare(storey.label, undefined, { sensitivity: 'base' }) !== 0
-      storeyLabelById.set(storeyId, shouldUseName ? rawName! : fallbackStoreyLabel(index))
+      treeIndexByStoreyId.set(storeyId, index)
     })
 
-    const resolveStorey = (nodeId: string): { id: string | null; label: string | null } => {
+    const storeyEntries = storeyOrder
+      .map((storeyId) => {
+        const info = storeyInfoByNodeId[storeyId]
+        return {
+          id: storeyId,
+          treeIndex: treeIndexByStoreyId.get(storeyId) ?? Number.MAX_SAFE_INTEGER,
+          elevation: typeof info?.elevation === 'number' ? info.elevation : null
+        }
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+
+    const sortedStoreyEntries = [...storeyEntries].sort((left, right) => {
+      const leftHasElevation = typeof left.elevation === 'number'
+      const rightHasElevation = typeof right.elevation === 'number'
+      if (leftHasElevation && rightHasElevation && left.elevation !== right.elevation) {
+        return (left.elevation ?? 0) - (right.elevation ?? 0)
+      }
+      if (leftHasElevation !== rightHasElevation) {
+        return leftHasElevation ? -1 : 1
+      }
+      return left.treeIndex - right.treeIndex
+    })
+    const storeyLabelById = new Map<string, string>()
+    const storeyElevationById = new Map<string, number | null>()
+    sortedStoreyEntries.forEach((entry, index) => {
+      storeyElevationById.set(entry.id, entry.elevation)
+      storeyLabelById.set(entry.id, `Podlaží ${index + 1}`)
+    })
+
+    const resolveStorey = (nodeId: string): { id: string | null; label: string | null; elevation: number | null } => {
       let currentId: string | null = nodeId
       while (currentId) {
         const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
@@ -557,12 +593,13 @@ const IfcViewer = ({
         if (node.nodeType === 'ifc' && node.type.toUpperCase() === 'IFCBUILDINGSTOREY') {
           return {
             id: node.id,
-            label: storeyLabelById.get(node.id) ?? node.name?.trim() ?? node.label
+            label: storeyLabelById.get(node.id) ?? node.name?.trim() ?? node.label,
+            elevation: storeyElevationById.get(node.id) ?? null
           }
         }
         currentId = node.parentId
       }
-      return { id: null, label: 'Nezarazene' }
+      return { id: null, label: 'Nezarazene', elevation: null }
     }
 
     return Object.values(tree.nodes)
@@ -578,17 +615,29 @@ const IfcViewer = ({
           ifcId: node.expressID!,
           roomNumber,
           storeyId: storey.id,
-          storeyLabel: storey.label
+          storeyLabel: storey.label,
+          storeyElevation: storey.elevation
         }
       })
       .sort((left, right) => {
+        const leftElevation = left.storeyElevation
+        const rightElevation = right.storeyElevation
+        const leftHasElevation = typeof leftElevation === 'number'
+        const rightHasElevation = typeof rightElevation === 'number'
+        if (leftHasElevation && rightHasElevation && leftElevation !== rightElevation) {
+          return leftElevation - rightElevation
+        }
+        if (leftHasElevation !== rightHasElevation) {
+          return leftHasElevation ? -1 : 1
+        }
+
         const leftStoreyIndex =
           left.storeyId !== null && left.storeyId !== undefined
-            ? storeyOrder.indexOf(left.storeyId)
+            ? treeIndexByStoreyId.get(left.storeyId) ?? Number.MAX_SAFE_INTEGER
             : Number.MAX_SAFE_INTEGER
         const rightStoreyIndex =
           right.storeyId !== null && right.storeyId !== undefined
-            ? storeyOrder.indexOf(right.storeyId)
+            ? treeIndexByStoreyId.get(right.storeyId) ?? Number.MAX_SAFE_INTEGER
             : Number.MAX_SAFE_INTEGER
         if (leftStoreyIndex !== rightStoreyIndex) {
           return leftStoreyIndex - rightStoreyIndex
@@ -597,7 +646,7 @@ const IfcViewer = ({
         const rightKey = right.roomNumber?.trim() || right.label
         return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: 'base' })
       })
-  }, [tree.nodes, tree.roots])
+  }, [storeyInfoByNodeId, tree.nodes, tree.roots])
   const treeNodeBySelectionKey = useMemo(() => {
     const byKey = new Map<string, string>()
     Object.values(tree.nodes).forEach((node) => {
@@ -615,6 +664,37 @@ const IfcViewer = ({
     },
     [treeNodeBySelectionKey]
   )
+  const isNodeEditableWithinRoom = useCallback(
+    (nodeId: string | null | undefined): boolean => {
+      if (!nodeId) return false
+      let currentId: string | null | undefined = nodeId
+      let isRoot = true
+      while (currentId) {
+        const node: (typeof tree.nodes)[string] | undefined = tree.nodes[currentId]
+        if (!node) break
+        if (node.nodeType === 'ifc' && node.type.trim().toUpperCase() === 'IFCSPACE') {
+          return !isRoot
+        }
+        isRoot = false
+        currentId = node.parentId
+      }
+      return false
+    },
+    [tree.nodes]
+  )
+  const selectedTransformNodeId = useMemo(() => {
+    if (!selectedElement) return null
+    return resolveTreeNodeIdForSelection(selectedElement.modelID, selectedElement.expressID)
+  }, [resolveTreeNodeIdForSelection, selectedElement])
+  const canTransformSelected = useMemo(() => {
+    if (!selectedElement) return false
+    if (!roomOnlyTransformGuard) return true
+    return isNodeEditableWithinRoom(selectedTransformNodeId)
+  }, [isNodeEditableWithinRoom, roomOnlyTransformGuard, selectedElement, selectedTransformNodeId])
+  const transformGuardReason = useMemo(() => {
+    if (!roomOnlyTransformGuard || !selectedElement || canTransformSelected) return null
+    return 'Movement and rotation are locked for elements outside rooms.'
+  }, [canTransformSelected, roomOnlyTransformGuard, selectedElement])
   const showSidePanel = showTree || showProperties
 
   const loadIfcWithCustomSettings = useCallback(
@@ -942,6 +1022,7 @@ const IfcViewer = ({
     selectedElement,
     offsetInputs,
     showShortcuts,
+    canTransformSelected,
     getSelectedWorldPosition,
     getIfcElementRotationDelta,
     moveSelectedTo,
@@ -958,10 +1039,11 @@ const IfcViewer = ({
   const {
     treeUploadInputRef,
     findSpaceNodeIdByRoomNumber,
+    findSpaceNodeIdByIfcId,
     resolveNodeInsertTarget,
-    spawnUnitCube,
     spawnUploadedModelAt,
-    handleTreeAddCube,
+    spawnPrefabAt,
+    handleTreeInsertPrefab,
     handleTreeUploadModel,
     handleTreeUploadInputChange
   } = useInsertActions({
@@ -975,6 +1057,7 @@ const IfcViewer = ({
     registerCubeFurniture,
     registerUploadedFurniture,
     selectById,
+    getElementWorldPosition,
     getIfcElementPlacementPosition,
     ensureIfcPlacementPosition,
     selectCustomCube,
@@ -1054,6 +1137,7 @@ const IfcViewer = ({
   )
 
   const applyOffsetAndPersist = useCallback(() => {
+    if (!canTransformSelected) return
     applyOffsetToSelectedElement()
     syncSelectedCubePosition()
     syncSelectedIfcPosition()
@@ -1062,6 +1146,7 @@ const IfcViewer = ({
     }
   }, [
     applyOffsetToSelectedElement,
+    canTransformSelected,
     pushHistoryEntry,
     selectedElement,
     syncSelectedCubePosition,
@@ -1183,34 +1268,53 @@ const IfcViewer = ({
   }, [handleFieldChange, metadataMap, propertyFields, selectedElement])
 
   useEffect(() => {
-    if (!isHydrated || furnitureRestoredRef.current) return
+    if (!isHydrated || furnitureRestoredRef.current || activeModelId === null || tree.roots.length === 0) return
     const viewer = ensureViewer()
     if (!viewer) return
     furnitureEntries.forEach((item) => {
-      if (item.model !== 'cube') return
-      const cubeId = parseCubeId(item.id)
-      if (!cubeId) return
-      const info = spawnCube(item.position, { id: cubeId, focus: false })
+      let info: { expressID: number; position: Point3D } | null = null
+      if (item.model === 'cube') {
+        const cubeId = parseCubeId(item.id)
+        if (!cubeId) return
+        info = spawnCube(item.position, { id: cubeId, focus: false })
+      } else if (item.geometry) {
+        info = spawnStoredCustomObject({
+          itemId: item.id,
+          model: item.model,
+          name: item.name,
+          position: item.position,
+          rotation: item.rotation,
+          geometry: item.geometry,
+          roomNumber: item.roomNumber,
+          spaceIfcId: item.spaceIfcId,
+          sourceFileName: item.custom?.sourceFileName ?? null,
+          focus: false
+        })
+      }
       if (!info) return
       setCustomCubeRoomNumber(info.expressID, item.roomNumber)
       setCustomObjectSpaceIfcId(info.expressID, item.spaceIfcId)
-      const parentId = findSpaceNodeIdByRoomNumber(item.roomNumber)
+      const parentId = findSpaceNodeIdByIfcId(item.spaceIfcId) ?? findSpaceNodeIdByRoomNumber(item.roomNumber)
       addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
         expressID: info.expressID,
-        label: `Cube #${info.expressID}`,
-        type: 'CUBE',
+        label: item.model === 'cube' ? `Cube #${info.expressID}` : item.name ?? item.id,
+        type: item.model === 'cube' ? 'CUBE' : 'FURNITURE',
         parentId
       })
     })
     furnitureRestoredRef.current = true
   }, [
     addCustomNode,
+    activeModelId,
     ensureViewer,
+    findSpaceNodeIdByIfcId,
     findSpaceNodeIdByRoomNumber,
     furnitureEntries,
     isHydrated,
     setCustomCubeRoomNumber,
+    spawnStoredCustomObject,
+    tree.roots.length,
     spawnCube
   ])
 
@@ -1228,19 +1332,34 @@ const IfcViewer = ({
       }
     })
     furnitureEntries.forEach((item) => {
-      if (item.model !== 'cube') return
-      const cubeId = parseCubeId(item.id)
-      if (!cubeId || existing.has(cubeId)) return
-      const parentId = findSpaceNodeIdByRoomNumber(item.roomNumber)
+      let expressID: number | null = null
+      if (item.model === 'cube') {
+        const cubeId = parseCubeId(item.id)
+        if (!cubeId) return
+        expressID = cubeId
+      } else {
+        expressID = findCustomObjectExpressIdByItemId(item.id)
+      }
+      if (!expressID || existing.has(expressID)) return
+      const parentId = findSpaceNodeIdByIfcId(item.spaceIfcId) ?? findSpaceNodeIdByRoomNumber(item.roomNumber)
       addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
-        expressID: cubeId,
-        label: `Cube #${cubeId}`,
-        type: 'CUBE',
+        expressID,
+        label: item.model === 'cube' ? `Cube #${expressID}` : item.name ?? item.id,
+        type: item.model === 'cube' ? 'CUBE' : 'FURNITURE',
         parentId
       })
     })
-  }, [addCustomNode, findSpaceNodeIdByRoomNumber, furnitureEntries, isHydrated, tree.nodes, tree.roots])
+  }, [
+    addCustomNode,
+    findCustomObjectExpressIdByItemId,
+    findSpaceNodeIdByIfcId,
+    findSpaceNodeIdByRoomNumber,
+    furnitureEntries,
+    isHydrated,
+    tree.nodes,
+    tree.roots
+  ])
 
   useEffect(() => {
     if (!isHydrated || activeModelId === null) return
@@ -1472,12 +1591,21 @@ const IfcViewer = ({
           const rawTree = buildIfcTree(spatial, modelID)
           if (loadTokenRef.current !== loadToken) return
           roomNumbersRef.current = new Map()
+          setStoreyInfoByNodeId({})
           setIfcTree(rawTree, modelID)
           setSelectedNodeId(rawTree.roots[0] ?? null)
 
           // Enrich labels/relations in background so loading is never blocked by heavy IFC relation traversal.
           void (async () => {
             let nextTree = rawTree
+
+            try {
+              const storeyInfo = await buildStoreyInfoMap(viewer, rawTree, modelID)
+              if (loadTokenRef.current !== loadToken) return
+              setStoreyInfoByNodeId(Object.fromEntries(storeyInfo))
+            } catch (err) {
+              console.warn('Failed to read storey elevation info', err)
+            }
 
             try {
               const hydratedTree = await hydrateUnknownIfcNodeTypes(viewer, nextTree, modelID, loadToken)
@@ -1521,12 +1649,14 @@ const IfcViewer = ({
           console.error('Failed to build IFC tree', err)
           resetTree()
           setSelectedNodeId(null)
+          setStoreyInfoByNodeId({})
         }
       } catch (err) {
         if (loadTokenRef.current !== loadToken) return
         console.error('Failed to build IFC tree', err)
         resetTree()
         setSelectedNodeId(null)
+        setStoreyInfoByNodeId({})
       }
     },
     [buildSpatialContainmentMap, hydrateUnknownIfcNodeTypes, resetTree, setIfcTree]
@@ -1642,10 +1772,7 @@ const IfcViewer = ({
     ]
   )
   useEffect(() => {
-    if (!selectedElement) {
-      setSelectedNodeId(null)
-      return
-    }
+    if (!selectedElement) return
 
     const matchId = resolveTreeNodeIdForSelection(selectedElement.modelID, selectedElement.expressID)
     setSelectedNodeId(matchId)
@@ -1661,8 +1788,10 @@ const IfcViewer = ({
       resetTree()
       setSelectedNodeId(null)
       setActiveModelId(null)
+      setStoreyInfoByNodeId({})
       roomNumbersRef.current = new Map()
       offsetsRestoredRef.current = null
+      furnitureRestoredRef.current = false
 
       // Hard reset viewer instance so the next load always starts from an empty scene.
       const previousViewer = viewerRef.current
@@ -1749,7 +1878,9 @@ const IfcViewer = ({
       setSelectedNodeId(null)
       setActiveModelId(null)
       offsetsRestoredRef.current = null
+      furnitureRestoredRef.current = false
       roomNumbersRef.current = new Map()
+      setStoreyInfoByNodeId({})
     }
   }, [clearOffsetArtifacts, ensureViewer, resetTree, stopWalkMovementLoop])
 
@@ -1787,6 +1918,39 @@ const IfcViewer = ({
     setStatus(null)
   }, [defaultModelUrl, file, loadIfcWithCustomSettings])
 
+  const handleInsertPrefab = useCallback(
+    async (prefabId: string, nodeId?: string | null) => {
+      if (!onResolvePrefabFile) {
+        setError('Prefab loading is not configured.')
+        return
+      }
+
+      const prefab = prefabs.find((item) => item.prefabId === prefabId)
+      try {
+        setError(null)
+        setStatus(prefab ? `Loading prefab ${prefab.fileName}...` : 'Loading prefab...')
+        const prefabFile = await onResolvePrefabFile(prefabId)
+        if (!prefabFile) {
+          setStatus(null)
+          setError('Failed to load prefab IFC file.')
+          return
+        }
+
+        if (nodeId) {
+          await handleTreeInsertPrefab(nodeId, prefabFile)
+        } else {
+          await spawnPrefabAt(prefabFile)
+        }
+        setStatus(null)
+      } catch (err) {
+        console.error('Failed to insert prefab', err)
+        setStatus(null)
+        setError('Failed to insert prefab IFC file.')
+      }
+    },
+    [handleTreeInsertPrefab, onResolvePrefabFile, prefabs, spawnPrefabAt]
+  )
+
   return (
     <>
       <div className="viewer-wrapper">
@@ -1797,32 +1961,44 @@ const IfcViewer = ({
             <InsertMenu
               open={isInsertMenuOpen}
               anchor={insertMenuAnchor}
-              onInsertCube={() => {
-                spawnUnitCube()
+              prefabs={prefabs}
+              onInsertPrefab={(prefabId) => {
+                void handleInsertPrefab(prefabId)
                 closeInsertMenu()
               }}
               onUploadClick={() => uploadInputRef.current?.click()}
               onCancel={closeInsertMenu}
             />
-            <SelectionMenu
-              open={isPickMenuOpen}
-              anchor={pickMenuAnchor}
-              candidates={pickMenuItems}
-              onSelect={handlePickMenuSelect}
-              onCancel={closePickMenu}
-            />
-            <button
-              type="button"
-              className={`navigation-toggle${showShortcuts ? ' navigation-toggle--with-shortcuts' : ''}${isWalkMode ? ' navigation-toggle--walk' : ''}`}
-              onClick={toggleNavigationMode}
-              title={isWalkMode ? 'Switch to free look mode' : 'Switch to walk mode'}
-            >
-              {isWalkMode ? 'Walk' : 'Free'}
-            </button>
-            {status && <div className="viewer-overlay">{status}</div>}
-            {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
-            {showShortcuts && (
-              <>
+              <SelectionMenu
+                open={isPickMenuOpen}
+                anchor={pickMenuAnchor}
+                candidates={pickMenuItems}
+                onSelect={handlePickMenuSelect}
+                onCancel={closePickMenu}
+              />
+              <div className={`viewer-mode-controls${showShortcuts ? ' viewer-mode-controls--with-shortcuts' : ''}`}>
+                <button
+                  type="button"
+                  className={`navigation-toggle${isWalkMode ? ' navigation-toggle--walk' : ''}`}
+                  onClick={toggleNavigationMode}
+                  title={isWalkMode ? 'Switch to free look mode' : 'Switch to walk mode'}
+                >
+                  {isWalkMode ? 'Walk mode' : 'Free mode'}
+                </button>
+                <button
+                  type="button"
+                  className={`navigation-toggle navigation-toggle--room-guard${roomOnlyTransformGuard ? ' navigation-toggle--room-guard-active' : ''}`}
+                  onClick={() => setRoomOnlyTransformGuard((prev) => !prev)}
+                  aria-pressed={roomOnlyTransformGuard}
+                  title="Lock movement and rotation for elements outside rooms"
+                >
+                  Room-only edit {roomOnlyTransformGuard ? 'On' : 'Off'}
+                </button>
+              </div>
+              {status && <div className="viewer-overlay">{status}</div>}
+              {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
+              {showShortcuts && (
+                <>
                 <button
                   type="button"
                   className="shortcuts-toggle"
@@ -1849,7 +2025,10 @@ const IfcViewer = ({
                   onSelectNode={handleTreeSelect}
                   rooms={roomOptions}
                   onSelectRoom={handleRoomSelect}
-                  onAddCube={handleTreeAddCube}
+                  prefabs={prefabs}
+                  onInsertPrefab={(nodeId, prefabId) => {
+                    void handleInsertPrefab(prefabId, nodeId)
+                  }}
                   onUploadModel={handleTreeUploadModel}
                 />
               )}
@@ -1857,12 +2036,14 @@ const IfcViewer = ({
                 <PropertiesPanel
                   selectedElement={selectedElement}
                   isFetchingProperties={isFetchingProperties}
-                  propertyError={propertyError}
-                  offsetInputs={offsetInputs}
-                  onOffsetChange={handleOffsetInputChange}
-                  onApplyOffset={applyOffsetAndPersist}
-                  shortcutsHint={showShortcuts ? 'Shortcuts: press ? or H' : undefined}
-                  onShowShortcuts={showShortcuts ? () => setIsShortcutsOpen(true) : undefined}
+                    propertyError={propertyError}
+                    offsetInputs={offsetInputs}
+                    onOffsetChange={handleOffsetInputChange}
+                    onApplyOffset={applyOffsetAndPersist}
+                    canTransformSelected={canTransformSelected}
+                    transformGuardReason={transformGuardReason}
+                    shortcutsHint={showShortcuts ? 'Shortcuts: press ? or H' : undefined}
+                    onShowShortcuts={showShortcuts ? () => setIsShortcutsOpen(true) : undefined}
                   onDeleteSelected={selectedElement ? handleDeleteSelected : undefined}
                   deleteLabel={
                     selectedElement?.modelID === CUSTOM_CUBE_MODEL_ID

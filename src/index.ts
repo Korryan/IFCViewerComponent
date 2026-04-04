@@ -3,6 +3,7 @@ export type {
   FurnitureGeometry,
   FurnitureItem,
   HistoryEntry,
+  InsertPrefabOption,
   MetadataEntry,
   ObjectTree,
   ObjectTreeNode,

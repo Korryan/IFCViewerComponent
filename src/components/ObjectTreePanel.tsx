@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ObjectTree } from '../ifcViewerTypes'
+import type { InsertPrefabOption } from '../ifcViewerTypes'
 import { InsertMenu } from './InsertMenu'
 import { localizeIfcType } from '../utils/ifcTypeLocalization'
 
@@ -15,7 +16,8 @@ type ObjectTreePanelProps = {
     storeyLabel?: string | null
   }[]
   onSelectRoom?: (nodeId: string) => void
-  onAddCube: (nodeId: string) => void
+  prefabs?: InsertPrefabOption[]
+  onInsertPrefab: (nodeId: string, prefabId: string) => void
   onUploadModel: (nodeId: string) => void
 }
 
@@ -133,7 +135,8 @@ export const ObjectTreePanel = ({
   onSelectNode,
   rooms = [],
   onSelectRoom,
-  onAddCube,
+  prefabs = [],
+  onInsertPrefab,
   onUploadModel
 }: ObjectTreePanelProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -301,29 +304,46 @@ export const ObjectTreePanel = ({
                 <div key={group.label} className="tree-panel__room-group">
                   <p className="tree-panel__room-group-title">{group.label}</p>
                   {group.rooms.map((room) => (
-                    <button
-                      type="button"
-                      key={room.nodeId}
-                      className={[
-                        'tree-panel__room',
-                        selectedNodeId === room.nodeId ? 'tree-panel__room--selected' : ''
-                      ]
-                        .filter(Boolean)
-                        .join(' ')}
-                      onClick={() => {
-                        ;(onSelectRoom ?? onSelectNode)(room.nodeId)
-                      }}
-                      data-room-node-id={room.nodeId}
-                      title={room.label}
-                    >
-                      <span className="tree-panel__room-label-group">
-                        <span className="tree-panel__room-label">{room.label}</span>
-                        <span className="tree-panel__room-number">#{room.ifcId}</span>
-                      </span>
-                      {room.roomNumber && (
-                        <span className="tree-panel__room-meta">c. {room.roomNumber}</span>
-                      )}
-                    </button>
+                    <div key={room.nodeId} className="tree-panel__room-row">
+                      <button
+                        type="button"
+                        className={[
+                          'tree-panel__room',
+                          selectedNodeId === room.nodeId ? 'tree-panel__room--selected' : ''
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                        onClick={() => {
+                          ;(onSelectRoom ?? onSelectNode)(room.nodeId)
+                        }}
+                        data-room-node-id={room.nodeId}
+                        title={room.label}
+                      >
+                        <span className="tree-panel__room-label-group">
+                          <span className="tree-panel__room-label">{room.label}</span>
+                          <span className="tree-panel__room-number">#{room.ifcId}</span>
+                        </span>
+                        {room.roomNumber && (
+                          <span className="tree-panel__room-meta">c. {room.roomNumber}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="tree-node__add"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          const button = event.currentTarget as HTMLButtonElement
+                          const row = button.closest('.tree-panel__room-row') as HTMLDivElement | null
+                          const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
+                          const anchorX = row ? rect.left + rect.width / 2 : rect.left
+                          handleOpenMenu(room.nodeId, { x: anchorX, y: rect.bottom })
+                        }}
+                        aria-label="Add child object"
+                        title="Add child object"
+                      >
+                        +
+                      </button>
+                    </div>
                   ))}
                 </div>
               ))}
@@ -354,9 +374,10 @@ export const ObjectTreePanel = ({
         open={Boolean(menuAnchor && menuNodeId)}
         anchor={menuAnchor}
         alignX="center"
-        onInsertCube={() => {
+        prefabs={prefabs}
+        onInsertPrefab={(prefabId) => {
           if (menuNodeId) {
-            onAddCube(menuNodeId)
+            onInsertPrefab(menuNodeId, prefabId)
           }
           handleCloseMenu()
         }}

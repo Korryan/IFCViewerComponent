@@ -490,6 +490,39 @@ const buildCenteredCustomObject = (
   return root
 }
 
+const buildCustomObjectFromStoredGeometry = (
+  storedGeometry: FurnitureGeometry,
+  expressID: number
+): Group | null => {
+  if (!Array.isArray(storedGeometry.positions) || storedGeometry.positions.length < 3) {
+    return null
+  }
+
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new Float32BufferAttribute(storedGeometry.positions, 3))
+  if (Array.isArray(storedGeometry.indices) && storedGeometry.indices.length >= 3) {
+    geometry.setIndex(storedGeometry.indices.map((value) => Math.trunc(Number(value))))
+  }
+  geometry.computeVertexNormals()
+  geometry.computeBoundingBox()
+  geometry.computeBoundingSphere()
+  tagCustomGeometryExpressId(geometry, expressID)
+
+  const material = new MeshStandardMaterial({
+    color: 0xb8b8b8,
+    metalness: 0.1,
+    roughness: 0.8
+  })
+
+  const mesh = new Mesh(geometry, material)
+  ;(mesh as any).modelID = CUSTOM_CUBE_MODEL_ID
+
+  const root = new Group()
+  root.add(mesh)
+  ;(root as any).modelID = CUSTOM_CUBE_MODEL_ID
+  return root
+}
+
 type SelectionTypeFilterOptions = {
   allowedIfcTypes?: string[]
 }
@@ -531,6 +564,7 @@ type UseSelectionOffsetsResult = {
   setCustomCubeRoomNumber: (expressID: number, roomNumber?: string | null) => void
   setCustomObjectSpaceIfcId: (expressID: number, spaceIfcId?: number | null) => void
   setCustomObjectItemId: (expressID: number, itemId?: string | null) => void
+  findCustomObjectExpressIdByItemId: (itemId: string | null | undefined) => number | null
   getCustomObjectState: (expressID: number) => CustomObjectState | null
   ensureCustomCubesPickable: () => void
   pickCandidatesAt: (
@@ -549,6 +583,18 @@ type UseSelectionOffsetsResult = {
     target?: Point3D | null,
     options?: { focus?: boolean }
   ) => Promise<SpawnedModelInfo | null>
+  spawnStoredCustomObject: (args: {
+    itemId: string
+    model: string
+    name?: string | null
+    position: Point3D
+    rotation?: Point3D | null
+    geometry: FurnitureGeometry
+    roomNumber?: string | null
+    spaceIfcId?: number | null
+    sourceFileName?: string | null
+    focus?: boolean
+  }) => { expressID: number; position: Point3D } | null
   applyVisibilityFilter: (modelID: number, visibleIds: number[] | null) => void
   configureSpaceBiasTargets: (modelID: number, expressIDs: number[]) => void
 }
@@ -1539,6 +1585,18 @@ export const useSelectionOffsets = (
         }
       })
       if (typeof modelID !== 'number') {
+        cubeRegistryRef.current.forEach((customObject) => {
+          scene.remove(customObject)
+          removePickable(viewer, customObject)
+        })
+        cubeRegistryRef.current.clear()
+        customCubeRoomsRef.current.clear()
+        customObjectSpaceIfcIdsRef.current.clear()
+        customObjectModelsRef.current.clear()
+        customObjectNamesRef.current.clear()
+        customObjectItemIdsRef.current.clear()
+        customObjectSourceFilesRef.current.clear()
+        highlightedCubeRef.current = null
         baseCentersRef.current.clear()
         placementOriginsRef.current.clear()
         coordinationMatrixRef.current.clear()
@@ -1915,6 +1973,16 @@ export const useSelectionOffsets = (
       return
     }
     customObjectItemIdsRef.current.set(expressID, itemId)
+  }, [])
+
+  const findCustomObjectExpressIdByItemId = useCallback((itemId: string | null | undefined): number | null => {
+    if (!itemId) return null
+    for (const [expressID, currentItemId] of customObjectItemIdsRef.current.entries()) {
+      if (currentItemId === itemId) {
+        return expressID
+      }
+    }
+    return null
   }, [])
 
   const getCustomObjectState = useCallback((expressID: number): CustomObjectState | null => {
@@ -2751,6 +2819,87 @@ export const useSelectionOffsets = (
     [focusOnPoint, rememberCustomObjectState, viewerRef]
   )
 
+  const spawnStoredCustomObject = useCallback(
+    ({
+      itemId,
+      model,
+      name,
+      position,
+      rotation,
+      geometry,
+      roomNumber,
+      spaceIfcId,
+      sourceFileName,
+      focus
+    }: {
+      itemId: string
+      model: string
+      name?: string | null
+      position: Point3D
+      rotation?: Point3D | null
+      geometry: FurnitureGeometry
+      roomNumber?: string | null
+      spaceIfcId?: number | null
+      sourceFileName?: string | null
+      focus?: boolean
+    }): { expressID: number; position: Point3D } | null => {
+      const viewer = viewerRef.current
+      if (!viewer) return null
+
+      const existingExpressId = findCustomObjectExpressIdByItemId(itemId)
+      const expressID = existingExpressId ?? cubeIdCounterRef.current++
+      const existing = cubeRegistryRef.current.get(expressID)
+      if (existing) {
+        existing.position.set(position.x, position.y, position.z)
+        existing.rotation.set(rotation?.x ?? 0, rotation?.y ?? 0, rotation?.z ?? 0)
+        existing.updateMatrixWorld(true)
+        setCustomCubeRoomNumber(expressID, roomNumber)
+        setCustomObjectSpaceIfcId(expressID, spaceIfcId)
+        setCustomObjectItemId(expressID, itemId)
+        rememberCustomObjectState(expressID, {
+          model,
+          name: name ?? itemId,
+          sourceFileName: sourceFileName ?? undefined
+        })
+        if (focus) {
+          focusOnPoint(position)
+        }
+        return { expressID, position }
+      }
+
+      const customObject = buildCustomObjectFromStoredGeometry(geometry, expressID)
+      if (!customObject) return null
+
+      customObject.position.set(position.x, position.y, position.z)
+      customObject.rotation.set(rotation?.x ?? 0, rotation?.y ?? 0, rotation?.z ?? 0)
+      customObject.updateMatrixWorld(true)
+      cubeRegistryRef.current.set(expressID, customObject as unknown as Mesh)
+      viewer.context.getScene().add(customObject)
+      viewer.context.items.pickableIfcModels.push(customObject as any)
+      rememberCustomObjectState(expressID, {
+        model,
+        name: name ?? itemId,
+        sourceFileName: sourceFileName ?? undefined
+      })
+      setCustomCubeRoomNumber(expressID, roomNumber)
+      setCustomObjectSpaceIfcId(expressID, spaceIfcId)
+      setCustomObjectItemId(expressID, itemId)
+      if (focus) {
+        focusOnPoint(position)
+      }
+      return { expressID, position }
+    },
+    [
+      findCustomObjectExpressIdByItemId,
+      focusOnPoint,
+      rememberCustomObjectState,
+      setCustomCubeRoomNumber,
+      setCustomObjectItemId,
+      setCustomObjectSpaceIfcId,
+      viewerRef
+    ]
+  )
+
   return {
     selectedElement,
     offsetInputs,
@@ -2778,6 +2927,7 @@ export const useSelectionOffsets = (
     setCustomCubeRoomNumber,
     setCustomObjectSpaceIfcId,
     setCustomObjectItemId,
+    findCustomObjectExpressIdByItemId,
     getCustomObjectState,
     ensureCustomCubesPickable,
     pickCandidatesAt,
@@ -2786,6 +2936,7 @@ export const useSelectionOffsets = (
     clearOffsetArtifacts,
     spawnCube,
     spawnUploadedModel,
+    spawnStoredCustomObject,
     applyIfcElementOffset,
     applyIfcElementRotation,
     rotateSelectedTo,

@@ -423,7 +423,56 @@ export const useObjectTree = () => {
         const parent = resolvedParentId ? next.nodes[resolvedParentId] : null
 
         if (next.nodes[nextId]) {
-          return next
+          const existing = next.nodes[nextId]
+          const nextParentId = resolvedParentId ?? existing.parentId
+          const parentUnchanged = existing.parentId === nextParentId
+          const labelUnchanged =
+            existing.label === payload.label &&
+            existing.name === payload.label &&
+            existing.type === (payload.type ?? existing.type)
+
+          if (parentUnchanged && labelUnchanged) {
+            return next
+          }
+
+          const nextNodes: ObjectTree['nodes'] = {
+            ...next.nodes,
+            [nextId]: {
+              ...existing,
+              label: payload.label,
+              name: payload.label,
+              type: payload.type ?? existing.type,
+              parentId: nextParentId
+            }
+          }
+
+          let nextRoots = next.roots
+
+          if (existing.parentId && nextNodes[existing.parentId]) {
+            nextNodes[existing.parentId] = {
+              ...nextNodes[existing.parentId],
+              children: nextNodes[existing.parentId].children.filter((childId) => childId !== nextId)
+            }
+          } else if (existing.parentId === null) {
+            nextRoots = nextRoots.filter((rootId) => rootId !== nextId)
+          }
+
+          if (nextParentId && nextNodes[nextParentId]) {
+            const nextParent = nextNodes[nextParentId]
+            if (!nextParent.children.includes(nextId)) {
+              nextNodes[nextParentId] = {
+                ...nextParent,
+                children: [...nextParent.children, nextId]
+              }
+            }
+          } else if (!nextRoots.includes(nextId)) {
+            nextRoots = [...nextRoots, nextId]
+          }
+
+          return {
+            nodes: nextNodes,
+            roots: nextRoots
+          }
         }
 
         const node: ObjectTreeNode = {

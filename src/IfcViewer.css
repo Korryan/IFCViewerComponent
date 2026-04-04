@@ -71,10 +71,20 @@
   background: #f1f5f9;
 }
 
-.navigation-toggle {
+.viewer-mode-controls {
   position: absolute;
   top: 1rem;
   right: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.viewer-mode-controls--with-shortcuts {
+  right: 3.8rem;
+}
+
+.navigation-toggle {
   min-width: 54px;
   height: 34px;
   border-radius: 999px;
@@ -85,14 +95,11 @@
   cursor: pointer;
   box-shadow: 0 8px 16px rgba(15, 23, 42, 0.12);
   padding: 0 0.75rem;
+  white-space: nowrap;
 }
 
 .navigation-toggle:hover {
   background: #f1f5f9;
-}
-
-.navigation-toggle--with-shortcuts {
-  right: 3.8rem;
 }
 
 .navigation-toggle--walk {
@@ -102,6 +109,16 @@
 }
 
 .navigation-toggle--walk:hover {
+  background: #1e293b;
+}
+
+.navigation-toggle--room-guard-active {
+  background: #0f172a;
+  border-color: #0f172a;
+  color: #ffffff;
+}
+
+.navigation-toggle--room-guard-active:hover {
   background: #1e293b;
 }
 
@@ -275,6 +292,124 @@
   color: #94a3b8;
 }
 
+.insert-menu-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+}
+
+.insert-menu {
+  position: absolute;
+  z-index: 8;
+  width: min(24rem, calc(100vw - 2rem));
+  border: 1px solid #cbd5e1;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.16);
+  padding: 0.7rem;
+}
+
+.insert-menu__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.insert-menu__header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #0f172a;
+}
+
+.insert-menu__header p {
+  margin: 0.2rem 0 0;
+  font-size: 0.78rem;
+  color: #64748b;
+}
+
+.insert-menu__close {
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #0f172a;
+  border-radius: 0.5rem;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.insert-menu__close:hover {
+  background: #e2e8f0;
+}
+
+.insert-menu__content {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.insert-menu__list {
+  display: grid;
+  gap: 0.35rem;
+  max-height: 14rem;
+  overflow: auto;
+}
+
+.insert-menu__item,
+.insert-menu__upload {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  text-align: left;
+  border-radius: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+}
+
+.insert-menu__item {
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.insert-menu__item:hover {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+
+.insert-menu__item-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #0f172a;
+  word-break: break-word;
+}
+
+.insert-menu__item-meta {
+  font-size: 0.75rem;
+  color: #64748b;
+  word-break: break-word;
+}
+
+.insert-menu__empty {
+  margin: 0;
+  padding: 0.2rem 0.15rem;
+  font-size: 0.82rem;
+  color: #64748b;
+}
+
+.insert-menu__upload {
+  border: 1px dashed #cbd5e1;
+  background: #ffffff;
+  color: #0f172a;
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.insert-menu__upload:hover {
+  background: #f8fafc;
+  border-color: #94a3b8;
+}
+
 .properties-panel {
   width: 100%;
   border-top: 1px solid #e2e8f0;
@@ -301,6 +436,30 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
+}
+
+.properties-panel__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin-bottom: 0.75rem;
+}
+
+.properties-panel__toggle {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #0f172a;
+  border-radius: 0.6rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.properties-panel__toggle--active {
+  border-color: #93c5fd;
+  background: #dbeafe;
+  color: #1e3a8a;
 }
 
 .properties-panel__status {
@@ -433,6 +592,11 @@
   outline: none;
 }
 
+.offset-panel__field input:disabled {
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
 .offset-panel__apply {
   align-self: flex-start;
   border: none;
@@ -446,6 +610,11 @@
 
 .offset-panel__apply:hover {
   background: #1e293b;
+}
+
+.offset-panel__apply:disabled {
+  background: #94a3b8;
+  cursor: not-allowed;
 }
 
 .history-panel {
@@ -576,6 +745,12 @@
   gap: 0.35rem;
 }
 
+.tree-panel__room-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
 .tree-panel__room-group-title {
   margin: 0;
   color: #1e3a8a;
@@ -597,6 +772,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
+  flex: 1;
 }
 
 .tree-panel__room:hover {

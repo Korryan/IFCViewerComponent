@@ -26,6 +26,7 @@ type UseViewerInteractionsArgs = {
   selectedElement: SelectedElement | null
   offsetInputs: OffsetVector
   showShortcuts?: boolean
+  canTransformSelected: boolean
   getSelectedWorldPosition: () => Vector3 | null
   getIfcElementRotationDelta: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
@@ -115,6 +116,7 @@ export const useViewerInteractions = ({
   selectedElement,
   offsetInputs,
   showShortcuts,
+  canTransformSelected,
   getSelectedWorldPosition,
   getIfcElementRotationDelta,
   moveSelectedTo,
@@ -138,11 +140,13 @@ export const useViewerInteractions = ({
   const dragPlaneRef = useRef<Plane | null>(null)
   const dragStartPointRef = useRef<Vector3 | null>(null)
   const dragStartOffsetRef = useRef<OffsetVector | null>(null)
+  const dragModeStartOffsetRef = useRef<OffsetVector | null>(null)
   const [isRotating, setIsRotating] = useState(false)
   const [rotateAxisLock, setRotateAxisLock] = useState<'x' | 'y' | 'z' | null>(null)
   const rotateStartPointerRef = useRef<{ x: number; y: number } | null>(null)
   const rotateStartValueRef = useRef<Point3D | null>(null)
   const rotateCurrentValueRef = useRef<Point3D | null>(null)
+  const suppressNextSelectionClickRef = useRef(false)
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false)
   const [isPickMenuOpen, setIsPickMenuOpen] = useState(false)
   const [pickMenuAnchor, setPickMenuAnchor] = useState<{ x: number; y: number } | null>(null)
@@ -575,6 +579,45 @@ export const useViewerInteractions = ({
     ]
   )
 
+  const finishDragMode = useCallback(
+    (options?: { commit?: boolean; revert?: boolean }) => {
+      const shouldCommit = options?.commit ?? false
+      const shouldRevert = options?.revert ?? false
+      const startOffset = dragModeStartOffsetRef.current
+
+      if (shouldRevert && startOffset) {
+        moveSelectedTo(startOffset)
+      } else if (shouldCommit && startOffset) {
+        const changed =
+          Math.abs(offsetInputs.dx - startOffset.dx) >= 1e-6 ||
+          Math.abs(offsetInputs.dy - startOffset.dy) >= 1e-6 ||
+          Math.abs(offsetInputs.dz - startOffset.dz) >= 1e-6
+        if (changed) {
+          syncSelectedCubePosition()
+          syncSelectedIfcPosition()
+          if (selectedElement && selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
+            pushHistoryEntry(selectedElement.expressID, 'Position updated')
+          }
+        }
+      }
+
+      setIsDragging(false)
+      setDragAxisLock(null)
+      dragPlaneRef.current = null
+      dragStartPointRef.current = null
+      dragStartOffsetRef.current = null
+      dragModeStartOffsetRef.current = null
+    },
+    [
+      moveSelectedTo,
+      offsetInputs,
+      pushHistoryEntry,
+      selectedElement,
+      syncSelectedCubePosition,
+      syncSelectedIfcPosition
+    ]
+  )
+
   const updateHoverCoords = useCallback(() => {
     const viewer = viewerRef.current
     if (!viewer) return
@@ -887,7 +930,14 @@ export const useViewerInteractions = ({
 
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return
+      if (isDragging) {
+        suppressNextSelectionClickRef.current = true
+        finishDragMode({ commit: true })
+        event.preventDefault()
+        return
+      }
       if (isRotating) {
+        suppressNextSelectionClickRef.current = true
         finishRotateMode({ commit: true })
         event.preventDefault()
       }
@@ -895,6 +945,11 @@ export const useViewerInteractions = ({
 
     const handleClick = (event: MouseEvent) => {
       if (event.button !== 0) return
+      if (suppressNextSelectionClickRef.current) {
+        suppressNextSelectionClickRef.current = false
+        event.preventDefault()
+        return
+      }
       handleSelectClick(event.clientX, event.clientY)
       event.preventDefault()
     }
@@ -908,7 +963,9 @@ export const useViewerInteractions = ({
   }, [
     closePickMenu,
     containerRef,
+    finishDragMode,
     finishRotateMode,
+    isDragging,
     isRotating,
     pickCandidatesAt,
     resetSelection,
@@ -1057,7 +1114,7 @@ export const useViewerInteractions = ({
         return
       }
       if (key === 'r') {
-        if (!selectedElement) return
+        if (!selectedElement || !canTransformSelected) return
         const container = containerRef.current
         if (container) {
           const rect = container.getBoundingClientRect()
@@ -1120,7 +1177,7 @@ export const useViewerInteractions = ({
         setIsInsertMenuOpen(true)
       }
       if (key === 'g') {
-        if (!selectedElement) return
+        if (!selectedElement || !canTransformSelected) return
         const viewer = viewerRef.current
         const currentPos = getSelectedWorldPosition()
         if (!viewer || !currentPos) return
@@ -1138,6 +1195,11 @@ export const useViewerInteractions = ({
         dragPlaneRef.current = plane
         dragStartPointRef.current = startPoint.clone()
         dragStartOffsetRef.current = {
+          dx: offsetInputs.dx,
+          dy: offsetInputs.dy,
+          dz: offsetInputs.dz
+        }
+        dragModeStartOffsetRef.current = {
           dx: offsetInputs.dx,
           dy: offsetInputs.dy,
           dz: offsetInputs.dz
@@ -1184,11 +1246,7 @@ export const useViewerInteractions = ({
       }
       if (event.key === 'Escape') {
         closeInsertMenu()
-        setIsDragging(false)
-        setDragAxisLock(null)
-        dragPlaneRef.current = null
-        dragStartPointRef.current = null
-        dragStartOffsetRef.current = null
+        finishDragMode({ revert: true })
         finishRotateMode({ revert: true })
         setIsShortcutsOpen(false)
         closePickMenu()
@@ -1204,41 +1262,28 @@ export const useViewerInteractions = ({
 
     const handleWindowBlur = () => {
       walkKeyStateRef.current = { ...emptyWalkKeyState }
+      if (isDragging) {
+        finishDragMode({ revert: true })
+      }
       if (isRotating) {
         finishRotateMode({ revert: true })
       }
     }
 
-    const handlePointerUp = () => {
-      const wasDragging = isDragging || dragStartOffsetRef.current !== null
-      if (wasDragging) {
-        syncSelectedCubePosition()
-        syncSelectedIfcPosition()
-        if (selectedElement && selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
-          pushHistoryEntry(selectedElement.expressID, 'Position updated')
-        }
-      }
-      setIsDragging(false)
-      setDragAxisLock(null)
-      dragPlaneRef.current = null
-      dragStartPointRef.current = null
-      dragStartOffsetRef.current = null
-    }
-
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('keyup', handleKeyUp)
     window.addEventListener('blur', handleWindowBlur)
-    window.addEventListener('pointerup', handlePointerUp)
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
       window.removeEventListener('blur', handleWindowBlur)
-      window.removeEventListener('pointerup', handlePointerUp)
     }
   }, [
+    canTransformSelected,
     closeInsertMenu,
     closePickMenu,
     containerRef,
+    finishDragMode,
     finishRotateMode,
     getIfcElementRotationDelta,
     getSelectedWorldPosition,
@@ -1247,14 +1292,21 @@ export const useViewerInteractions = ({
     isRotating,
     isWalkMode,
     offsetInputs,
-    pushHistoryEntry,
     selectedElement,
     showShortcuts,
-    syncSelectedCubePosition,
-    syncSelectedIfcPosition,
     toggleNavigationMode,
     viewerRef
   ])
+
+  useEffect(() => {
+    if (canTransformSelected) return
+    if (isRotating) {
+      finishRotateMode({ revert: true })
+    }
+    if (isDragging) {
+      finishDragMode({ revert: true })
+    }
+  }, [canTransformSelected, finishDragMode, finishRotateMode, isDragging, isRotating])
 
   return {
     navigationMode,
