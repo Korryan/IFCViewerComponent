@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build / TypeScript artifacts
+dist/
+dist-ssr/
+**/dist/
+**/dist-ssr/
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Logs and temp files
+*.log
+*.tmp
+*.cache
+*.tgz
+
+# IDE / editor files
+.idea/
+.vscode/
+**/.idea/
+**/.vscode/
+*.iml
+
+# OS noise
+.DS_Store
+Thumbs.db
