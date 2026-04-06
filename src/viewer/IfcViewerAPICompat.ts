@@ -1,22 +1,18 @@
 import CameraControls from 'camera-controls'
 import * as OBC from '@thatopen/components'
 import { Mesher } from '@thatopen/components-front'
-import type { FragmentsModel, ItemData, MaterialDefinition, MeshData, RawMaterial, RawSample } from '@thatopen/fragments'
+import type { FragmentsModel, ItemData } from '@thatopen/fragments'
 import fragmentsWorkerUrl from '@thatopen/fragments/worker?url'
 import * as THREE from 'three'
-import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import {
   AmbientLight,
   Box3,
   BufferGeometry,
   Color,
   DirectionalLight,
-  Float32BufferAttribute,
   HemisphereLight,
   Material,
-  MeshLambertMaterial,
   Mesh,
-  Matrix4,
   Object3D,
   OrthographicCamera,
   PerspectiveCamera,
@@ -26,7 +22,48 @@ import {
   Vector3,
   WebGLRenderer
 } from 'three'
-import type { Intersection } from 'three'
+import {
+  gatherPropertySets,
+  resolveCategoryFromData,
+  toLegacyItemData,
+  toLegacySpatial
+} from './IfcViewerAPICompat.legacy'
+import {
+  uniqueNumbers
+} from './IfcViewerAPICompat.materials'
+import {
+  castRayIfcCandidates as castRayIfcCandidatesInternal,
+  getExpressIdFromGeometry,
+  type PickResult
+} from './IfcViewerAPICompat.picking'
+import {
+  attachBaseMeshToModelRecord,
+  buildGeometryCache,
+  createViewerModelRecord,
+  registerLoadedModelRecord,
+  resolveGeometryMaterialsByLocalId as resolveGeometryMaterialsByLocalIdInternal,
+  resolveMaterialsByLocalId as resolveMaterialsByLocalIdInternal
+} from './IfcViewerAPICompat.models'
+import {
+  applyIfcLoaderSettings as applyIfcLoaderSettingsInternal,
+  getNameFromUrl as getNameFromUrlInternal,
+  isAbsoluteWasmPath as isAbsoluteWasmPathInternal,
+  makeModelKey as makeModelKeyInternal
+} from './IfcViewerAPICompat.loader'
+import {
+  buildMeshFromCache as buildMeshFromCacheInternal,
+  createSubsetRecord,
+  detachSubsetRecord,
+  removeIdsFromSubsetRecord
+} from './IfcViewerAPICompat.subsets'
+import {
+  addPickableObject,
+  attachIfcModelToScene,
+  computeSceneRadius,
+  removeModelFromSceneList,
+  removePickableObject,
+  updateCameraClipPlanesForScene
+} from './IfcViewerAPICompat.scene'
 
 let controlsInstalled = false
 
@@ -39,14 +76,6 @@ type IfcModelLike = Mesh & {
   modelID?: number
   __modelKey?: string
   removeFromParent?: () => void
-}
-
-type PickResult = {
-  id: number
-  modelID: number
-  point: Vector3
-  distance: number
-  object: Object3D
 }
 
 type GeometrySlice = {
@@ -72,341 +101,11 @@ type ModelRecord = {
 
 const DEFAULT_SUBSET_ID = '__default__'
 const FRAGMENTS_WORKER_PATH = fragmentsWorkerUrl
-const MAX_LEGACY_ITEM_DEPTH = 32
-const MATERIAL_LOOKUP_BATCH_SIZE = 1500
-const MATERIAL_GEOMETRY_BATCH_SIZE = 64
-const MAX_PROPERTYSET_SCAN_NODES = 6000
 
 const ensureCameraControlsInstalled = () => {
   if (controlsInstalled) return
   CameraControls.install({ THREE })
   controlsInstalled = true
-}
-
-const resolveSpatialType = (item: any): string => {
-  const candidates = [item?._category, item?.category, item?.ifcClass, item?.type]
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string') {
-      const value = candidate.trim()
-      if (value) return value.toUpperCase()
-    }
-    if (candidate && typeof candidate === 'object' && typeof (candidate as any).value === 'string') {
-      const value = (candidate as any).value.trim()
-      if (value) return value.toUpperCase()
-    }
-  }
-  return 'UNKNOWN'
-}
-
-const parseSpatialIdCandidate = (raw: unknown): number | undefined => {
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    return Math.trunc(raw)
-  }
-  if (typeof raw === 'string' && raw.trim().length > 0) {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed)) {
-      return Math.trunc(parsed)
-    }
-  }
-  if (raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)) {
-    return parseSpatialIdCandidate((raw as { value?: unknown }).value)
-  }
-  return undefined
-}
-
-const resolveSpatialIdCandidates = (item: any): number[] => {
-  const candidates = [
-    item?.expressID,
-    item?.expressId,
-    item?.id,
-    item?.localId
-  ]
-  const dedup = new Set<number>()
-  candidates.forEach((candidate) => {
-    const parsed = parseSpatialIdCandidate(candidate)
-    if (parsed !== undefined) {
-      dedup.add(parsed)
-    }
-  })
-  return Array.from(dedup)
-}
-
-const resolveSpatialSelectionId = (item: any, renderableIds?: Set<number>): number | undefined => {
-  const candidates = resolveSpatialIdCandidates(item)
-  if (candidates.length === 0) return undefined
-  if (renderableIds && renderableIds.size > 0) {
-    const matching = candidates.find((candidate) => renderableIds.has(candidate))
-    if (matching !== undefined) return matching
-  }
-  return candidates[0]
-}
-
-const resolveSpatialName = (item: any): string | undefined => {
-  const candidates = [item?.name, item?.Name]
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string') {
-      const value = candidate.trim()
-      if (value) return value
-    }
-    if (candidate && typeof candidate === 'object' && typeof (candidate as any).value === 'string') {
-      const value = (candidate as any).value.trim()
-      if (value) return value
-    }
-  }
-  return undefined
-}
-
-const toLegacySpatial = (item: any, renderableIds?: Set<number>): any => {
-  const normalizedId = resolveSpatialSelectionId(item, renderableIds)
-  return {
-    expressID: normalizedId,
-    localId: normalizedId,
-    type: resolveSpatialType(item),
-    name: resolveSpatialName(item),
-    children: Array.isArray(item?.children)
-      ? item.children.map((child: any) => toLegacySpatial(child, renderableIds))
-      : []
-  }
-}
-
-const toLegacyItemData = (value: any, depth = 0, stack = new WeakSet<object>()): any => {
-  if (value === null || value === undefined) return value
-  if (typeof value !== 'object') return value
-  if (depth > MAX_LEGACY_ITEM_DEPTH) return undefined
-  if (stack.has(value as object)) return undefined
-
-  stack.add(value as object)
-  try {
-    if (Array.isArray(value)) {
-      return value
-        .map((entry) => toLegacyItemData(entry, depth + 1, stack))
-        .filter((entry) => entry !== undefined)
-    }
-
-    if ('value' in value && Object.keys(value).every((key) => key === 'value' || key === 'type')) {
-      return {
-        value: toLegacyItemData((value as { value: unknown }).value, depth + 1, stack),
-        type: typeof (value as { type?: unknown }).type === 'string' ? (value as { type?: string }).type : undefined
-      }
-    }
-
-    const result: Record<string, any> = {}
-    Object.entries(value).forEach(([key, entry]) => {
-      if (typeof entry === 'function') return
-      const normalized = toLegacyItemData(entry, depth + 1, stack)
-      if (normalized !== undefined) {
-        result[key] = normalized
-      }
-    })
-    return result
-  } finally {
-    stack.delete(value as object)
-  }
-}
-
-const readRawString = (value: unknown): string | null => {
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    return trimmed || null
-  }
-  if (!value || typeof value !== 'object') return null
-
-  const wrapped = value as { value?: unknown }
-  if (typeof wrapped.value === 'string') {
-    const trimmed = wrapped.value.trim()
-    return trimmed || null
-  }
-  return null
-}
-
-const resolveCategoryFromData = (rawData: any, normalized: any): string | null => {
-  const candidates = [
-    rawData?._category,
-    rawData?.ifcClass,
-    rawData?.category,
-    rawData?.type,
-    normalized?._category,
-    normalized?.ifcClass,
-    normalized?.category,
-    normalized?.type
-  ]
-
-  for (const candidate of candidates) {
-    const resolved = readRawString(candidate)
-    if (resolved) {
-      return resolved.toUpperCase()
-    }
-  }
-  return null
-}
-
-const gatherPropertySets = (
-  value: any,
-  acc: any[],
-  seen: Set<any>,
-  budget: { remaining: number } = { remaining: MAX_PROPERTYSET_SCAN_NODES }
-) => {
-  if (budget.remaining <= 0) return
-  budget.remaining -= 1
-  if (!value || typeof value !== 'object' || seen.has(value)) return
-  seen.add(value)
-
-  if (
-    Array.isArray((value as { HasProperties?: unknown }).HasProperties) &&
-    (typeof (value as { type?: unknown }).type === 'string' ||
-      typeof (value as { ifcClass?: unknown }).ifcClass === 'string' ||
-      typeof (value as { category?: unknown }).category === 'string')
-  ) {
-    acc.push(value)
-  }
-
-  if (Array.isArray(value)) {
-    value.forEach((entry) => gatherPropertySets(entry, acc, seen, budget))
-    return
-  }
-
-  Object.values(value).forEach((entry) => gatherPropertySets(entry, acc, seen, budget))
-}
-
-const clamp01 = (value: number): number => {
-  if (!Number.isFinite(value)) return 0
-  if (value < 0) return 0
-  if (value > 1) return 1
-  return value
-}
-
-const normalizeColorChannel = (value: unknown): number | null => {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return null
-  const normalized = numeric > 1 ? numeric / 255 : numeric
-  return clamp01(normalized)
-}
-
-const normalizeColor = (value: unknown): Color | null => {
-  if (Array.isArray(value) && value.length >= 3) {
-    const r = normalizeColorChannel(value[0])
-    const g = normalizeColorChannel(value[1])
-    const b = normalizeColorChannel(value[2])
-    if (r === null || g === null || b === null) return null
-    return new Color().setRGB(r, g, b, THREE.SRGBColorSpace)
-  }
-
-  if (!value || typeof value !== 'object') return null
-
-  const candidate = value as {
-    r?: unknown
-    g?: unknown
-    b?: unknown
-    x?: unknown
-    y?: unknown
-    z?: unknown
-  }
-
-  const r = normalizeColorChannel(candidate.r ?? candidate.x)
-  const g = normalizeColorChannel(candidate.g ?? candidate.y)
-  const b = normalizeColorChannel(candidate.b ?? candidate.z)
-  if (r === null || g === null || b === null) return null
-  return new Color().setRGB(r, g, b, THREE.SRGBColorSpace)
-}
-
-const normalizeOpacity = (value: unknown): number => {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return 1
-  const normalized = numeric > 1 ? numeric / 255 : numeric
-  return clamp01(normalized)
-}
-
-const materialFromDefinition = (
-  definition: MaterialDefinition | undefined,
-  cache: Map<string, Material>
-): Material | null => {
-  if (!definition) return null
-
-  const definitionColor = (definition as any)?.color
-  const color = normalizeColor(definitionColor)
-  if (!color) return null
-  const opacity = normalizeOpacity((definition as any)?.opacity)
-  const transparent =
-    typeof (definition as any)?.transparent === 'boolean' ? Boolean((definition as any)?.transparent) : opacity < 1
-  const renderedFaces = Number((definition as any)?.renderedFaces)
-  const side = renderedFaces === 1 ? THREE.DoubleSide : THREE.FrontSide
-  const depthTest = true
-  const depthWrite = !transparent
-
-  const key = [
-    color.r.toFixed(6),
-    color.g.toFixed(6),
-    color.b.toFixed(6),
-    opacity.toFixed(6),
-    transparent ? '1' : '0',
-    side === THREE.DoubleSide ? '2' : '1',
-    depthTest ? '1' : '0',
-    depthWrite ? '1' : '0'
-  ].join('|')
-
-  const cached = cache.get(key)
-  if (cached) return cached
-
-  const material = new MeshLambertMaterial({
-    color: color.clone(),
-    opacity,
-    transparent,
-    side,
-    depthTest,
-    depthWrite
-  })
-
-  cache.set(key, material)
-  return material
-}
-
-const materialFromRawMaterial = (raw: RawMaterial | undefined, cache: Map<string, Material>): Material | null => {
-  if (!raw) return null
-
-  const color = normalizeColor(raw)
-  if (!color) return null
-  const opacity = normalizeOpacity((raw as any).a)
-  const transparent = opacity < 1
-  const renderedFaces = Number((raw as any).renderedFaces)
-  const side = renderedFaces === 1 ? THREE.DoubleSide : THREE.FrontSide
-  const depthTest = true
-  const depthWrite = !transparent
-
-  const key = [
-    color.r.toFixed(6),
-    color.g.toFixed(6),
-    color.b.toFixed(6),
-    opacity.toFixed(6),
-    transparent ? '1' : '0',
-    side === THREE.DoubleSide ? '2' : '1',
-    depthTest ? '1' : '0',
-    depthWrite ? '1' : '0'
-  ].join('|')
-
-  const cached = cache.get(key)
-  if (cached) return cached
-
-  const material = new MeshLambertMaterial({
-    color: color.clone(),
-    opacity,
-    transparent,
-    side,
-    depthTest,
-    depthWrite
-  })
-
-  cache.set(key, material)
-  return material
-}
-
-const uniqueNumbers = (values: unknown[]): number[] => {
-  const dedup = new Set<number>()
-  values.forEach((raw) => {
-    const parsed = Number(raw)
-    if (!Number.isFinite(parsed)) return
-    dedup.add(Math.trunc(parsed))
-  })
-  return Array.from(dedup)
 }
 
 export class IfcViewerAPI {
@@ -551,7 +250,7 @@ export class IfcViewerAPI {
         await this.applyWebIfcConfig(settings)
       },
       getExpressId: (geometry: BufferGeometry, faceIndex: number) => {
-        return this.getExpressIdFromGeometry(geometry, faceIndex)
+        return getExpressIdFromGeometry(geometry, faceIndex)
       },
       getIfcType: (modelID: number, expressID: number) => {
         return this.modelsById.get(modelID)?.ifcTypeCache.get(expressID)
@@ -589,29 +288,12 @@ export class IfcViewerAPI {
     }
 
     const castRayIfcCandidates = (pointer?: Vector2): PickResult[] => {
-      const pickables = this.context.items.pickableIfcModels
-      if (pickables.length === 0) return []
-      this.raycaster.setFromCamera(pointer ?? this.mousePosition, this.perspectiveCamera)
-      const hits = this.raycaster.intersectObjects(pickables, true)
-      const results: PickResult[] = []
-      const seen = new Set<string>()
-      for (const hit of hits) {
-        const modelID = this.resolveModelID(hit.object)
-        if (modelID === null || modelID < 0) continue
-        const expressID = this.resolveExpressID(modelID, hit)
-        if (!Number.isFinite(expressID) || expressID <= 0) continue
-        const key = `${modelID}:${expressID}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        results.push({
-          id: expressID,
-          modelID,
-          point: hit.point.clone(),
-          distance: hit.distance,
-          object: hit.object
-        })
-      }
-      return results
+      return castRayIfcCandidatesInternal({
+        raycaster: this.raycaster,
+        pointer: pointer ?? this.mousePosition,
+        camera: this.perspectiveCamera,
+        pickables: this.context.items.pickableIfcModels
+      })
     }
 
     const castRayIfc = () => {
@@ -860,16 +542,11 @@ export class IfcViewerAPI {
   }
 
   private addIfcModel(mesh: IfcModelLike | null | undefined) {
-    if (!mesh) return
-    if (!this.scene.children.includes(mesh)) {
-      this.scene.add(mesh)
-    }
-    if (!this.context.items.ifcModels.includes(mesh)) {
-      this.context.items.ifcModels.push(mesh)
-    }
-    if (!this.context.items.pickableIfcModels.includes(mesh)) {
-      this.context.items.pickableIfcModels.push(mesh)
-    }
+    attachIfcModelToScene({
+      scene: this.scene,
+      items: this.context.items,
+      mesh
+    })
     this.updateSceneRadius()
     this.updateCameraClipPlanes()
   }
@@ -909,107 +586,16 @@ export class IfcViewerAPI {
   }
 
   private updateSceneRadius() {
-    const models = this.context.items.ifcModels
-    if (models.length === 0) {
-      this.sceneRadius = 50
-      return
-    }
-
-    const box = new Box3()
-    let hasBox = false
-    for (const model of models) {
-      const modelBox = new Box3().setFromObject(model)
-      if (!Number.isFinite(modelBox.min.x) || !Number.isFinite(modelBox.max.x)) continue
-      if (!hasBox) {
-        box.copy(modelBox)
-        hasBox = true
-      } else {
-        box.union(modelBox)
-      }
-    }
-
-    if (!hasBox) {
-      this.sceneRadius = 50
-      return
-    }
-
-    const size = box.getSize(new Vector3())
-    this.sceneRadius = Math.max(size.x, size.y, size.z) * 0.5 + 1
+    this.sceneRadius = computeSceneRadius(this.context.items.ifcModels)
   }
 
   private updateCameraClipPlanes() {
-    const position = new Vector3()
-    const target = new Vector3()
-    this.cameraControls.getPosition(position)
-    this.cameraControls.getTarget(target)
-
-    const distance = Math.max(1, position.distanceTo(target))
-    const radius = Math.max(5, this.sceneRadius)
-    const near = Math.max(0.2, Math.min(2, distance / 120))
-    const far = Math.max(150, distance + radius * 4)
-
-    if (
-      Math.abs(this.perspectiveCamera.near - near) > 1e-3 ||
-      Math.abs(this.perspectiveCamera.far - far) > 1e-2
-    ) {
-      this.perspectiveCamera.near = near
-      this.perspectiveCamera.far = far
-      this.perspectiveCamera.updateProjectionMatrix()
-    }
-
-    if (
-      Math.abs(this.orthographicCamera.near - near) > 1e-3 ||
-      Math.abs(this.orthographicCamera.far - far) > 1e-2
-    ) {
-      this.orthographicCamera.near = near
-      this.orthographicCamera.far = far
-      this.orthographicCamera.updateProjectionMatrix()
-    }
-  }
-
-  private resolveModelID(object: Object3D | null): number | null {
-    let current: any = object
-    while (current) {
-      if (typeof current.modelID === 'number') return current.modelID
-      current = current.parent
-    }
-    return null
-  }
-
-  private resolveExpressID(_modelID: number, hit: Intersection<Object3D>): number {
-    const object: any = hit.object
-    const geometry: any = object?.geometry
-    const faceIndex = typeof hit.faceIndex === 'number' ? hit.faceIndex : null
-
-    const expressAttr = geometry?.getAttribute?.('expressID')
-    if (!expressAttr || typeof expressAttr.getX !== 'function') {
-      return -1
-    }
-
-    const indexAttr = geometry?.index
-    let vertexIndex = faceIndex !== null ? faceIndex * 3 : 0
-    if (indexAttr && typeof indexAttr.getX === 'function' && faceIndex !== null) {
-      vertexIndex = indexAttr.getX(faceIndex * 3)
-    }
-
-    const raw = expressAttr.getX(vertexIndex)
-    return Number.isFinite(raw) ? Math.trunc(raw) : -1
-  }
-
-  private getExpressIdFromGeometry(geometry: BufferGeometry, faceIndex: number): number {
-    const expressAttr: any = geometry.getAttribute('expressID')
-    if (!expressAttr || typeof expressAttr.getX !== 'function') {
-      return -1
-    }
-
-    const indexAttr: any = geometry.index
-    let vertexIndex = faceIndex * 3
-    if (indexAttr && typeof indexAttr.getX === 'function') {
-      vertexIndex = indexAttr.getX(faceIndex * 3)
-    }
-
-    const resolved = expressAttr.getX(vertexIndex)
-    return Number.isFinite(resolved) ? Math.trunc(resolved) : -1
+    updateCameraClipPlanesForScene({
+      cameraControls: this.cameraControls,
+      perspectiveCamera: this.perspectiveCamera,
+      orthographicCamera: this.orthographicCamera,
+      sceneRadius: this.sceneRadius
+    })
   }
 
   private async ensureIfcLoaderReady() {
@@ -1036,17 +622,15 @@ export class IfcViewerAPI {
   }
 
   private isAbsoluteWasmPath(path: string) {
-    return path.startsWith('http://') || path.startsWith('https://') || path.startsWith('/')
+    return isAbsoluteWasmPathInternal(path)
   }
 
   private applyIfcLoaderSettings() {
-    this.ifcLoader.settings.autoSetWasm = false
-    this.ifcLoader.settings.wasm.path = this.wasmPath
-    this.ifcLoader.settings.wasm.absolute = this.isAbsoluteWasmPath(this.wasmPath)
-    this.ifcLoader.settings.webIfc = {
-      ...this.ifcLoader.settings.webIfc,
-      ...this.webIfcConfig
-    }
+    applyIfcLoaderSettingsInternal({
+      ifcLoader: this.ifcLoader,
+      wasmPath: this.wasmPath,
+      webIfcConfig: this.webIfcConfig
+    })
   }
 
   private configureWasmPath(path: string) {
@@ -1066,73 +650,11 @@ export class IfcViewerAPI {
   }
 
   private getNameFromUrl(url: string): string {
-    try {
-      const parsed = new URL(url, window.location.origin)
-      const tail = parsed.pathname.split('/').pop()
-      return tail && tail.trim() ? tail : 'model.ifc'
-    } catch {
-      const tail = url.split('/').pop()
-      return tail && tail.trim() ? tail : 'model.ifc'
-    }
+    return getNameFromUrlInternal(url)
   }
 
   private makeModelKey(name: string): string {
-    const clean = name
-      .toLowerCase()
-      .replace(/\.ifc$/i, '')
-      .replace(/[^a-z0-9_-]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'model'
-    const suffix = Math.random().toString(36).slice(2, 10)
-    return `${clean}-${suffix}`
-  }
-
-  private cloneGeometryWithExpressId(
-    source: BufferGeometry,
-    expressID: number,
-    worldMatrix?: Matrix4
-  ): BufferGeometry | null {
-    let geometry = source.clone()
-    if (geometry.index) {
-      const nonIndexed = geometry.toNonIndexed()
-      geometry.dispose()
-      geometry = nonIndexed
-    }
-
-    const positions = geometry.getAttribute('position')
-    if (!positions) {
-      geometry.dispose()
-      return null
-    }
-
-    const ids = new Float32Array(positions.count)
-    ids.fill(expressID)
-    geometry.setAttribute('expressID', new Float32BufferAttribute(ids, 1))
-
-    if (worldMatrix) {
-      const elements = worldMatrix.elements
-      const isIdentity =
-        elements[0] === 1 &&
-        elements[1] === 0 &&
-        elements[2] === 0 &&
-        elements[3] === 0 &&
-        elements[4] === 0 &&
-        elements[5] === 1 &&
-        elements[6] === 0 &&
-        elements[7] === 0 &&
-        elements[8] === 0 &&
-        elements[9] === 0 &&
-        elements[10] === 1 &&
-        elements[11] === 0 &&
-        elements[12] === 0 &&
-        elements[13] === 0 &&
-        elements[14] === 0 &&
-        elements[15] === 1
-      if (!isIdentity) {
-        geometry.applyMatrix4(worldMatrix)
-      }
-    }
-
-    return geometry
+    return makeModelKeyInternal(name)
   }
 
   private buildMeshFromCache(
@@ -1140,91 +662,12 @@ export class IfcViewerAPI {
     ids: number[],
     materialOverride?: Material | Material[]
   ): Mesh | null {
-    const geometries: BufferGeometry[] = []
-    const entryMaterials: Material[] = []
-
-    const uniqueIds = uniqueNumbers(ids)
-    for (const id of uniqueIds) {
-      const entries = record.geometryCache.get(id)
-      if (!entries || entries.length === 0) continue
-
-      for (const entry of entries) {
-        const geometry = entry.geometry.clone()
-        const positions = geometry.getAttribute('position')
-        if (!positions) {
-          geometry.dispose()
-          continue
-        }
-
-        if (!materialOverride) {
-          const sourceMaterial = entry.material
-          const indexCount = geometry.index ? geometry.index.count : positions.count
-
-          if (Array.isArray(sourceMaterial)) {
-            if (sourceMaterial.length === 0) {
-              geometry.dispose()
-              continue
-            }
-
-            const baseIndex = entryMaterials.length
-            entryMaterials.push(...sourceMaterial)
-
-            if (geometry.groups.length === 0) {
-              geometry.clearGroups()
-              geometry.addGroup(0, indexCount, baseIndex)
-            } else {
-              for (const group of geometry.groups) {
-                const rawIndex = group.materialIndex
-                const nextIndex = typeof rawIndex === 'number' && Number.isFinite(rawIndex) ? Math.trunc(rawIndex) : 0
-                const clampedIndex = Math.max(0, Math.min(sourceMaterial.length - 1, nextIndex))
-                group.materialIndex = baseIndex + clampedIndex
-              }
-            }
-          } else {
-            const baseIndex = entryMaterials.length
-            entryMaterials.push(sourceMaterial)
-
-            if (geometry.groups.length === 0) {
-              geometry.clearGroups()
-              geometry.addGroup(0, indexCount, baseIndex)
-            } else {
-              for (const group of geometry.groups) {
-                group.materialIndex = baseIndex
-              }
-            }
-          }
-        } else {
-          geometry.clearGroups()
-        }
-        geometries.push(geometry)
-      }
-    }
-
-    if (geometries.length === 0) {
-      return null
-    }
-
-    const merged = mergeGeometries(geometries, true)
-    geometries.forEach((geometry) => geometry.dispose())
-    if (!merged) {
-      return null
-    }
-
-    const fallbackMaterial = new MeshLambertMaterial({ color: 0xffffff })
-    const material =
-      materialOverride ??
-      (entryMaterials.length === 0
-        ? fallbackMaterial
-        : entryMaterials.length === 1
-          ? entryMaterials[0]
-          : entryMaterials)
-
-    const mesh = new Mesh(merged, material)
-    ;(mesh as any).modelID = record.numericId
-    mesh.matrixAutoUpdate = false
-    mesh.updateMatrix()
-    this.tagModelObject(mesh, record.numericId)
-    return mesh
+    return buildMeshFromCacheInternal({
+      record,
+      ids,
+      materialOverride,
+      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
+    })
   }
 
   private tagModelObject(root: Object3D, modelID: number) {
@@ -1234,35 +677,23 @@ export class IfcViewerAPI {
   }
 
   private removePickable(object: Object3D) {
-    const pickables = this.context.items.pickableIfcModels
-    const index = pickables.indexOf(object)
-    if (index !== -1) {
-      pickables.splice(index, 1)
-    }
+    removePickableObject(this.context.items, object)
   }
 
   private addPickable(object: Object3D) {
-    if (!this.context.items.pickableIfcModels.includes(object)) {
-      this.context.items.pickableIfcModels.push(object)
-    }
+    addPickableObject(this.context.items, object)
   }
 
   private removeModelFromList(model: IfcModelLike) {
-    const models = this.context.items.ifcModels
-    const index = models.indexOf(model)
-    if (index !== -1) {
-      models.splice(index, 1)
-    }
+    removeModelFromSceneList(this.context.items, model)
   }
 
   private detachSubset(record: ModelRecord, subsetId: string) {
-    const subset = record.subsets.get(subsetId)
-    if (!subset) return
-
-    this.removePickable(subset.mesh)
-    subset.mesh.parent?.remove(subset.mesh)
-    subset.mesh.geometry?.dispose?.()
-    record.subsets.delete(subsetId)
+    detachSubsetRecord({
+      record,
+      subsetId,
+      removePickable: (object) => this.removePickable(object)
+    })
   }
 
   private createSubset(config: {
@@ -1277,36 +708,17 @@ export class IfcViewerAPI {
     if (!record) return null
 
     const subsetId = config.customID || DEFAULT_SUBSET_ID
-    const existing = record.subsets.get(subsetId)
-
-    const requestedIds = uniqueNumbers((config.ids ?? []).filter((id) => record.expressIds.has(id)))
-    if (requestedIds.length === 0) {
-      if (existing) this.detachSubset(record, subsetId)
-      return null
-    }
-
-    const ids = new Set<number>(requestedIds)
-    if (existing && config.removePrevious === false) {
-      existing.ids.forEach((id) => ids.add(id))
-    }
-
-    if (existing) {
-      this.detachSubset(record, subsetId)
-    }
-
-    const subsetMesh = this.buildMeshFromCache(record, Array.from(ids), config.material)
-    if (!subsetMesh) return null
-
-    const targetScene = config.scene ?? this.scene
-    targetScene.add(subsetMesh)
-    this.addPickable(subsetMesh)
-
-    record.subsets.set(subsetId, {
-      ids,
-      mesh: subsetMesh
+    return createSubsetRecord({
+      record,
+      subsetId,
+      ids: config.ids ?? [],
+      scene: config.scene ?? this.scene,
+      removePrevious: config.removePrevious,
+      material: config.material,
+      addPickable: (object) => this.addPickable(object),
+      removePickable: (object) => this.removePickable(object),
+      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
     })
-
-    return subsetMesh
   }
 
   private removeSubset(modelID: number, customID?: string) {
@@ -1322,31 +734,14 @@ export class IfcViewerAPI {
     if (!record) return
 
     const subsetId = customID || DEFAULT_SUBSET_ID
-    const subset = record.subsets.get(subsetId)
-    if (!subset) return
-
-    const nextIds = new Set<number>(subset.ids)
-    uniqueNumbers(ids).forEach((id) => nextIds.delete(id))
-
-    const targetScene = (subset.mesh.parent as Scene | null) ?? this.scene
-
-    this.detachSubset(record, subsetId)
-
-    if (nextIds.size === 0) {
-      return
-    }
-
-    // Rebuild materials from geometry cache for current ids.
-    // Reusing the previous merged material array can desync group->material indices
-    // after ids change, which swaps colors/materials between elements.
-    const rebuilt = this.buildMeshFromCache(record, Array.from(nextIds))
-    if (!rebuilt) return
-
-    targetScene.add(rebuilt)
-    this.addPickable(rebuilt)
-    record.subsets.set(subsetId, {
-      ids: nextIds,
-      mesh: rebuilt
+    removeIdsFromSubsetRecord({
+      record,
+      subsetId,
+      ids,
+      fallbackScene: this.scene,
+      addPickable: (object) => this.addPickable(object),
+      removePickable: (object) => this.removePickable(object),
+      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
     })
   }
 
@@ -1354,114 +749,14 @@ export class IfcViewerAPI {
     fragments: FragmentsModel,
     localIds: number[]
   ): Promise<Map<number, Material>> {
-    const byLocalId = new Map<number, Material>()
-    const dedupMaterials = new Map<string, Material>()
-    const ids = uniqueNumbers(localIds)
-    if (ids.length === 0) return byLocalId
-
-    for (let start = 0; start < ids.length; start += MATERIAL_LOOKUP_BATCH_SIZE) {
-      const batch = ids.slice(start, start + MATERIAL_LOOKUP_BATCH_SIZE)
-      let definitions: Array<{ definition: MaterialDefinition; localIds: number[] }> = []
-
-      try {
-        definitions = (await fragments.getItemsMaterialDefinition(batch)) ?? []
-      } catch (error) {
-        console.warn('Failed to resolve IFC material definitions; using fallback material.', error)
-        continue
-      }
-
-      for (const entry of definitions) {
-        const material = materialFromDefinition(entry?.definition, dedupMaterials)
-        if (!material) continue
-
-        for (const rawLocalId of entry.localIds ?? []) {
-          const localId = Number(rawLocalId)
-          if (!Number.isFinite(localId)) continue
-          const normalizedLocalId = Math.trunc(localId)
-          // Keep the last material definition for a localId. In IFC, later style
-          // assignments can override generic ones.
-          byLocalId.set(normalizedLocalId, material)
-        }
-      }
-    }
-
-    return byLocalId
+    return resolveMaterialsByLocalIdInternal(fragments, localIds)
   }
 
   private async resolveGeometryMaterialsByLocalId(
     fragments: FragmentsModel,
     localIds: number[]
   ): Promise<Map<number, Array<Material | null>>> {
-    const byLocalId = new Map<number, Array<Material | null>>()
-    const ids = uniqueNumbers(localIds)
-    if (ids.length === 0) return byLocalId
-
-    let samplesById = new Map<number, RawSample>()
-    let materialsById = new Map<number, RawMaterial>()
-    try {
-      ;[samplesById, materialsById] = await Promise.all([fragments.getSamples(), fragments.getMaterials()])
-    } catch (error) {
-      console.warn('Failed to read IFC sample/material tables for geometry colors.', error)
-      return byLocalId
-    }
-
-    const dedupMaterials = new Map<string, Material>()
-    for (let start = 0; start < ids.length; start += MATERIAL_GEOMETRY_BATCH_SIZE) {
-      const batch = ids.slice(start, start + MATERIAL_GEOMETRY_BATCH_SIZE)
-      let geometryRows: MeshData[][] = []
-      try {
-        geometryRows = (await fragments.getItemsGeometry(batch)) ?? []
-      } catch (error) {
-        console.warn('Failed to read IFC item geometry for material mapping.', error)
-        continue
-      }
-
-      batch.forEach((localId, rowIndex) => {
-        const row = Array.isArray(geometryRows[rowIndex]) ? geometryRows[rowIndex] : []
-        const rowMaterials: Array<Material | null> = []
-
-        row.forEach((meshData) => {
-          const sampleId = Number((meshData as any)?.sampleId)
-          if (!Number.isFinite(sampleId)) {
-            rowMaterials.push(null)
-            return
-          }
-          const sample = samplesById.get(Math.trunc(sampleId))
-          const materialId = Number((sample as any)?.material)
-          if (!Number.isFinite(materialId)) {
-            rowMaterials.push(null)
-            return
-          }
-          const rawMaterial = materialsById.get(Math.trunc(materialId))
-          rowMaterials.push(materialFromRawMaterial(rawMaterial, dedupMaterials))
-        })
-
-        byLocalId.set(localId, rowMaterials)
-      })
-    }
-
-    return byLocalId
-  }
-
-  private makeGeometryInstanceKey(
-    geometry: BufferGeometry,
-    matrix?: Matrix4,
-    material?: Material | Material[] | null
-  ): string {
-    if (!matrix) return `${geometry.uuid}|identity`
-
-    const matrixKey = matrix.elements
-      .map((value) => (Math.abs(value) < 1e-7 ? '0' : value.toFixed(6)))
-      .join(',')
-
-    let materialKey = 'no-material'
-    if (Array.isArray(material)) {
-      materialKey = material.length > 0 ? material.map((entry) => entry.uuid).join(',') : 'no-material'
-    } else if (material) {
-      materialKey = material.uuid
-    }
-
-    return `${geometry.uuid}|${matrixKey}|${materialKey}`
+    return resolveGeometryMaterialsByLocalIdInternal(fragments, localIds)
   }
 
   private async createModelRecord(buffer: ArrayBuffer, sourceName: string): Promise<ModelRecord | null> {
@@ -1504,67 +799,20 @@ export class IfcViewerAPI {
       this.resolveGeometryMaterialsByLocalId(fragments, localIds)
     ])
 
-    const geometryCache = new Map<number, GeometrySlice[]>()
-    for (const [rawLocalId, meshes] of localMap as any) {
-      const localId = Number(rawLocalId)
-      if (!Number.isFinite(localId)) continue
-
-      const normalizedLocalId = Math.trunc(localId)
-      const resolvedMaterialForLocalId = resolvedMaterials.get(normalizedLocalId)
-      const resolvedGeometryMaterialsForLocalId = geometryResolvedMaterials.get(normalizedLocalId) ?? []
-      const seenGeometryInstances = new Set<string>()
-      const entries: GeometrySlice[] = []
-
-      for (const [meshIndex, source] of (meshes as Mesh[]).entries()) {
-        const sourceGeometry = source.geometry as BufferGeometry | undefined
-        const sourceMaterial = source.material as Material | Material[] | undefined
-        // Prefer IFC-resolved materials first (per-geometry/per-item color),
-        // then fallback to source material from mesher.
-        const resolvedMaterial =
-          resolvedGeometryMaterialsForLocalId[meshIndex] ?? resolvedMaterialForLocalId ?? sourceMaterial
-        if (!sourceGeometry || !resolvedMaterial) continue
-
-        if (typeof source.updateMatrixWorld === 'function') {
-          source.updateMatrixWorld(true)
-        }
-        const sourceMatrix =
-          source.matrixWorld instanceof Matrix4
-            ? source.matrixWorld
-            : source.matrix instanceof Matrix4
-              ? source.matrix
-              : undefined
-
-        const instanceKey = this.makeGeometryInstanceKey(sourceGeometry, sourceMatrix, resolvedMaterial)
-        if (seenGeometryInstances.has(instanceKey)) {
-          continue
-        }
-        seenGeometryInstances.add(instanceKey)
-
-        const geometry = this.cloneGeometryWithExpressId(sourceGeometry, normalizedLocalId, sourceMatrix)
-        if (!geometry) continue
-
-        entries.push({
-          geometry,
-          material: resolvedMaterial
-        })
-      }
-
-      if (entries.length > 0) {
-        geometryCache.set(normalizedLocalId, entries)
-      }
-    }
+    const geometryCache = buildGeometryCache({
+      localMap,
+      resolvedMaterials,
+      geometryResolvedMaterials
+    }) as Map<number, GeometrySlice[]>
 
     const numericId = this.nextModelId++
-    const record: ModelRecord = {
+    const record = createViewerModelRecord({
       numericId,
       modelKey,
-      mesh: null as unknown as IfcModelLike,
       fragments,
-      expressIds: new Set(expressIds),
-      geometryCache,
-      subsets: new Map(),
-      ifcTypeCache: new Map()
-    }
+      expressIds,
+      geometryCache
+    }) as ModelRecord
 
     const baseMesh = this.buildMeshFromCache(record, expressIds)
     if (!baseMesh) {
@@ -1577,11 +825,7 @@ export class IfcViewerAPI {
       return null
     }
 
-    record.mesh = baseMesh as IfcModelLike
-    record.mesh.modelID = numericId
-    record.mesh.__modelKey = modelKey
-
-    return record
+    return attachBaseMeshToModelRecord(record, baseMesh) as ModelRecord
   }
 
   private async loadFromBuffer(
@@ -1592,9 +836,12 @@ export class IfcViewerAPI {
     const record = await this.createModelRecord(buffer, sourceName)
     if (!record) return null
 
-    this.modelsById.set(record.numericId, record)
-    this.modelIdByKey.set(record.modelKey, record.numericId)
-    this.ifcManager.state.models[record.numericId] = { mesh: record.mesh }
+    registerLoadedModelRecord({
+      record,
+      modelsById: this.modelsById,
+      modelIdByKey: this.modelIdByKey,
+      ifcManagerState: this.ifcManager.state
+    })
 
     this.addIfcModel(record.mesh)
 
