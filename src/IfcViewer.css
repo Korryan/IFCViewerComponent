@@ -751,6 +751,12 @@
   gap: 0.4rem;
 }
 
+.tree-panel__room-contents-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
 .tree-panel__room-group-title {
   margin: 0;
   color: #1e3a8a;

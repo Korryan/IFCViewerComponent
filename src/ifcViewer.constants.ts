@@ -25,8 +25,8 @@ export const ROOM_NUMBER_KEYS = new Set([
   'raumnummer',
   'roomnumber'
 ])
-export const ENABLE_ROOM_NUMBER_GROUPING = false
-export const MAX_ROOM_NUMBER_LOOKUPS = 400
+export const ENABLE_ROOM_NUMBER_GROUPING = true
+export const MAX_ROOM_NUMBER_LOOKUPS = 2000
 export const ROOM_NUMBER_BATCH_SIZE = 20
 export const CONTAINMENT_RELATION_BATCH_SIZE = 20
 export const MAX_CONTAINMENT_RELATION_LOOKUPS = 800

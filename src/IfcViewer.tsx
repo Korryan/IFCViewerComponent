@@ -365,6 +365,7 @@ const IfcViewer = ({
   const lastLoadSourceRef = useRef<LoadSource>({ kind: 'none' })
   const { tree, setIfcTree, resetTree, addCustomNode, removeNode } = useObjectTree()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [lastWalkRoomNodeId, setLastWalkRoomNodeId] = useState<string | null>(null)
   const [roomOnlyTransformGuard, setRoomOnlyTransformGuard] = useState(true)
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
@@ -374,6 +375,7 @@ const IfcViewer = ({
   const [activeModelId, setActiveModelId] = useState<number | null>(null)
   const [storeyInfoByNodeId, setStoreyInfoByNodeId] = useState<Record<string, StoreyInfo>>({})
   const roomNumbersRef = useRef<Map<number, string>>(new Map())
+  const activeIfcTextRef = useRef<string | null>(null)
   const activeModelInverseCoordinationMatrixRef = useRef<number[] | null>(null)
   const suppressMetadataNotifyRef = useRef(false)
   const suppressHistoryNotifyRef = useRef(false)
@@ -664,23 +666,27 @@ const IfcViewer = ({
     },
     [treeNodeBySelectionKey]
   )
-  const isNodeEditableWithinRoom = useCallback(
-    (nodeId: string | null | undefined): boolean => {
-      if (!nodeId) return false
+  const resolveContainingRoomNodeId = useCallback(
+    (nodeId: string | null | undefined): string | null => {
       let currentId: string | null | undefined = nodeId
-      let isRoot = true
       while (currentId) {
         const node: (typeof tree.nodes)[string] | undefined = tree.nodes[currentId]
         if (!node) break
         if (node.nodeType === 'ifc' && node.type.trim().toUpperCase() === 'IFCSPACE') {
-          return !isRoot
+          return currentId
         }
-        isRoot = false
         currentId = node.parentId
       }
-      return false
+      return null
     },
     [tree.nodes]
+  )
+  const isNodeEditableWithinRoom = useCallback(
+    (nodeId: string | null | undefined): boolean => {
+      const roomNodeId = resolveContainingRoomNodeId(nodeId)
+      return Boolean(roomNodeId && roomNodeId !== nodeId)
+    },
+    [resolveContainingRoomNodeId]
   )
   const selectedTransformNodeId = useMemo(() => {
     if (!selectedElement) return null
@@ -695,6 +701,14 @@ const IfcViewer = ({
     if (!roomOnlyTransformGuard || !selectedElement || canTransformSelected) return null
     return 'Movement and rotation are locked for elements outside rooms.'
   }, [canTransformSelected, roomOnlyTransformGuard, selectedElement])
+  const roomOptionsByNodeId = useMemo(
+    () => new Map(roomOptions.map((room) => [room.nodeId, room])),
+    [roomOptions]
+  )
+  const walkRoomContents = useMemo(() => {
+    if (!lastWalkRoomNodeId) return null
+    return roomOptionsByNodeId.get(lastWalkRoomNodeId) ?? null
+  }, [lastWalkRoomNodeId, roomOptionsByNodeId])
   const showSidePanel = showTree || showProperties
 
   const loadIfcWithCustomSettings = useCallback(
@@ -703,12 +717,26 @@ const IfcViewer = ({
       const loader = ifc.loader
       const ifcManager = loader?.ifcManager
       activeModelInverseCoordinationMatrixRef.current = null
+      activeIfcTextRef.current = null
 
       if (!loader?.loadAsync || !ifcManager?.applyWebIfcConfig || typeof ifc.addIfcModel !== 'function') {
         if (source.file && typeof ifc.loadIfc === 'function') {
+          try {
+            activeIfcTextRef.current = await source.file.text()
+          } catch (error) {
+            console.warn('Failed to read IFC source text from file', error)
+          }
           return ifc.loadIfc(source.file, fitToFrame)
         }
         if (source.url && typeof ifc.loadIfcUrl === 'function') {
+          try {
+            const response = await fetch(source.url)
+            if (response.ok) {
+              activeIfcTextRef.current = await response.text()
+            }
+          } catch (error) {
+            console.warn('Failed to read IFC source text from URL', error)
+          }
           return ifc.loadIfcUrl(source.url, fitToFrame)
         }
         return null
@@ -725,6 +753,19 @@ const IfcViewer = ({
       if (!resolvedUrl) return null
 
       try {
+        try {
+          if (source.file) {
+            activeIfcTextRef.current = await source.file.text()
+          } else if (source.url) {
+            const response = await fetch(source.url)
+            if (response.ok) {
+              activeIfcTextRef.current = await response.text()
+            }
+          }
+        } catch (error) {
+          console.warn('Failed to read IFC source text for room-number fallback', error)
+        }
+
         const model = await loader.loadAsync(resolvedUrl)
         if (!model) return null
         ifc.addIfcModel(model)
@@ -1633,12 +1674,18 @@ const IfcViewer = ({
             // Optional grouping: if room numbers exist in Psets, move elements under the matching IfcSpace.
             if (ENABLE_ROOM_NUMBER_GROUPING) {
               try {
-                const roomNumbers = await buildRoomNumberMap(viewer, nextTree, modelID)
+                const roomNumbers = await buildRoomNumberMap(
+                  viewer,
+                  nextTree,
+                  modelID,
+                  activeIfcTextRef.current
+                )
                 if (loadTokenRef.current !== loadToken) return
                 roomNumbersRef.current = roomNumbers
                 const roomGroupedTree = groupIfcTreeByRoomNumber(nextTree, roomNumbers)
                 if (roomGroupedTree !== nextTree) {
-                  setIfcTree(roomGroupedTree, modelID)
+                  nextTree = roomGroupedTree
+                  setIfcTree(nextTree, modelID)
                 }
               } catch (err) {
                 console.warn('Failed to group storey nodes by room number', err)
@@ -1744,6 +1791,7 @@ const IfcViewer = ({
 
   const handleRoomSelect = useCallback(
     async (nodeId: string) => {
+      setLastWalkRoomNodeId(nodeId)
       if (isWalkMode) {
         setSelectedNodeId(null)
       } else {
@@ -1776,7 +1824,21 @@ const IfcViewer = ({
 
     const matchId = resolveTreeNodeIdForSelection(selectedElement.modelID, selectedElement.expressID)
     setSelectedNodeId(matchId)
-  }, [resolveTreeNodeIdForSelection, selectedElement])
+    const roomNodeId = resolveContainingRoomNodeId(matchId)
+    if (isWalkMode && roomNodeId) {
+      setLastWalkRoomNodeId((current) => (current === roomNodeId ? current : roomNodeId))
+      return
+    }
+    if (roomNodeId && roomNodeId === matchId) {
+      setLastWalkRoomNodeId((current) => (current === roomNodeId ? current : roomNodeId))
+    }
+  }, [isWalkMode, resolveContainingRoomNodeId, resolveTreeNodeIdForSelection, selectedElement])
+
+  useEffect(() => {
+    if (!lastWalkRoomNodeId) return
+    if (tree.nodes[lastWalkRoomNodeId]) return
+    setLastWalkRoomNodeId(null)
+  }, [lastWalkRoomNodeId, tree.nodes])
 
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
@@ -1787,9 +1849,11 @@ const IfcViewer = ({
       resetSelection()
       resetTree()
       setSelectedNodeId(null)
+      setLastWalkRoomNodeId(null)
       setActiveModelId(null)
       setStoreyInfoByNodeId({})
       roomNumbersRef.current = new Map()
+      activeIfcTextRef.current = null
       offsetsRestoredRef.current = null
       furnitureRestoredRef.current = false
 
@@ -1876,6 +1940,7 @@ const IfcViewer = ({
       lastModelIdRef.current = null
       resetTree()
       setSelectedNodeId(null)
+      setLastWalkRoomNodeId(null)
       setActiveModelId(null)
       offsetsRestoredRef.current = null
       furnitureRestoredRef.current = false
@@ -2024,6 +2089,8 @@ const IfcViewer = ({
                   selectedNodeId={selectedNodeId}
                   onSelectNode={handleTreeSelect}
                   rooms={roomOptions}
+                  roomContents={walkRoomContents}
+                  activeRoomNodeId={lastWalkRoomNodeId}
                   onSelectRoom={handleRoomSelect}
                   prefabs={prefabs}
                   onInsertPrefab={(nodeId, prefabId) => {

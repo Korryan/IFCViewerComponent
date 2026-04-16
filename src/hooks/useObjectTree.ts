@@ -258,46 +258,95 @@ export const groupIfcTreeByRoomNumber = (
     if (storey.children.length === 0) return
     // Find the first IfcSpace node for each room number on this storey.
     const roomToSpaceId = new Map<string, string>()
+    const stack = [...storey.children]
+    const visited = new Set<string>()
+    const candidateNodeIds: string[] = []
 
-    storey.children.forEach((childId) => {
-      const child = tree.nodes[childId]
-      if (!child || child.expressID === null) return
-      if (!isIfcType(child, 'IFCSPACE')) return
-      const roomNumber = roomNumbers.get(child.expressID)
-      if (!roomNumber || roomToSpaceId.has(roomNumber)) return
-      roomToSpaceId.set(roomNumber, childId)
-    })
+    while (stack.length > 0) {
+      const nodeId = stack.pop()
+      if (!nodeId || visited.has(nodeId)) continue
+      visited.add(nodeId)
+
+      const node = tree.nodes[nodeId]
+      if (!node) continue
+      if (node.children.length > 0) {
+        stack.push(...node.children)
+      }
+      if (node.nodeType !== 'ifc' || node.expressID === null) continue
+
+      const nodeType = normalizeIfcType(node.type)
+      if (nodeType === 'IFCSPACE') {
+        const roomNumber = roomNumbers.get(node.expressID)
+        if (roomNumber && !roomToSpaceId.has(roomNumber)) {
+          roomToSpaceId.set(roomNumber, nodeId)
+        }
+        continue
+      }
+      if (IFC_SPATIAL_TYPES.has(nodeType) || nodeType.startsWith('IFCREL')) continue
+      candidateNodeIds.push(nodeId)
+    }
 
     if (roomToSpaceId.size === 0) return
 
-    // Move non-space children under the matching IfcSpace (same room number).
-    const removedFromStorey = new Set<string>()
-    storey.children.forEach((childId) => {
-      const child = tree.nodes[childId]
+    // Move the highest eligible node in each branch under the matching IfcSpace.
+    candidateNodeIds.forEach((candidateNodeId) => {
+      const child = nextNodes[candidateNodeId] ?? tree.nodes[candidateNodeId]
       if (!child || child.expressID === null) return
-      if (isIfcType(child, 'IFCSPACE')) return
       const roomNumber = roomNumbers.get(child.expressID)
       if (!roomNumber) return
       const spaceId = roomToSpaceId.get(roomNumber)
       if (!spaceId) return
-      removedFromStorey.add(childId)
-      changed = true
-      nextNodes[childId] = { ...child, parentId: spaceId }
-      const currentSpace = nextNodes[spaceId] ?? tree.nodes[spaceId]
-      if (currentSpace && !currentSpace.children.includes(childId)) {
-        nextNodes[spaceId] = {
-          ...currentSpace,
-          children: [...currentSpace.children, childId]
+
+      let ancestorId = child.parentId
+      while (ancestorId) {
+        if (ancestorId === storey.id) break
+        const ancestor = nextNodes[ancestorId] ?? tree.nodes[ancestorId]
+        if (!ancestor || ancestor.nodeType !== 'ifc' || ancestor.expressID === null) break
+        if (ancestor.id === spaceId) {
+          return
+        }
+        const ancestorRoomNumber = roomNumbers.get(ancestor.expressID)
+        const ancestorType = normalizeIfcType(ancestor.type)
+        if (ancestorRoomNumber === roomNumber && !IFC_SPATIAL_TYPES.has(ancestorType)) {
+          return
+        }
+        ancestorId = ancestor.parentId
+      }
+
+      if (child.parentId === spaceId) return
+
+      let cursor: string | null = spaceId
+      while (cursor) {
+        if (cursor === candidateNodeId) return
+        const cursorNode: ObjectTreeNode | undefined = nextNodes[cursor] ?? tree.nodes[cursor]
+        cursor = cursorNode?.parentId ?? null
+      }
+
+      if (child.parentId) {
+        const previousParent = nextNodes[child.parentId] ?? tree.nodes[child.parentId]
+        if (previousParent && previousParent.children.includes(candidateNodeId)) {
+          nextNodes[previousParent.id] = {
+            ...previousParent,
+            children: previousParent.children.filter((childId) => childId !== candidateNodeId)
+          }
         }
       }
-    })
 
-    if (removedFromStorey.size > 0) {
-      nextNodes[storey.id] = {
-        ...storey,
-        children: storey.children.filter((childId) => !removedFromStorey.has(childId))
+      const currentSpace = nextNodes[spaceId] ?? tree.nodes[spaceId]
+      if (!currentSpace) return
+
+      nextNodes[candidateNodeId] = {
+        ...child,
+        parentId: spaceId
       }
-    }
+      nextNodes[spaceId] = {
+        ...currentSpace,
+        children: currentSpace.children.includes(candidateNodeId)
+          ? currentSpace.children
+          : [...currentSpace.children, candidateNodeId]
+      }
+      changed = true
+    })
   })
 
   return changed ? { nodes: nextNodes, roots: tree.roots } : tree
