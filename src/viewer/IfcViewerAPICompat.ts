@@ -1,16 +1,11 @@
 import CameraControls from 'camera-controls'
 import * as OBC from '@thatopen/components'
 import { Mesher } from '@thatopen/components-front'
-import type { FragmentsModel, ItemData } from '@thatopen/fragments'
 import fragmentsWorkerUrl from '@thatopen/fragments/worker?url'
 import * as THREE from 'three'
 import {
-  AmbientLight,
-  Box3,
   BufferGeometry,
   Color,
-  DirectionalLight,
-  HemisphereLight,
   Material,
   Mesh,
   Object3D,
@@ -19,27 +14,17 @@ import {
   Raycaster,
   Scene,
   Vector2,
-  Vector3,
   WebGLRenderer
 } from 'three'
 import {
-  gatherPropertySets,
-  resolveCategoryFromData,
-  toLegacyItemData,
   toLegacySpatial
 } from './IfcViewerAPICompat.legacy'
-import {
-  uniqueNumbers
-} from './IfcViewerAPICompat.materials'
 import {
   castRayIfcCandidates as castRayIfcCandidatesInternal,
   getExpressIdFromGeometry,
   type PickResult
 } from './IfcViewerAPICompat.picking'
 import {
-  attachBaseMeshToModelRecord,
-  buildGeometryCache,
-  createViewerModelRecord,
   registerLoadedModelRecord,
   resolveGeometryMaterialsByLocalId as resolveGeometryMaterialsByLocalIdInternal,
   resolveMaterialsByLocalId as resolveMaterialsByLocalIdInternal
@@ -64,40 +49,18 @@ import {
   removePickableObject,
   updateCameraClipPlanesForScene
 } from './IfcViewerAPICompat.scene'
+import { createModelRecordFromBuffer } from './IfcViewerAPICompat.loadingFlow'
+import { loadLegacyItemProperties } from './IfcViewerAPICompat.properties'
+import {
+  fitCameraToVisibleModels,
+  renderViewerFrame,
+  resizeViewerViewport,
+  setupDefaultSceneLights,
+  updateViewerPointerPosition
+} from './IfcViewerAPICompat.runtime'
+import type { IfcModelLike, ModelRecord, ViewerOptions } from './IfcViewerAPICompat.types'
 
 let controlsInstalled = false
-
-type ViewerOptions = {
-  container: HTMLElement
-  backgroundColor?: Color
-}
-
-type IfcModelLike = Mesh & {
-  modelID?: number
-  __modelKey?: string
-  removeFromParent?: () => void
-}
-
-type GeometrySlice = {
-  geometry: BufferGeometry
-  material: Material | Material[]
-}
-
-type SubsetRecord = {
-  ids: Set<number>
-  mesh: Mesh
-}
-
-type ModelRecord = {
-  numericId: number
-  modelKey: string
-  mesh: IfcModelLike
-  fragments: FragmentsModel
-  expressIds: Set<number>
-  geometryCache: Map<number, GeometrySlice[]>
-  subsets: Map<string, SubsetRecord>
-  ifcTypeCache: Map<number, string>
-}
 
 const DEFAULT_SUBSET_ID = '__default__'
 const FRAGMENTS_WORKER_PATH = fragmentsWorkerUrl
@@ -210,7 +173,7 @@ export class IfcViewerAPI {
     this.container = options.container
     this.scene = new Scene()
     this.scene.background = options.backgroundColor ?? new Color(0xffffff)
-    this.setupSceneLights()
+    setupDefaultSceneLights(this.scene)
 
     this.renderer = new WebGLRenderer({
       antialias: true,
@@ -332,7 +295,7 @@ export class IfcViewerAPI {
             throw new Error(`Failed to load IFC from URL: ${url}`)
           }
           const buffer = await response.arrayBuffer()
-          const name = this.getNameFromUrl(url)
+          const name = getNameFromUrlInternal(url)
           return this.loadFromBuffer(buffer, name, false)
         }
       },
@@ -360,7 +323,7 @@ export class IfcViewerAPI {
           throw new Error(`Failed to load IFC from URL: ${url}`)
         }
         const buffer = await response.arrayBuffer()
-        return this.loadFromBuffer(buffer, this.getNameFromUrl(url), fitToFrame)
+        return this.loadFromBuffer(buffer, getNameFromUrlInternal(url), fitToFrame)
       },
       addIfcModel: (mesh: IfcModelLike | null | undefined) => {
         this.addIfcModel(mesh)
@@ -431,6 +394,7 @@ export class IfcViewerAPI {
     }
 
     this.renderer.dispose()
+    this.renderer.forceContextLoss()
     if (this.renderer.domElement.parentElement === this.container) {
       this.container.removeChild(this.renderer.domElement)
     }
@@ -441,104 +405,63 @@ export class IfcViewerAPI {
     this.container.addEventListener('pointerdown', this.handlePointerMove)
   }
 
-  private setupSceneLights() {
-    const ambient = new AmbientLight(0xffffff, 0.42)
-    const hemi = new HemisphereLight(0xe5f2ff, 0xd6c9b7, 0.3)
-    const key = new DirectionalLight(0xffffff, 0.72)
-    const fill = new DirectionalLight(0xffffff, 0.28)
-    const rim = new DirectionalLight(0xffffff, 0.16)
-
-    key.position.set(24, 32, 18)
-    fill.position.set(-18, 14, -20)
-    rim.position.set(4, 20, -28)
-
-    this.scene.add(ambient)
-    this.scene.add(hemi)
-    this.scene.add(key)
-    this.scene.add(fill)
-    this.scene.add(rim)
-  }
-
   private handlePointerMove = (event: PointerEvent) => {
-    const rect = this.container.getBoundingClientRect()
-    if (rect.width <= 0 || rect.height <= 0) return
-    this.mousePosition.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-    this.mousePosition.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+    updateViewerPointerPosition({
+      container: this.container,
+      mousePosition: this.mousePosition,
+      event
+    })
   }
 
   private bindResizeObserver() {
     if (typeof ResizeObserver === 'undefined') return
-    this.resizeObserver = new ResizeObserver(() => this.resize())
+    this.resizeObserver = new ResizeObserver(() => {
+      resizeViewerViewport({
+        container: this.container,
+        renderer: this.renderer,
+        perspectiveCamera: this.perspectiveCamera,
+        orthographicCamera: this.orthographicCamera,
+        updateCameraClipPlanes: () => this.updateCameraClipPlanes()
+      })
+    })
     this.resizeObserver.observe(this.container)
-    this.resize()
-  }
-
-  private resize() {
-    const width = Math.max(1, this.container.clientWidth)
-    const height = Math.max(1, this.container.clientHeight)
-    this.renderer.setSize(width, height)
-    this.perspectiveCamera.aspect = width / height
-    this.perspectiveCamera.updateProjectionMatrix()
-
-    const frustumHeight = 20
-    const frustumWidth = frustumHeight * (width / height)
-    this.orthographicCamera.left = -frustumWidth / 2
-    this.orthographicCamera.right = frustumWidth / 2
-    this.orthographicCamera.top = frustumHeight / 2
-    this.orthographicCamera.bottom = -frustumHeight / 2
-    this.orthographicCamera.updateProjectionMatrix()
-    this.updateCameraClipPlanes()
+    resizeViewerViewport({
+      container: this.container,
+      renderer: this.renderer,
+      perspectiveCamera: this.perspectiveCamera,
+      orthographicCamera: this.orthographicCamera,
+      updateCameraClipPlanes: () => this.updateCameraClipPlanes()
+    })
   }
 
   private startLoop() {
     const animate = () => {
       if (this.disposed) return
       const now = performance.now()
-      const delta = Math.max(0, (now - this.lastFrameTime) / 1000)
+      renderViewerFrame({
+        now,
+        lastFrameTime: this.lastFrameTime,
+        cameraControls: this.cameraControls,
+        updateCameraClipPlanes: () => this.updateCameraClipPlanes(),
+        renderer: this.renderer,
+        scene: this.scene,
+        perspectiveCamera: this.perspectiveCamera
+      })
       this.lastFrameTime = now
-      this.cameraControls.update(delta)
-      this.updateCameraClipPlanes()
-      this.renderer.render(this.scene, this.perspectiveCamera)
       this.animationFrame = requestAnimationFrame(animate)
     }
     this.animationFrame = requestAnimationFrame(animate)
   }
 
   private async fitToFrame() {
-    const models = this.context.items.ifcModels
-    if (models.length === 0) return
-
-    const box = new Box3()
-    let hasBox = false
-    for (const model of models) {
-      const modelBox = new Box3().setFromObject(model)
-      if (!Number.isFinite(modelBox.min.x) || !Number.isFinite(modelBox.max.x)) continue
-      if (!hasBox) {
-        box.copy(modelBox)
-        hasBox = true
-      } else {
-        box.union(modelBox)
-      }
+    const sceneRadius = await fitCameraToVisibleModels({
+      cameraControls: this.cameraControls,
+      models: this.context.items.ifcModels,
+      updateCameraClipPlanes: () => this.updateCameraClipPlanes()
+    })
+    if (sceneRadius !== null) {
+      this.sceneRadius = sceneRadius
     }
-    if (!hasBox) return
-
-    const center = box.getCenter(new Vector3())
-    const size = box.getSize(new Vector3())
-    this.sceneRadius = Math.max(size.x, size.y, size.z) * 0.5 + 1
-    const radius = Math.max(size.x, size.y, size.z) * 0.8 + 2
-    const nextPos = center.clone().add(new Vector3(radius, radius * 0.6, radius))
-
-    await this.cameraControls.setLookAt(
-      nextPos.x,
-      nextPos.y,
-      nextPos.z,
-      center.x,
-      center.y,
-      center.z,
-      true
-    )
-
-    this.updateCameraClipPlanes()
   }
 
   private addIfcModel(mesh: IfcModelLike | null | undefined) {
@@ -610,7 +533,7 @@ export class IfcViewerAPI {
       wasm: {
         ...this.ifcLoader.settings.wasm,
         path: this.wasmPath,
-        absolute: this.isAbsoluteWasmPath(this.wasmPath)
+        absolute: isAbsoluteWasmPathInternal(this.wasmPath)
       },
       webIfc: {
         ...this.ifcLoader.settings.webIfc,
@@ -619,10 +542,6 @@ export class IfcViewerAPI {
     })
 
     await this.ifcLoaderSetupPromise
-  }
-
-  private isAbsoluteWasmPath(path: string) {
-    return isAbsoluteWasmPathInternal(path)
   }
 
   private applyIfcLoaderSettings() {
@@ -647,14 +566,6 @@ export class IfcViewerAPI {
     this.applyIfcLoaderSettings()
     this.ifcLoaderSetupPromise = null
     await this.ensureIfcLoaderReady()
-  }
-
-  private getNameFromUrl(url: string): string {
-    return getNameFromUrlInternal(url)
-  }
-
-  private makeModelKey(name: string): string {
-    return makeModelKeyInternal(name)
   }
 
   private buildMeshFromCache(
@@ -745,95 +656,24 @@ export class IfcViewerAPI {
     })
   }
 
-  private async resolveMaterialsByLocalId(
-    fragments: FragmentsModel,
-    localIds: number[]
-  ): Promise<Map<number, Material>> {
-    return resolveMaterialsByLocalIdInternal(fragments, localIds)
-  }
-
-  private async resolveGeometryMaterialsByLocalId(
-    fragments: FragmentsModel,
-    localIds: number[]
-  ): Promise<Map<number, Array<Material | null>>> {
-    return resolveGeometryMaterialsByLocalIdInternal(fragments, localIds)
-  }
-
-  private async createModelRecord(buffer: ArrayBuffer, sourceName: string): Promise<ModelRecord | null> {
-    await this.ensureIfcLoaderReady()
-
-    const modelKey = this.makeModelKey(sourceName)
-    const fragments = (await this.ifcLoader.load(new Uint8Array(buffer), true, modelKey)) as FragmentsModel
-    fragments.object.visible = false
-
-    const expressIds = uniqueNumbers(await fragments.getItemsIdsWithGeometry())
-    if (expressIds.length === 0) {
-      try {
-        void this.fragmentsManager.core.disposeModel(modelKey)
-      } catch {
-        // no-op
-      }
-      return null
-    }
-
-    const modelIdMap: OBC.ModelIdMap = {
-      [modelKey]: new Set(expressIds)
-    }
-    const mesherResult = await this.mesher.get(modelIdMap, {
-      applyTransformation: true
-    })
-
-    const localMap = mesherResult.get(modelKey) as Map<number, Mesh[]> | undefined
-    if (!localMap || localMap.size === 0) {
-      try {
-        void this.fragmentsManager.core.disposeModel(modelKey)
-      } catch {
-        // no-op
-      }
-      return null
-    }
-
-    const localIds = uniqueNumbers(Array.from(localMap.keys()) as number[])
-    const [resolvedMaterials, geometryResolvedMaterials] = await Promise.all([
-      this.resolveMaterialsByLocalId(fragments, localIds),
-      this.resolveGeometryMaterialsByLocalId(fragments, localIds)
-    ])
-
-    const geometryCache = buildGeometryCache({
-      localMap,
-      resolvedMaterials,
-      geometryResolvedMaterials
-    }) as Map<number, GeometrySlice[]>
-
-    const numericId = this.nextModelId++
-    const record = createViewerModelRecord({
-      numericId,
-      modelKey,
-      fragments,
-      expressIds,
-      geometryCache
-    }) as ModelRecord
-
-    const baseMesh = this.buildMeshFromCache(record, expressIds)
-    if (!baseMesh) {
-      geometryCache.forEach((entries) => entries.forEach((entry) => entry.geometry.dispose()))
-      try {
-        void this.fragmentsManager.core.disposeModel(modelKey)
-      } catch {
-        // no-op
-      }
-      return null
-    }
-
-    return attachBaseMeshToModelRecord(record, baseMesh) as ModelRecord
-  }
-
   private async loadFromBuffer(
     buffer: ArrayBuffer,
     sourceName: string,
     fitToFrame = true
   ): Promise<IfcModelLike | null> {
-    const record = await this.createModelRecord(buffer, sourceName)
+    const record = await createModelRecordFromBuffer({
+      buffer,
+      sourceName,
+      numericId: this.nextModelId++,
+      ifcLoader: this.ifcLoader,
+      fragmentsManager: this.fragmentsManager,
+      mesher: this.mesher,
+      ensureIfcLoaderReady: () => this.ensureIfcLoaderReady(),
+      makeModelKey: (name) => makeModelKeyInternal(name),
+      resolveMaterialsByLocalId: resolveMaterialsByLocalIdInternal,
+      resolveGeometryMaterialsByLocalId: resolveGeometryMaterialsByLocalIdInternal,
+      buildMeshFromCache: (record, ids) => this.buildMeshFromCache(record, ids)
+    })
     if (!record) return null
 
     registerLoadedModelRecord({
@@ -860,48 +700,12 @@ export class IfcViewerAPI {
   ): Promise<any> {
     const record = this.modelsById.get(modelID)
     if (!record) return {}
-
-    const config = includeProperties
-      ? {
-          attributesDefault: true,
-          relationsDefault: {
-            attributes: true,
-            relations: recursive
-          }
-        }
-      : {
-          attributesDefault: true,
-          relationsDefault: {
-            attributes: false,
-            relations: false
-          }
-        }
-
-    const rawData = await record.fragments
-      .getItemsData([expressID], config as any)
-      .then((items: ItemData[]) => (Array.isArray(items) && items.length > 0 ? items[0] : {}))
-      .catch(() => ({}))
-
-    const normalized = toLegacyItemData(rawData)
-    const resolvedCategory = resolveCategoryFromData(rawData, normalized)
-    if (resolvedCategory) {
-      normalized.ifcClass = resolvedCategory
-      normalized.type = resolvedCategory
-      record.ifcTypeCache.set(expressID, resolvedCategory)
-    }
-
-    if (!includeProperties) {
-      return normalized
-    }
-
-    const psets: any[] = []
-    gatherPropertySets(normalized, psets, new Set())
-
-    return {
-      ...normalized,
-      psets,
-      typeProperties: [],
-      materials: []
-    }
+    return loadLegacyItemProperties({
+      fragments: record.fragments,
+      expressID,
+      recursive,
+      includeProperties,
+      ifcTypeCache: record.ifcTypeCache
+    })
   }
 }

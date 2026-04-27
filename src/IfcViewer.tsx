@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { FrontSide, Matrix4 } from 'three'
 import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
 import type {
   FurnitureItem,
   HistoryEntry,
   InsertPrefabOption,
   MetadataEntry,
-  ObjectTree,
   Point3D,
   SelectedElement
 } from './ifcViewerTypes'
@@ -21,52 +19,50 @@ import { PropertiesPanel } from './components/PropertiesPanel'
 import { ObjectTreePanel } from './components/ObjectTreePanel'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 import { SelectionMenu } from './components/SelectionMenu'
+import { useObjectTree } from './hooks/useObjectTree'
+import { type StoreyInfo } from './ifcRoomTree.utils'
 import {
-  buildIfcTree,
-  groupIfcTreeByRoomNumber,
-  groupIfcTreeBySpatialContainment,
-  useObjectTree
-} from './hooks/useObjectTree'
-import {
-  buildStoreyInfoMap,
-  buildRoomNumberMap,
-  collectContainmentCandidateIds,
-  resolveSpaceFromRelationId,
-  type StoreyInfo
-} from './ifcRoomTree.utils'
-import {
-  CONTAINMENT_RELATION_BATCH_SIZE,
   CUBE_ITEM_PREFIX,
-  ENABLE_ROOM_NUMBER_GROUPING,
-  IFC_LOADER_SETTINGS,
   INVERSE_COORDINATION_MATRIX_CUSTOM_KEY,
-  MAX_CONTAINMENT_RELATION_LOOKUPS,
-  MAX_UNKNOWN_TREE_TYPE_LOOKUPS,
   MODEL_LOAD_TIMEOUT_MS,
-  MOVE_DELTA_CUSTOM_KEY,
-  PLACEMENT_POSITION_CUSTOM_KEY,
   POSITION_EPSILON,
   ROOM_SELECT_Y_OFFSET,
-  ROTATE_DELTA_CUSTOM_KEY,
-  ROTATION_EPSILON,
   SPACE_RELATIVE_POSITION_CUSTOM_KEY,
   SHORTCUTS,
-  UNKNOWN_TREE_TYPE_BATCH_SIZE,
   wasmRootPath
 } from './ifcViewer.constants'
 import {
-  collectContainedRelationIds,
   isSameLoadSource,
-  normalizeIfcTypeValue,
   parseCubeId,
-  resolveContainedSpaceId,
-  resolveIfcTypeFromProperties,
   sanitizeHistoryEntries,
   sanitizeMetadataEntries,
   withTimeout,
   type LoadSource
 } from './ifcViewer.utils'
-import { localizeIfcType } from './utils/ifcTypeLocalization'
+import {
+  removeIfcModelSafely,
+  tuneIfcModelMaterials
+} from './ifcViewer.modelCleanup'
+import {
+  clearLoadedViewerModels,
+  loadIfcModelWithSettings,
+  type Loader
+} from './ifcViewer.loading'
+import {
+  buildUpdatedIfcMetadataEntry,
+  injectMissingInverseCoordinationMatrix,
+  serializeInverseCoordinationMatrix
+} from './ifcViewer.persistence'
+import {
+  buildRoomOptions,
+  buildTreeNodeSelectionMap,
+  collectIfcIdsInSubtree as collectIfcIdsInTreeSubtree,
+  isTreeNodeEditableWithinRoom,
+  resolveContainingRoomNodeId as resolveContainingRoomNodeIdInTree,
+  type RoomListEntry
+} from './ifcViewer.rooms'
+import { collectMaterializedFurnitureItemIds } from './ifcViewer.furnitureReconciliation'
+import { rebuildIfcTreeForModel } from './ifcViewer.treeHydration'
 import './IfcViewer.css'
 
 type IfcViewerProps = {
@@ -84,256 +80,6 @@ type IfcViewerProps = {
   onHistoryChange?: (items: HistoryEntry[]) => void
   onSelectionChange?: (selection: SelectedElement | null) => void
   onResolvePrefabFile?: (prefabId: string) => Promise<File | null>
-}
-
-type Loader = (viewer: IfcViewerAPI) => Promise<any>
-
-type IfcLoaderManagerLike = {
-  applyWebIfcConfig?: (settings: { COORDINATE_TO_ORIGIN?: boolean; USE_FAST_BOOLS?: boolean }) => Promise<void>
-  ifcAPI?: {
-    GetCoordinationMatrix?: (modelID: number) => Promise<number[]> | number[]
-  }
-  setupCoordinationMatrix?: (matrix: Matrix4) => void
-}
-
-type IfcLoadFacadeLike = {
-  loadIfc?: (file: File, fitToFrame?: boolean) => Promise<any>
-  loadIfcUrl?: (url: string, fitToFrame?: boolean) => Promise<any>
-  addIfcModel?: (mesh: any) => void
-  loader?: {
-    loadAsync?: (url: string, onProgress?: (event: any) => Promise<void> | void) => Promise<any>
-    ifcManager?: IfcLoaderManagerLike
-  }
-  context?: {
-    items?: { ifcModels?: unknown[] }
-    fitToFrame?: () => void
-  }
-}
-
-type IfcMeshLike = {
-  modelID?: number
-  geometry?: { dispose?: () => void }
-  material?:
-    | {
-        dispose?: () => void
-        side?: number
-        depthTest?: boolean
-        depthWrite?: boolean
-        transparent?: boolean
-        polygonOffset?: boolean
-        polygonOffsetFactor?: number
-        polygonOffsetUnits?: number
-        needsUpdate?: boolean
-      }
-    | Array<{
-        dispose?: () => void
-        side?: number
-        depthTest?: boolean
-        depthWrite?: boolean
-        transparent?: boolean
-        polygonOffset?: boolean
-        polygonOffsetFactor?: number
-        polygonOffsetUnits?: number
-        needsUpdate?: boolean
-      }>
-}
-
-type IfcSceneLike = {
-  children?: unknown[]
-  remove: (item: unknown) => void
-}
-
-type RoomListEntry = {
-  nodeId: string
-  label: string
-  ifcId: number
-  roomNumber?: string | null
-  storeyId?: string | null
-  storeyLabel?: string | null
-  storeyElevation?: number | null
-}
-
-const disposeMeshResources = (mesh: IfcMeshLike | null | undefined) => {
-  if (!mesh) return
-  mesh.geometry?.dispose?.()
-  if (Array.isArray(mesh.material)) {
-    mesh.material.forEach((material) => material?.dispose?.())
-    return
-  }
-  mesh.material?.dispose?.()
-}
-
-const removeMeshesByModelId = (collection: unknown[] | undefined, modelID: number) => {
-  if (!Array.isArray(collection)) return
-  for (let index = collection.length - 1; index >= 0; index -= 1) {
-    const item = collection[index] as { modelID?: number }
-    if (item?.modelID === modelID) {
-      collection.splice(index, 1)
-    }
-  }
-}
-
-const collectLoadedIfcModelIds = (viewer: IfcViewerAPI, fallbackModelID: number | null): number[] => {
-  const ids = new Set<number>()
-  if (typeof fallbackModelID === 'number') {
-    ids.add(fallbackModelID)
-  }
-
-  const manager = viewer.IFC.loader.ifcManager as {
-    state?: { models?: Record<string, { mesh?: unknown }> }
-  }
-  const models = manager.state?.models ?? {}
-  Object.keys(models).forEach((rawId) => {
-    const parsed = Number(rawId)
-    if (Number.isFinite(parsed)) {
-      ids.add(parsed)
-    }
-  })
-
-  ;(viewer.context.items.ifcModels as Array<{ modelID?: number }>).forEach((mesh) => {
-    if (typeof mesh?.modelID === 'number') {
-      ids.add(mesh.modelID)
-    }
-  })
-
-  return Array.from(ids)
-}
-
-const removeIfcModelSafely = (viewer: IfcViewerAPI, modelID: number) => {
-  const manager = viewer.IFC.loader.ifcManager as {
-    close?: (id: number, scene?: unknown) => void
-    state?: { models?: Record<number, { mesh?: unknown }> }
-  }
-  const scene = viewer.context.getScene() as IfcSceneLike
-
-  if (manager.state?.models?.[modelID]) {
-    try {
-      manager.close?.(modelID, scene)
-    } catch (err) {
-      console.warn('Failed to close IFC model', modelID, err)
-    }
-  } else {
-    try {
-      viewer.IFC.removeIfcModel(modelID)
-    } catch (err) {
-      console.warn('Failed to remove IFC model', modelID, err)
-    }
-  }
-
-  const children = Array.isArray(scene.children) ? [...scene.children] : []
-  children.forEach((child) => {
-    const mesh = child as IfcMeshLike
-    if (mesh?.modelID !== modelID) return
-    scene.remove(child)
-    disposeMeshResources(mesh)
-  })
-
-  removeMeshesByModelId(viewer.context.items.ifcModels as unknown[], modelID)
-  removeMeshesByModelId(viewer.context.items.pickableIfcModels as unknown[], modelID)
-}
-
-const purgeIfcVisuals = (viewer: IfcViewerAPI, modelIDsToRemove: number[]) => {
-  const modelIdSet = new Set(modelIDsToRemove)
-  const scene = viewer.context.getScene() as IfcSceneLike
-  const removed = new Set<unknown>()
-  const stack = Array.isArray(scene.children) ? [...scene.children] : []
-
-  while (stack.length > 0) {
-    const current = stack.pop() as IfcMeshLike & {
-      modelID?: number
-      geometry?: { getAttribute?: (name: string) => unknown; dispose?: () => void }
-      material?: { dispose?: () => void } | Array<{ dispose?: () => void }>
-      children?: unknown[]
-      parent?: { remove?: (item: unknown) => void }
-    }
-    if (!current) continue
-    if (Array.isArray(current.children) && current.children.length > 0) {
-      stack.push(...current.children)
-    }
-
-    const modelID = typeof current.modelID === 'number' ? current.modelID : null
-    const isCustomCube = modelID === CUSTOM_CUBE_MODEL_ID
-    const hasExpressIds = Boolean(current.geometry?.getAttribute?.('expressID'))
-    const shouldRemoveByModelID = modelID !== null && modelIdSet.has(modelID) && !isCustomCube
-    const shouldRemoveOrphanIfcVisual = hasExpressIds && !isCustomCube
-    if (!shouldRemoveByModelID && !shouldRemoveOrphanIfcVisual) continue
-
-    if (current.parent?.remove) {
-      current.parent.remove(current)
-    }
-    disposeMeshResources(current)
-    removed.add(current)
-  }
-
-  const purgeCollection = (collection: unknown[] | undefined) => {
-    if (!Array.isArray(collection)) return
-    for (let index = collection.length - 1; index >= 0; index -= 1) {
-      const item = collection[index] as {
-        modelID?: number
-        geometry?: { getAttribute?: (name: string) => unknown }
-      }
-      const modelID = typeof item?.modelID === 'number' ? item.modelID : null
-      const isCustomCube = modelID === CUSTOM_CUBE_MODEL_ID
-      const hasExpressIds = Boolean(item?.geometry?.getAttribute?.('expressID'))
-      const shouldRemoveByModelID = modelID !== null && modelIdSet.has(modelID) && !isCustomCube
-      const shouldRemoveOrphanIfcVisual = hasExpressIds && !isCustomCube
-      if (removed.has(item) || shouldRemoveByModelID || shouldRemoveOrphanIfcVisual) {
-        collection.splice(index, 1)
-      }
-    }
-  }
-
-  purgeCollection(viewer.context.items.ifcModels as unknown[])
-  purgeCollection(viewer.context.items.pickableIfcModels as unknown[])
-}
-
-const tuneIfcMeshMaterial = (
-  material:
-    | {
-        side?: number
-        depthTest?: boolean
-        depthWrite?: boolean
-        transparent?: boolean
-        polygonOffset?: boolean
-        polygonOffsetFactor?: number
-        polygonOffsetUnits?: number
-        needsUpdate?: boolean
-      }
-    | null
-    | undefined
-) => {
-  if (!material) return
-  // FrontSide is much more stable for IFC models that contain coplanar or duplicated faces.
-  material.side = FrontSide
-  material.depthTest = true
-  material.depthWrite = true
-  material.polygonOffset = false
-  material.polygonOffsetFactor = 0
-  material.polygonOffsetUnits = 0
-  material.needsUpdate = true
-}
-
-const tuneIfcModelMaterials = (model: unknown) => {
-  if (!model) return
-  const stack: Array<
-    IfcMeshLike & {
-      children?: unknown[]
-    }
-  > = [model as IfcMeshLike & { children?: unknown[] }]
-  while (stack.length > 0) {
-    const current = stack.pop()
-    if (!current) continue
-    if (Array.isArray(current.material)) {
-      current.material.forEach((material) => tuneIfcMeshMaterial(material))
-    } else {
-      tuneIfcMeshMaterial(current.material)
-    }
-    if (Array.isArray(current.children) && current.children.length > 0) {
-      current.children.forEach((child) =>
-        stack.push(child as IfcMeshLike & { children?: unknown[] })
-      )
-    }
-  }
 }
 
 // Top-level viewer wiring together scene setup, selection hook, and UI overlays
@@ -370,6 +116,7 @@ const IfcViewer = ({
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
   const [isHydrated, setIsHydrated] = useState(false)
+  const [isFurnitureStateReconciled, setIsFurnitureStateReconciled] = useState(false)
   const furnitureRestoredRef = useRef(false)
   const offsetsRestoredRef = useRef<number | null>(null)
   const [activeModelId, setActiveModelId] = useState<number | null>(null)
@@ -422,6 +169,7 @@ const IfcViewer = ({
     applyVisibilityFilter
   } = useSelectionOffsets(viewerRef)
 
+  // This prepares the persisted custom payload for inserted objects from the current viewer state.
   const buildFurnitureCustom = useCallback(
     async (args?: {
       position?: { x: number; y: number; z: number } | null
@@ -429,9 +177,11 @@ const IfcViewer = ({
       extraCustom?: Record<string, string>
     }) => {
       const custom: Record<string, string> = { ...(args?.extraCustom ?? {}) }
-      const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
-      if (Array.isArray(inverseMatrix) && inverseMatrix.length === 16) {
-        custom[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY] = JSON.stringify(inverseMatrix)
+      const serializedInverseMatrix = serializeInverseCoordinationMatrix(
+        activeModelInverseCoordinationMatrixRef.current
+      )
+      if (serializedInverseMatrix) {
+        custom[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY] = serializedInverseMatrix
       }
 
       const position = args?.position ?? null
@@ -465,7 +215,6 @@ const IfcViewer = ({
     setFurnitureEntries,
     suppressNextFurnitureNotify,
     upsertFurnitureItem,
-    registerCubeFurniture,
     registerUploadedFurniture
   } = useFurnitureState({
     furniture,
@@ -484,51 +233,19 @@ const IfcViewer = ({
   )
 
   useEffect(() => {
-    const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
-    if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return
-    const serializedMatrix = JSON.stringify(inverseMatrix)
-    setFurnitureEntries((prev) => {
-      let changed = false
-      const next = prev.map((item) => {
-        const existingValue = item.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
-        if (typeof existingValue === 'string' && existingValue.trim()) {
-          return item
-        }
-        changed = true
-        return {
-          ...item,
-          custom: {
-            ...(item.custom ?? {}),
-            [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: serializedMatrix
-          }
-        }
-      })
-      return changed ? next : prev
-    })
+    const serializedMatrix = serializeInverseCoordinationMatrix(
+      activeModelInverseCoordinationMatrixRef.current
+    )
+    if (!serializedMatrix) return
+    setFurnitureEntries((prev) => injectMissingInverseCoordinationMatrix(prev, serializedMatrix))
   }, [activeModelId, setFurnitureEntries])
 
   useEffect(() => {
-    const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
-    if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return
-    const serializedMatrix = JSON.stringify(inverseMatrix)
-    setMetadataEntries((prev) => {
-      let changed = false
-      const next = prev.map((entry) => {
-        const existingValue = entry.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
-        if (typeof existingValue === 'string' && existingValue.trim()) {
-          return entry
-        }
-        changed = true
-        return {
-          ...entry,
-          custom: {
-            ...(entry.custom ?? {}),
-            [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: serializedMatrix
-          }
-        }
-      })
-      return changed ? next : prev
-    })
+    const serializedMatrix = serializeInverseCoordinationMatrix(
+      activeModelInverseCoordinationMatrixRef.current
+    )
+    if (!serializedMatrix) return
+    setMetadataEntries((prev) => injectMissingInverseCoordinationMatrix(prev, serializedMatrix))
   }, [activeModelId])
 
   const deletedIfcIds = useMemo(() => {
@@ -540,126 +257,16 @@ const IfcViewer = ({
     })
     return ids
   }, [metadataEntries])
-  const roomOptions = useMemo<RoomListEntry[]>(() => {
-    const roomNumbers = roomNumbersRef.current
-    const storeyOrder: string[] = []
-    const visitNode = (nodeId: string) => {
-      const node = tree.nodes[nodeId]
-      if (!node) return
-      if (node.nodeType === 'ifc' && node.type.toUpperCase() === 'IFCBUILDINGSTOREY') {
-        storeyOrder.push(nodeId)
-      }
-      node.children.forEach(visitNode)
-    }
-    tree.roots.forEach(visitNode)
-
-    const treeIndexByStoreyId = new Map<string, number>()
-    storeyOrder.forEach((storeyId, index) => {
-      treeIndexByStoreyId.set(storeyId, index)
-    })
-
-    const storeyEntries = storeyOrder
-      .map((storeyId) => {
-        const info = storeyInfoByNodeId[storeyId]
-        return {
-          id: storeyId,
-          treeIndex: treeIndexByStoreyId.get(storeyId) ?? Number.MAX_SAFE_INTEGER,
-          elevation: typeof info?.elevation === 'number' ? info.elevation : null
-        }
-      })
-      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-
-    const sortedStoreyEntries = [...storeyEntries].sort((left, right) => {
-      const leftHasElevation = typeof left.elevation === 'number'
-      const rightHasElevation = typeof right.elevation === 'number'
-      if (leftHasElevation && rightHasElevation && left.elevation !== right.elevation) {
-        return (left.elevation ?? 0) - (right.elevation ?? 0)
-      }
-      if (leftHasElevation !== rightHasElevation) {
-        return leftHasElevation ? -1 : 1
-      }
-      return left.treeIndex - right.treeIndex
-    })
-    const storeyLabelById = new Map<string, string>()
-    const storeyElevationById = new Map<string, number | null>()
-    sortedStoreyEntries.forEach((entry, index) => {
-      storeyElevationById.set(entry.id, entry.elevation)
-      storeyLabelById.set(entry.id, `Podlaží ${index + 1}`)
-    })
-
-    const resolveStorey = (nodeId: string): { id: string | null; label: string | null; elevation: number | null } => {
-      let currentId: string | null = nodeId
-      while (currentId) {
-        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[currentId]
-        if (!node) break
-        if (node.nodeType === 'ifc' && node.type.toUpperCase() === 'IFCBUILDINGSTOREY') {
-          return {
-            id: node.id,
-            label: storeyLabelById.get(node.id) ?? node.name?.trim() ?? node.label,
-            elevation: storeyElevationById.get(node.id) ?? null
-          }
-        }
-        currentId = node.parentId
-      }
-      return { id: null, label: 'Nezarazene', elevation: null }
-    }
-
-    return Object.values(tree.nodes)
-      .filter(
-        (node) => node.nodeType === 'ifc' && node.expressID !== null && node.type.toUpperCase() === 'IFCSPACE'
-      )
-      .map((node) => {
-        const roomNumber = roomNumbers.get(node.expressID!) ?? null
-        const storey = resolveStorey(node.id)
-        return {
-          nodeId: node.id,
-          label: 'Mistnost',
-          ifcId: node.expressID!,
-          roomNumber,
-          storeyId: storey.id,
-          storeyLabel: storey.label,
-          storeyElevation: storey.elevation
-        }
-      })
-      .sort((left, right) => {
-        const leftElevation = left.storeyElevation
-        const rightElevation = right.storeyElevation
-        const leftHasElevation = typeof leftElevation === 'number'
-        const rightHasElevation = typeof rightElevation === 'number'
-        if (leftHasElevation && rightHasElevation && leftElevation !== rightElevation) {
-          return leftElevation - rightElevation
-        }
-        if (leftHasElevation !== rightHasElevation) {
-          return leftHasElevation ? -1 : 1
-        }
-
-        const leftStoreyIndex =
-          left.storeyId !== null && left.storeyId !== undefined
-            ? treeIndexByStoreyId.get(left.storeyId) ?? Number.MAX_SAFE_INTEGER
-            : Number.MAX_SAFE_INTEGER
-        const rightStoreyIndex =
-          right.storeyId !== null && right.storeyId !== undefined
-            ? treeIndexByStoreyId.get(right.storeyId) ?? Number.MAX_SAFE_INTEGER
-            : Number.MAX_SAFE_INTEGER
-        if (leftStoreyIndex !== rightStoreyIndex) {
-          return leftStoreyIndex - rightStoreyIndex
-        }
-        const leftKey = left.roomNumber?.trim() || left.label
-        const rightKey = right.roomNumber?.trim() || right.label
-        return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: 'base' })
-      })
-  }, [storeyInfoByNodeId, tree.nodes, tree.roots])
-  const treeNodeBySelectionKey = useMemo(() => {
-    const byKey = new Map<string, string>()
-    Object.values(tree.nodes).forEach((node) => {
-      if (node.expressID === null) return
-      const key = `${node.modelID}:${node.expressID}`
-      if (!byKey.has(key)) {
-        byKey.set(key, node.id)
-      }
-    })
-    return byKey
-  }, [tree.nodes])
+  const roomOptions = useMemo<RoomListEntry[]>(
+    () =>
+      buildRoomOptions({
+        tree,
+        storeyInfoByNodeId,
+        roomNumbers: roomNumbersRef.current
+      }),
+    [storeyInfoByNodeId, tree]
+  )
+  const treeNodeBySelectionKey = useMemo(() => buildTreeNodeSelectionMap(tree.nodes), [tree.nodes])
   const resolveTreeNodeIdForSelection = useCallback(
     (modelID: number, expressID: number): string | null => {
       return treeNodeBySelectionKey.get(`${modelID}:${expressID}`) ?? null
@@ -667,26 +274,13 @@ const IfcViewer = ({
     [treeNodeBySelectionKey]
   )
   const resolveContainingRoomNodeId = useCallback(
-    (nodeId: string | null | undefined): string | null => {
-      let currentId: string | null | undefined = nodeId
-      while (currentId) {
-        const node: (typeof tree.nodes)[string] | undefined = tree.nodes[currentId]
-        if (!node) break
-        if (node.nodeType === 'ifc' && node.type.trim().toUpperCase() === 'IFCSPACE') {
-          return currentId
-        }
-        currentId = node.parentId
-      }
-      return null
-    },
+    (nodeId: string | null | undefined): string | null =>
+      resolveContainingRoomNodeIdInTree(tree.nodes, nodeId),
     [tree.nodes]
   )
   const isNodeEditableWithinRoom = useCallback(
-    (nodeId: string | null | undefined): boolean => {
-      const roomNodeId = resolveContainingRoomNodeId(nodeId)
-      return Boolean(roomNodeId && roomNodeId !== nodeId)
-    },
-    [resolveContainingRoomNodeId]
+    (nodeId: string | null | undefined): boolean => isTreeNodeEditableWithinRoom(tree.nodes, nodeId),
+    [tree.nodes]
   )
   const selectedTransformNodeId = useMemo(() => {
     if (!selectedElement) return null
@@ -711,99 +305,24 @@ const IfcViewer = ({
   }, [lastWalkRoomNodeId, roomOptionsByNodeId])
   const showSidePanel = showTree || showProperties
 
+  // This loads an IFC source while capturing the raw text and coordination matrix used by later editors.
   const loadIfcWithCustomSettings = useCallback(
     async (viewer: IfcViewerAPI, source: { file?: File; url?: string }, fitToFrame: boolean) => {
-      const ifc = viewer.IFC as unknown as IfcLoadFacadeLike
-      const loader = ifc.loader
-      const ifcManager = loader?.ifcManager
       activeModelInverseCoordinationMatrixRef.current = null
       activeIfcTextRef.current = null
-
-      if (!loader?.loadAsync || !ifcManager?.applyWebIfcConfig || typeof ifc.addIfcModel !== 'function') {
-        if (source.file && typeof ifc.loadIfc === 'function') {
-          try {
-            activeIfcTextRef.current = await source.file.text()
-          } catch (error) {
-            console.warn('Failed to read IFC source text from file', error)
-          }
-          return ifc.loadIfc(source.file, fitToFrame)
-        }
-        if (source.url && typeof ifc.loadIfcUrl === 'function') {
-          try {
-            const response = await fetch(source.url)
-            if (response.ok) {
-              activeIfcTextRef.current = await response.text()
-            }
-          } catch (error) {
-            console.warn('Failed to read IFC source text from URL', error)
-          }
-          return ifc.loadIfcUrl(source.url, fitToFrame)
-        }
-        return null
-      }
-
-      await ifcManager.applyWebIfcConfig({
-        // Keep geometry close to origin for stable depth precision.
-        COORDINATE_TO_ORIGIN: true,
-        USE_FAST_BOOLS: false
+      const loaded = await loadIfcModelWithSettings({
+        viewer,
+        source,
+        fitToFrame
       })
-
-      let objectUrl: string | null = null
-      const resolvedUrl = source.file ? ((objectUrl = URL.createObjectURL(source.file)), objectUrl) : source.url
-      if (!resolvedUrl) return null
-
-      try {
-        try {
-          if (source.file) {
-            activeIfcTextRef.current = await source.file.text()
-          } else if (source.url) {
-            const response = await fetch(source.url)
-            if (response.ok) {
-              activeIfcTextRef.current = await response.text()
-            }
-          }
-        } catch (error) {
-          console.warn('Failed to read IFC source text for room-number fallback', error)
-        }
-
-        const model = await loader.loadAsync(resolvedUrl)
-        if (!model) return null
-        ifc.addIfcModel(model)
-
-        const modelId =
-          typeof (model as { modelID?: unknown }).modelID === 'number'
-            ? ((model as { modelID: number }).modelID as number)
-            : null
-        const getCoordinationMatrix = ifcManager.ifcAPI?.GetCoordinationMatrix
-        if (modelId !== null && typeof getCoordinationMatrix === 'function') {
-          try {
-            const rawMatrix = await Promise.resolve(getCoordinationMatrix(modelId))
-            if (Array.isArray(rawMatrix) && rawMatrix.length === 16) {
-              const matrix = new Matrix4().fromArray(
-                rawMatrix.map((value) => Number(value) || 0)
-              )
-              if (Math.abs(matrix.determinant()) > 1e-12) {
-                activeModelInverseCoordinationMatrixRef.current = matrix.clone().invert().toArray()
-              }
-            }
-          } catch (error) {
-            console.warn('Failed to read IFC coordination matrix', error)
-          }
-        }
-
-        if (fitToFrame) {
-          ifc.context?.fitToFrame?.()
-        }
-        return model
-      } finally {
-        if (objectUrl) {
-          URL.revokeObjectURL(objectUrl)
-        }
-      }
+      activeIfcTextRef.current = loaded?.ifcText ?? null
+      activeModelInverseCoordinationMatrixRef.current = loaded?.inverseCoordinationMatrix ?? null
+      return loaded?.model ?? null
     },
     []
   )
 
+  // This appends one history record while keeping the newest edits for the same element near the top.
   const pushHistoryEntry = useCallback((ifcId: number, label: string, timestamp?: string) => {
     const nextTimestamp = timestamp ?? new Date().toISOString()
     setHistoryEntries((prev) => {
@@ -842,6 +361,7 @@ const IfcViewer = ({
     onSelectionChange(selectedElement ?? null)
   }, [onSelectionChange, selectedElement])
 
+  // This inserts or updates one metadata entry without rebuilding the whole metadata array manually.
   const upsertMetadataEntry = useCallback(
     (ifcId: number, updater: (current: MetadataEntry) => MetadataEntry) => {
       setMetadataEntries((prev) => {
@@ -865,6 +385,7 @@ const IfcViewer = ({
     []
   )
 
+  // This syncs a selected custom object back into the furniture state after a transform.
   const syncSelectedCubePosition = useCallback(() => {
     if (!selectedElement || selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) return
     const pos = getSelectedWorldPosition()
@@ -906,6 +427,7 @@ const IfcViewer = ({
     upsertFurnitureItem
   ])
 
+  // This syncs a selected IFC element back into persisted metadata after a transform.
   const syncSelectedIfcPosition = useCallback(() => {
     if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) return
     const resolved =
@@ -921,111 +443,19 @@ const IfcViewer = ({
     const translationDelta = getIfcElementTranslationDelta(selectedElement.modelID, selectedElement.expressID)
     const rotationDelta = getIfcElementRotationDelta(selectedElement.modelID, selectedElement.expressID)
     const base = getIfcElementBasePosition(selectedElement.modelID, selectedElement.expressID) ?? resolved
-    upsertMetadataEntry(selectedElement.expressID, (existing) => {
-      const resolvedType =
-        typeof selectedElement.type === 'string' ? selectedElement.type : existing.type
-      const prev = existing.position
-      const previousDelta = (() => {
-        const raw = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
-        if (!raw) return { dx: 0, dy: 0, dz: 0 }
-        try {
-          const parsed = JSON.parse(raw) as { dx?: number; dy?: number; dz?: number }
-          return {
-            dx: Number.isFinite(parsed.dx) ? Number(parsed.dx) : 0,
-            dy: Number.isFinite(parsed.dy) ? Number(parsed.dy) : 0,
-            dz: Number.isFinite(parsed.dz) ? Number(parsed.dz) : 0
-          }
-        } catch {
-          return { dx: 0, dy: 0, dz: 0 }
-        }
-      })()
-      const nextDelta = translationDelta
-        ? {
-            dx: translationDelta.x,
-            dy: translationDelta.y,
-            dz: translationDelta.z
-          }
-        : prev
-          ? {
-              dx: previousDelta.dx + (resolved.x - prev.x),
-              dy: previousDelta.dy + (resolved.y - prev.y),
-              dz: previousDelta.dz + (resolved.z - prev.z)
-            }
-          : {
-              dx: resolved.x - base.x,
-              dy: resolved.y - base.y,
-              dz: resolved.z - base.z
-            }
-      const nextRotation = rotationDelta
-        ? {
-            x: rotationDelta.x,
-            y: rotationDelta.y,
-            z: rotationDelta.z
-          }
-        : {
-            x: 0,
-            y: 0,
-            z: 0
-          }
-      const moveDeltaJson = JSON.stringify(nextDelta)
-      const rotateDeltaJson = JSON.stringify(nextRotation)
-      const placementPositionJson = placementPosition ? JSON.stringify(placementPosition) : null
-      const inverseCoordinationMatrixJson = (() => {
-        const inverseMatrix = activeModelInverseCoordinationMatrixRef.current
-        if (!Array.isArray(inverseMatrix) || inverseMatrix.length !== 16) return null
-        return JSON.stringify(inverseMatrix)
-      })()
-      const isSamePosition =
-        prev &&
-        Math.abs(prev.x - resolved.x) < POSITION_EPSILON &&
-        Math.abs(prev.y - resolved.y) < POSITION_EPSILON &&
-        Math.abs(prev.z - resolved.z) < POSITION_EPSILON
-      const prevRotation = existing.rotation
-      const isSameRotation =
-        prevRotation &&
-        Math.abs(prevRotation.x - nextRotation.x) < ROTATION_EPSILON &&
-        Math.abs(prevRotation.y - nextRotation.y) < ROTATION_EPSILON &&
-        Math.abs(prevRotation.z - nextRotation.z) < ROTATION_EPSILON
-      const currentDeltaJson = existing.custom?.[MOVE_DELTA_CUSTOM_KEY]
-      const currentRotateDeltaJson = existing.custom?.[ROTATE_DELTA_CUSTOM_KEY]
-      const currentPlacementPositionJson = existing.custom?.[PLACEMENT_POSITION_CUSTOM_KEY]
-      const currentInverseCoordinationJson = existing.custom?.[INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]
-      if (
-        isSamePosition &&
-        isSameRotation &&
-        existing.type === resolvedType &&
-        currentDeltaJson === moveDeltaJson &&
-        currentRotateDeltaJson === rotateDeltaJson &&
-        currentPlacementPositionJson === (placementPositionJson ?? currentPlacementPositionJson) &&
-        currentInverseCoordinationJson === (inverseCoordinationMatrixJson ?? currentInverseCoordinationJson)
-      ) {
-        return existing
-      }
-      return {
-        ...existing,
+    upsertMetadataEntry(selectedElement.expressID, (existing) =>
+      buildUpdatedIfcMetadataEntry({
+        existing,
         ifcId: selectedElement.expressID,
-        type: resolvedType,
-        position: resolved,
-        moveDelta: {
-          x: nextDelta.dx,
-          y: nextDelta.dy,
-          z: nextDelta.dz
-        },
-        rotation: nextRotation,
-        rotateDelta: nextRotation,
-        custom: {
-          ...(existing.custom ?? {}),
-          [MOVE_DELTA_CUSTOM_KEY]: moveDeltaJson,
-          [ROTATE_DELTA_CUSTOM_KEY]: rotateDeltaJson,
-          ...(placementPositionJson
-            ? { [PLACEMENT_POSITION_CUSTOM_KEY]: placementPositionJson }
-            : {}),
-          ...(inverseCoordinationMatrixJson
-            ? { [INVERSE_COORDINATION_MATRIX_CUSTOM_KEY]: inverseCoordinationMatrixJson }
-            : {})
-        }
-      }
-    })
+        resolvedType: selectedElement.type,
+        resolvedPosition: resolved,
+        basePosition: base,
+        translationDelta,
+        rotationDelta,
+        placementPosition,
+        inverseCoordinationMatrix: activeModelInverseCoordinationMatrixRef.current
+      })
+    )
   }, [
     getElementWorldPosition,
     getIfcElementBasePosition,
@@ -1095,17 +525,16 @@ const IfcViewer = ({
     hoverCoords,
     insertTargetCoords,
     addCustomNode,
-    registerCubeFurniture,
     registerUploadedFurniture,
     selectById,
     getElementWorldPosition,
     getIfcElementPlacementPosition,
     ensureIfcPlacementPosition,
     selectCustomCube,
-    spawnCube,
     spawnUploadedModel
   })
 
+  // This persists property edits either to custom furniture state or IFC metadata overrides.
   const handlePropertyFieldChange = useCallback(
     (key: string, value: string) => {
       const previousValue = propertyFields.find((field) => field.key === key)?.value
@@ -1177,6 +606,7 @@ const IfcViewer = ({
     ]
   )
 
+  // This applies the current transform inputs and immediately persists the resulting element state.
   const applyOffsetAndPersist = useCallback(() => {
     if (!canTransformSelected) return
     applyOffsetToSelectedElement()
@@ -1194,6 +624,7 @@ const IfcViewer = ({
     syncSelectedIfcPosition
   ])
 
+  // This deletes custom objects directly and marks IFC elements as deleted for export.
   const handleDeleteSelected = useCallback(() => {
     if (!selectedElement) return
 
@@ -1309,7 +740,73 @@ const IfcViewer = ({
   }, [handleFieldChange, metadataMap, propertyFields, selectedElement])
 
   useEffect(() => {
+    if (!isHydrated || activeModelId === null || tree.roots.length === 0) return
+
+    const viewer = ensureViewer()
+    if (!viewer) {
+      setIsFurnitureStateReconciled(true)
+      return
+    }
+
+    let cancelled = false
+    void (async () => {
+      const materializedItemIds = await collectMaterializedFurnitureItemIds({
+        viewer,
+        tree,
+        modelID: activeModelId,
+        furnitureEntries
+      })
+      if (cancelled) return
+
+      if (materializedItemIds.size > 0) {
+        const customExpressIds = furnitureEntries
+          .map((item) => {
+            if (!materializedItemIds.has(item.id)) return null
+            return item.model === 'cube'
+              ? parseCubeId(item.id)
+              : findCustomObjectExpressIdByItemId(item.id)
+          })
+          .filter((expressID): expressID is number => typeof expressID === 'number')
+
+        customExpressIds.forEach((expressID) => {
+          removeCustomCube(expressID)
+          const customNode = Object.values(tree.nodes).find(
+            (node) =>
+              node.nodeType === 'custom' &&
+              node.modelID === CUSTOM_CUBE_MODEL_ID &&
+              node.expressID === expressID
+          )
+          if (customNode) {
+            removeNode(customNode.id)
+          }
+        })
+
+        setFurnitureEntries((prev) =>
+          prev.filter((item) => !materializedItemIds.has(item.id))
+        )
+      }
+
+      setIsFurnitureStateReconciled(true)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    activeModelId,
+    ensureViewer,
+    findCustomObjectExpressIdByItemId,
+    furnitureEntries,
+    isHydrated,
+    removeCustomCube,
+    removeNode,
+    setFurnitureEntries,
+    tree
+  ])
+
+  useEffect(() => {
     if (!isHydrated || furnitureRestoredRef.current || activeModelId === null || tree.roots.length === 0) return
+    if (!isFurnitureStateReconciled) return
     const viewer = ensureViewer()
     if (!viewer) return
     furnitureEntries.forEach((item) => {
@@ -1352,6 +849,7 @@ const IfcViewer = ({
     findSpaceNodeIdByIfcId,
     findSpaceNodeIdByRoomNumber,
     furnitureEntries,
+    isFurnitureStateReconciled,
     isHydrated,
     setCustomCubeRoomNumber,
     spawnStoredCustomObject,
@@ -1365,7 +863,7 @@ const IfcViewer = ({
   }, [activeModelId, ensureCustomCubesPickable])
 
   useEffect(() => {
-    if (!isHydrated || tree.roots.length === 0) return
+    if (!isHydrated || !isFurnitureStateReconciled || tree.roots.length === 0) return
     const existing = new Set<number>()
     Object.values(tree.nodes).forEach((node) => {
       if (node.nodeType === 'custom' && node.modelID === CUSTOM_CUBE_MODEL_ID && node.expressID !== null) {
@@ -1397,6 +895,7 @@ const IfcViewer = ({
     findSpaceNodeIdByIfcId,
     findSpaceNodeIdByRoomNumber,
     furnitureEntries,
+    isFurnitureStateReconciled,
     isHydrated,
     tree.nodes,
     tree.roots
@@ -1453,296 +952,36 @@ const IfcViewer = ({
     }
   }, [activeModelId, applyVisibilityFilter, deletedIfcIds, hideIfcElement])
 
-  const resolveIfcNodeType = useCallback(
-    async (viewer: IfcViewerAPI, modelID: number, expressID: number): Promise<string | null> => {
-      try {
-        const manager = viewer.IFC?.loader?.ifcManager as
-          | { getIfcType?: (modelID: number, id: number) => string | undefined }
-          | undefined
-        const directType = manager?.getIfcType?.(modelID, expressID)
-        const normalizedDirect = normalizeIfcTypeValue(directType)
-        if (normalizedDirect) {
-          return normalizedDirect
-        }
-      } catch {
-        // Fallback to property read below.
-      }
-
-      try {
-        const props = await viewer.IFC.getProperties(modelID, expressID, false, false)
-        return resolveIfcTypeFromProperties(props)
-      } catch {
-        return null
-      }
-    },
-    []
-  )
-
-  const hydrateUnknownIfcNodeTypes = useCallback(
-    async (
-      viewer: IfcViewerAPI,
-      tree: ObjectTree,
-      modelID: number,
-      loadToken: number
-    ): Promise<ObjectTree> => {
-      const unknownNodes = Object.values(tree.nodes).filter(
-        (node) =>
-          node.nodeType === 'ifc' &&
-          node.expressID !== null &&
-          node.type.toUpperCase() === 'UNKNOWN'
-      )
-      if (unknownNodes.length === 0) return tree
-
-      const lookupNodes =
-        unknownNodes.length > MAX_UNKNOWN_TREE_TYPE_LOOKUPS
-          ? unknownNodes.slice(0, MAX_UNKNOWN_TREE_TYPE_LOOKUPS)
-          : unknownNodes
-
-      if (lookupNodes.length < unknownNodes.length) {
-        console.warn(
-          `Type lookup limited to ${MAX_UNKNOWN_TREE_TYPE_LOOKUPS} of ${unknownNodes.length} IFC nodes.`
-        )
-      }
-
-      const updates = new Map<string, string>()
-      for (let i = 0; i < lookupNodes.length; i += UNKNOWN_TREE_TYPE_BATCH_SIZE) {
-        if (loadTokenRef.current !== loadToken) {
-          return tree
-        }
-        const batch = lookupNodes.slice(i, i + UNKNOWN_TREE_TYPE_BATCH_SIZE)
-        const resolved = await Promise.all(
-          batch.map(async (node) => {
-            const expressID = node.expressID
-            if (expressID === null) return null
-            const resolvedType = await resolveIfcNodeType(viewer, modelID, expressID)
-            if (!resolvedType || resolvedType === 'UNKNOWN') return null
-            return { nodeId: node.id, type: resolvedType }
-          })
-        )
-        resolved.forEach((entry) => {
-          if (!entry) return
-          updates.set(entry.nodeId, entry.type)
-        })
-      }
-
-      if (updates.size === 0) return tree
-
-      const nextNodes: ObjectTree['nodes'] = { ...tree.nodes }
-      updates.forEach((resolvedType, nodeId) => {
-        const node = nextNodes[nodeId]
-        if (!node) return
-        nextNodes[nodeId] = {
-          ...node,
-          type: resolvedType,
-          label: localizeIfcType(resolvedType)
-        }
-      })
-      return {
-        nodes: nextNodes,
-        roots: tree.roots
-      }
-    },
-    [resolveIfcNodeType]
-  )
-
-  const buildSpatialContainmentMap = useCallback(
-    async (
-      viewer: IfcViewerAPI,
-      tree: ObjectTree,
-      modelID: number,
-      loadToken: number
-    ): Promise<Map<number, number>> => {
-      const spaceIds = new Set<number>()
-      Object.values(tree.nodes).forEach((node) => {
-        if (node.nodeType !== 'ifc' || node.expressID === null) return
-        if (node.type.toUpperCase() === 'IFCSPACE') {
-          spaceIds.add(node.expressID)
-        }
-      })
-      if (spaceIds.size === 0) return new Map()
-
-      const candidates = collectContainmentCandidateIds(tree)
-      if (candidates.length === 0) return new Map()
-      const lookupIds =
-        candidates.length > MAX_CONTAINMENT_RELATION_LOOKUPS
-          ? candidates.slice(0, MAX_CONTAINMENT_RELATION_LOOKUPS)
-          : candidates
-
-      if (lookupIds.length < candidates.length) {
-        console.warn(
-          `Containment lookup limited to ${MAX_CONTAINMENT_RELATION_LOOKUPS} of ${candidates.length} IFC nodes.`
-        )
-      }
-
-      const map = new Map<number, number>()
-      const relationSpaceCache = new Map<number, number | null>()
-      for (let i = 0; i < lookupIds.length; i += CONTAINMENT_RELATION_BATCH_SIZE) {
-        if (loadTokenRef.current !== loadToken) {
-          return map
-        }
-        const batch = lookupIds.slice(i, i + CONTAINMENT_RELATION_BATCH_SIZE)
-        const entries = await Promise.all(
-          batch.map(async (expressID) => {
-            try {
-              const properties = await viewer.IFC.getProperties(modelID, expressID, false, true)
-              let spaceId = resolveContainedSpaceId(properties)
-
-              if (spaceId === null) {
-                const relationIds = collectContainedRelationIds(properties)
-                for (const relationId of relationIds) {
-                  let cachedSpace = relationSpaceCache.get(relationId)
-                  if (cachedSpace === undefined) {
-                    cachedSpace = await resolveSpaceFromRelationId(viewer, modelID, relationId)
-                    relationSpaceCache.set(relationId, cachedSpace)
-                  }
-                  if (cachedSpace !== null && spaceIds.has(cachedSpace)) {
-                    spaceId = cachedSpace
-                    break
-                  }
-                }
-              }
-
-              if (spaceId === null || !spaceIds.has(spaceId)) return null
-              return [expressID, spaceId] as const
-            } catch (err) {
-              console.warn('Failed to resolve IfcRelContainedInSpatialStructure for', expressID, err)
-              return null
-            }
-          })
-        )
-        entries.forEach((entry) => {
-          if (!entry) return
-          map.set(entry[0], entry[1])
-        })
-      }
-
-      return map
-    },
-    []
-  )
-
+  // This rebuilds the sidebar tree through the shared hydration pipeline used for IFC model loads.
   const rebuildTreeForModel = useCallback(
     async (modelID: number, loadToken: number) => {
       const viewer = viewerRef.current
       if (!viewer) return
-      try {
-        const spatial = await viewer.IFC.getSpatialStructure(modelID)
-        if (loadTokenRef.current !== loadToken) return
-        try {
-          const rawTree = buildIfcTree(spatial, modelID)
-          if (loadTokenRef.current !== loadToken) return
-          roomNumbersRef.current = new Map()
-          setStoreyInfoByNodeId({})
-          setIfcTree(rawTree, modelID)
-          setSelectedNodeId(rawTree.roots[0] ?? null)
-
-          // Enrich labels/relations in background so loading is never blocked by heavy IFC relation traversal.
-          void (async () => {
-            let nextTree = rawTree
-
-            try {
-              const storeyInfo = await buildStoreyInfoMap(viewer, rawTree, modelID)
-              if (loadTokenRef.current !== loadToken) return
-              setStoreyInfoByNodeId(Object.fromEntries(storeyInfo))
-            } catch (err) {
-              console.warn('Failed to read storey elevation info', err)
-            }
-
-            try {
-              const hydratedTree = await hydrateUnknownIfcNodeTypes(viewer, nextTree, modelID, loadToken)
-              if (loadTokenRef.current !== loadToken) return
-              if (hydratedTree !== nextTree) {
-                nextTree = hydratedTree
-                setIfcTree(nextTree, modelID)
-              }
-            } catch (err) {
-              console.warn('Failed to hydrate UNKNOWN IFC node labels', err)
-            }
-
-            try {
-              const containmentMap = await buildSpatialContainmentMap(viewer, nextTree, modelID, loadToken)
-              if (loadTokenRef.current !== loadToken) return
-              const containedTree = groupIfcTreeBySpatialContainment(nextTree, containmentMap)
-              if (containedTree !== nextTree) {
-                nextTree = containedTree
-                setIfcTree(nextTree, modelID)
-              }
-            } catch (err) {
-              console.warn('Failed to group tree nodes by IfcRelContainedInSpatialStructure', err)
-            }
-
-            // Optional grouping: if room numbers exist in Psets, move elements under the matching IfcSpace.
-            if (ENABLE_ROOM_NUMBER_GROUPING) {
-              try {
-                const roomNumbers = await buildRoomNumberMap(
-                  viewer,
-                  nextTree,
-                  modelID,
-                  activeIfcTextRef.current
-                )
-                if (loadTokenRef.current !== loadToken) return
-                roomNumbersRef.current = roomNumbers
-                const roomGroupedTree = groupIfcTreeByRoomNumber(nextTree, roomNumbers)
-                if (roomGroupedTree !== nextTree) {
-                  nextTree = roomGroupedTree
-                  setIfcTree(nextTree, modelID)
-                }
-              } catch (err) {
-                console.warn('Failed to group storey nodes by room number', err)
-              }
-            }
-          })()
-        } catch (err) {
-          console.error('Failed to build IFC tree', err)
-          resetTree()
-          setSelectedNodeId(null)
-          setStoreyInfoByNodeId({})
+      await rebuildIfcTreeForModel({
+        viewer,
+        modelID,
+        loadToken,
+        activeIfcText: activeIfcTextRef.current,
+        isLoadTokenCurrent: (token) => loadTokenRef.current === token,
+        setIfcTree,
+        resetTree,
+        setSelectedNodeId,
+        setStoreyInfoByNodeId,
+        setRoomNumbers: (roomNumbers) => {
+          roomNumbersRef.current = roomNumbers
         }
-      } catch (err) {
-        if (loadTokenRef.current !== loadToken) return
-        console.error('Failed to build IFC tree', err)
-        resetTree()
-        setSelectedNodeId(null)
-        setStoreyInfoByNodeId({})
-      }
+      })
     },
-    [buildSpatialContainmentMap, hydrateUnknownIfcNodeTypes, resetTree, setIfcTree]
+    [resetTree, setIfcTree]
   )
 
   const collectIfcIdsInSubtree = useCallback(
-    (rootNodeId: string): { modelID: number | null; ids: number[] } => {
-      const root = tree.nodes[rootNodeId]
-      if (!root) return { modelID: null, ids: [] }
-
-      let modelID: number | null = root.nodeType === 'ifc' ? root.modelID : null
-      const ids = new Set<number>()
-      const stack = [rootNodeId]
-
-      while (stack.length > 0) {
-        const nodeId = stack.pop()
-        if (!nodeId) continue
-        const node = tree.nodes[nodeId]
-        if (!node) continue
-
-        if (node.nodeType === 'ifc' && node.expressID !== null) {
-          if (modelID === null) {
-            modelID = node.modelID
-          }
-          if (node.modelID === modelID) {
-            ids.add(node.expressID)
-          }
-        }
-
-        if (node.children.length > 0) {
-          stack.push(...node.children)
-        }
-      }
-
-      return { modelID, ids: Array.from(ids) }
-    },
-    [tree.nodes]
+    (rootNodeId: string): { modelID: number | null; ids: number[] } =>
+      collectIfcIdsInTreeSubtree(tree, rootNodeId),
+    [tree]
   )
 
+  // This maps a tree click to either a custom object selection or an IFC highlight/selection flow.
   const handleTreeSelect = useCallback(
     async (nodeId: string) => {
       setSelectedNodeId(nodeId)
@@ -1789,6 +1028,7 @@ const IfcViewer = ({
     ]
   )
 
+  // This focuses the selected room and updates the active room context used by the side panel.
   const handleRoomSelect = useCallback(
     async (nodeId: string) => {
       setLastWalkRoomNodeId(nodeId)
@@ -1840,6 +1080,7 @@ const IfcViewer = ({
     setLastWalkRoomNodeId(null)
   }, [lastWalkRoomNodeId, tree.nodes])
 
+  // This replaces the current scene with a newly loaded model and rebuilds all derived viewer state.
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
       const token = ++loadTokenRef.current
@@ -1852,25 +1093,22 @@ const IfcViewer = ({
       setLastWalkRoomNodeId(null)
       setActiveModelId(null)
       setStoreyInfoByNodeId({})
+      setIsFurnitureStateReconciled(false)
       roomNumbersRef.current = new Map()
       activeIfcTextRef.current = null
       offsetsRestoredRef.current = null
       furnitureRestoredRef.current = false
 
-      // Hard reset viewer instance so the next load always starts from an empty scene.
-      const previousViewer = viewerRef.current
-      if (previousViewer) {
+      // Reuse the existing viewer so repeated file loads do not leak WebGL contexts.
+      const existingViewer = viewerRef.current
+      if (existingViewer) {
         stopWalkMovementLoop()
-        const loadedModelIds = collectLoadedIfcModelIds(previousViewer, lastModelIdRef.current)
-        loadedModelIds.forEach((modelID) => {
-          clearOffsetArtifacts(modelID)
-          removeIfcModelSafely(previousViewer, modelID)
+        clearLoadedViewerModels({
+          viewer: existingViewer,
+          lastModelId: lastModelIdRef.current,
+          clearOffsetArtifacts
         })
-        purgeIfcVisuals(previousViewer, loadedModelIds)
-        previousViewer.dispose()
-        viewerRef.current = null
       }
-      containerRef.current?.replaceChildren()
       lastModelIdRef.current = null
       const viewer = ensureViewer()
       if (!viewer) {
@@ -1881,7 +1119,6 @@ const IfcViewer = ({
       applyNavigationMode(viewer)
 
       try {
-        await viewer.IFC.applyWebIfcConfig(IFC_LOADER_SETTINGS)
         const model = await withTimeout(loader(viewer), MODEL_LOAD_TIMEOUT_MS, 'IFC model loading')
         if (!model) {
           throw new Error('IFC model could not be loaded.')
@@ -1909,7 +1146,6 @@ const IfcViewer = ({
         console.error('Failed to load IFC model', err)
         setError('Failed to load IFC model. Check the console for details.')
         setStatus(null)
-        lastLoadSourceRef.current = { kind: 'none' }
         resetTree()
       }
     },
@@ -1917,6 +1153,7 @@ const IfcViewer = ({
       clearOffsetArtifacts,
       ensureViewer,
       rebuildTreeForModel,
+      stopWalkMovementLoop,
       resetSelection,
       resetTree
     ]
@@ -1942,6 +1179,7 @@ const IfcViewer = ({
       setSelectedNodeId(null)
       setLastWalkRoomNodeId(null)
       setActiveModelId(null)
+      setIsFurnitureStateReconciled(false)
       offsetsRestoredRef.current = null
       furnitureRestoredRef.current = false
       roomNumbersRef.current = new Map()
@@ -1983,6 +1221,7 @@ const IfcViewer = ({
     setStatus(null)
   }, [defaultModelUrl, file, loadIfcWithCustomSettings])
 
+  // This resolves a prefab file and inserts it either at the requested node or at the current cursor target.
   const handleInsertPrefab = useCallback(
     async (prefabId: string, nodeId?: string | null) => {
       if (!onResolvePrefabFile) {

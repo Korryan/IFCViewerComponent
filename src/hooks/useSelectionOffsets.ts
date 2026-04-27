@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
 // Encapsulates selection, IFC property fetching, and offset/subset handling
-import { Matrix4, Mesh, MeshStandardMaterial, Vector3 } from 'three'
+import { Vector3 } from 'three'
 import type { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
 import type {
   FurnitureGeometry,
@@ -10,22 +10,9 @@ import type {
   SelectedElement
 } from '../ifcViewerTypes'
 import {
-  CUSTOM_CUBE_MODEL_ID,
   normalizeCoordinateValue,
-  pointToOffsetVector,
   zeroOffset
 } from './selectionOffsets.shared'
-import {
-  getMovedIdsForModel as getMovedIdsForModelFromSubsets,
-  removeMovedSubset
-} from './selectionOffsets.subsets'
-import {
-  clearOffsetArtifacts as clearOffsetArtifactsInternal,
-  configureSpaceBiasTargets as configureSpaceBiasTargetsInternal,
-  ensureBaseSubset as ensureBaseSubsetInternal,
-  updateSpaceBiasSubset as updateSpaceBiasSubsetInternal,
-  updateVisibilityForModel as updateVisibilityForModelInternal
-} from './selectionOffsets.subsetState'
 import {
   ensureIfcPlacementPosition as ensureIfcPlacementPositionInternal,
   getBaseCenter as getBaseCenterInternal,
@@ -40,6 +27,9 @@ import {
 import {
   buildPropertyFields as buildIfcPropertyFields
 } from './selectionOffsets.properties'
+import {
+  isIfcSelectionAllowed as isIfcSelectionAllowedInternal
+} from './selectionOffsets.ifcTypes'
 import {
   getExpressIdFromHit as getExpressIdFromPickHit,
   pickCandidatesAtPoint,
@@ -67,36 +57,20 @@ import {
   rotateSelectedElement
 } from './selectionOffsets.transforms'
 import {
-  buildCustomPropertyFields as buildCustomPropertyFieldsFromRegistry,
-  findCustomObjectExpressIdByItemId as findCustomObjectExpressIdByItemIdInRegistry,
-  getCustomObjectState as getCustomObjectStateFromRegistry,
-  removeCustomObject,
-  setCustomObjectItemId as setCustomObjectItemIdInRegistry,
-  setCustomObjectRoomNumber as setCustomObjectRoomNumberInRegistry,
-  setCustomObjectSpaceIfcId as setCustomObjectSpaceIfcIdInRegistry,
-  spawnCubeObject,
-  spawnStoredCustomObject as spawnStoredCustomRegistryObject,
-  spawnUploadedCustomObject,
-  ensureCustomObjectsPickable,
-  type CustomObjectRegistryRefs,
   type CustomObjectState,
   type SpawnedCubeInfo,
-  type SpawnedModelInfo,
-  type SpawnStoredCustomObjectArgs
+  type SpawnedModelInfo
 } from './selectionOffsets.customRegistry'
+import { useSelectionOffsetRefs } from './useSelectionOffsetRefs'
+import { useSelectionOffsetsVisibility } from './useSelectionOffsetsVisibility'
+import { useSelectionOffsetsCustomObjects } from './useSelectionOffsetsCustomObjects'
 
 export { CUSTOM_CUBE_MODEL_ID } from './selectionOffsets.shared'
 export type { PickCandidate } from './selectionOffsets.picking'
 
-const tuneSpaceBiasSubsetMesh = (_mesh: Mesh | null | undefined) => {}
-
 type SpawnCubeOptions = {
   focus?: boolean
   id?: number
-}
-
-type SelectionTypeFilterOptions = {
-  allowedIfcTypes?: string[]
 }
 
 type UseSelectionOffsetsResult = {
@@ -174,113 +148,33 @@ type UseSelectionOffsetsResult = {
 export const useSelectionOffsets = (
   viewerRef: { current: IfcViewerAPI | null }
 ): UseSelectionOffsetsResult => {
-  // Local caches for subsets/cubes/offsets; kept outside React state to avoid re-renders
-  const propertyRequestRef = useRef(0)
-  const baseSubsetsRef = useRef<Map<number, Mesh>>(new Map())
-  const movedSubsetsRef = useRef<Map<string, Mesh>>(new Map())
-  const spaceBiasSubsetsRef = useRef<Map<number, Mesh>>(new Map())
-  const spaceBiasIdsRef = useRef<Map<number, Set<number>>>(new Map())
-  const spaceBiasAppliedRef = useRef<Map<number, Set<number>>>(new Map())
-  const hiddenIdsRef = useRef<Map<number, Set<number>>>(new Map())
-  const elementOffsetsRef = useRef<Map<string, OffsetVector>>(new Map())
-  const elementRotationsRef = useRef<Map<string, Point3D>>(new Map())
-  const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
-  const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
-  const placementOriginsRef = useRef<Map<string, Point3D>>(new Map())
-  const coordinationMatrixRef = useRef<Map<number, Matrix4 | null>>(new Map())
-  const filterSubsetsRef = useRef<Map<number, Mesh>>(new Map())
-  const filterIdsRef = useRef<Map<number, Set<number> | null>>(new Map())
-  const cubeRegistryRef = useRef<Map<number, Mesh>>(new Map())
-  const cubeIdCounterRef = useRef(1)
-  const highlightedCubeRef = useRef<number | null>(null)
-  const highlightedIfcRef = useRef<{ modelID: number; expressID: number } | null>(null)
-  const selectionSubsetsRef = useRef<Map<number, Mesh>>(new Map())
-  const selectionMaterialRef = useRef<MeshStandardMaterial | null>(null)
-  const focusOffsetRef = useRef<Point3D | null>(null)
-  const customCubeRoomsRef = useRef<Map<number, string>>(new Map())
-  const customObjectSpaceIfcIdsRef = useRef<Map<number, number>>(new Map())
-  const customObjectModelsRef = useRef<Map<number, string>>(new Map())
-  const customObjectNamesRef = useRef<Map<number, string>>(new Map())
-  const customObjectItemIdsRef = useRef<Map<number, string>>(new Map())
-  const customObjectSourceFilesRef = useRef<Map<number, string>>(new Map())
-  const customObjectRegistryRefs = useMemo<CustomObjectRegistryRefs>(
-    () => ({
-      cubeRegistryRef,
-      cubeIdCounterRef,
-      highlightedCubeRef,
-      customCubeRoomsRef,
-      customObjectSpaceIfcIdsRef,
-      customObjectModelsRef,
-      customObjectNamesRef,
-      customObjectItemIdsRef,
-      customObjectSourceFilesRef
-    }),
-    []
-  )
+  // This hook builds the mutable cache refs used by selection, subsets, and custom objects.
+  const refs = useSelectionOffsetRefs()
+  const {
+    propertyRequestRef,
+    baseSubsetsRef,
+    movedSubsetsRef,
+    elementOffsetsRef,
+    elementRotationsRef,
+    baseCentersRef,
+    placementOriginsRef,
+    coordinationMatrixRef,
+    cubeRegistryRef,
+    cubeIdCounterRef,
+    filterIdsRef,
+    highlightedIfcRef,
+    selectionSubsetsRef,
+    selectionMaterialRef,
+    focusOffsetRef,
+    customObjectRegistryRefs
+  } = refs
 
   const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null)
   const [offsetInputs, setOffsetInputs] = useState<OffsetVector>(zeroOffset)
   const [propertyFields, setPropertyFields] = useState<PropertyField[]>([])
   const [propertyError, setPropertyError] = useState<string | null>(null)
   const [isFetchingProperties, setIsFetchingProperties] = useState(false)
-  const normalizeIfcTypeName = useCallback((value: unknown): string | null => {
-    if (typeof value !== 'string') return null
-    const trimmed = value.trim()
-    return trimmed ? trimmed.toUpperCase() : null
-  }, [])
-
-  const resolveIfcTypeName = useCallback(
-    async (viewer: IfcViewerAPI, modelID: number, expressID: number): Promise<string | null> => {
-      try {
-        const manager = viewer.IFC?.loader?.ifcManager as
-          | { getIfcType?: (idModel: number, idExpress: number) => string | undefined }
-          | undefined
-        const directType = manager?.getIfcType?.(modelID, expressID)
-        if (directType) {
-          return normalizeIfcTypeName(directType)
-        }
-
-        const props = await viewer.IFC.getProperties(modelID, expressID, false, false)
-        return normalizeIfcTypeName(
-          typeof props?.ifcClass === 'string'
-            ? props.ifcClass
-            : typeof props?.type === 'string'
-              ? props.type
-              : null
-        )
-      } catch (err) {
-        console.warn('Failed to resolve IFC type for selection filter', expressID, err)
-        return null
-      }
-    },
-    [normalizeIfcTypeName]
-  )
-
-  const isIfcSelectionAllowed = useCallback(
-    async (
-      viewer: IfcViewerAPI,
-      modelID: number,
-      expressID: number,
-      options?: SelectionTypeFilterOptions
-    ): Promise<boolean> => {
-      const allowedIfcTypes = options?.allowedIfcTypes
-      if (!allowedIfcTypes || allowedIfcTypes.length === 0) {
-        return true
-      }
-      const normalizedAllowed = new Set(
-        allowedIfcTypes
-          .map((typeName) => normalizeIfcTypeName(typeName))
-          .filter((typeName): typeName is string => Boolean(typeName))
-      )
-      if (normalizedAllowed.size === 0) {
-        return true
-      }
-      const resolvedType = await resolveIfcTypeName(viewer, modelID, expressID)
-      return Boolean(resolvedType && normalizedAllowed.has(resolvedType))
-    },
-    [normalizeIfcTypeName, resolveIfcTypeName]
-  )
-
+  // This function clears any active IFC highlight subset for the current selection or one specific model.
   const clearIfcSelectionHighlight = useCallback(
     (modelID?: number | null) => {
       clearIfcSelectionHighlightInternal({
@@ -293,14 +187,17 @@ export const useSelectionOffsets = (
     [viewerRef]
   )
 
+  // This function moves the camera focus to the provided point using the shared viewer navigation helper.
   const focusOnPoint = useCallback((point: Point3D | null) => {
     focusViewerOnPoint(viewerRef.current, point)
   }, [viewerRef])
 
+  // This function updates the highlighted custom object id used by cube and prefab selection.
   const setCubeHighlight = useCallback((expressID: number | null) => {
     setHighlightedCustomObject(customObjectRegistryRefs, expressID)
   }, [customObjectRegistryRefs])
 
+  // This function returns the current world-space position of the selected IFC element or custom object.
   const getSelectedWorldPosition = useCallback((): Vector3 | null => {
     return getSelectedElementWorldPosition({
       selectedElement,
@@ -309,6 +206,7 @@ export const useSelectionOffsets = (
     })
   }, [offsetInputs, selectedElement])
 
+  // This function clears inspector state, pending property requests, and active viewer highlights in one step.
   const resetSelection = useCallback(() => {
     resetSelectionState({
       propertyRequestRef,
@@ -324,10 +222,12 @@ export const useSelectionOffsets = (
     })
   }, [clearIfcSelectionHighlight, customObjectRegistryRefs, viewerRef])
 
+  // This function builds the stable internal key used to cache per-element transform state.
   const getElementKey = useCallback((modelID: number, expressID: number) => {
     return `${modelID}:${expressID}`
   }, [])
 
+  // This function primes the cached IFC placement origin used to resolve later move deltas consistently.
   const primeIfcPlacementOrigin = useCallback(
     async (modelID: number, expressID: number, properties?: any): Promise<Point3D | null> => {
       const viewer = viewerRef.current
@@ -345,6 +245,7 @@ export const useSelectionOffsets = (
     [getElementKey, viewerRef]
   )
 
+  // This function returns the base model offset derived from the stored base subset for one IFC model.
   const getModelBaseOffset = useCallback(
     (modelID: number): OffsetVector => {
       return getModelBaseOffsetInternal({
@@ -356,74 +257,25 @@ export const useSelectionOffsets = (
     [viewerRef]
   )
 
-  const removePickable = useCallback((viewer: IfcViewerAPI, mesh: Mesh) => {
-    const pickables = viewer.context.items.pickableIfcModels
-    const index = pickables.indexOf(mesh as any)
-    if (index !== -1) {
-      pickables.splice(index, 1)
-    }
-  }, [])
+  // This hook builds the visibility, subset, and renderable-id callbacks used by the selection runtime.
+  const {
+    removePickable,
+    registerPickable,
+    hasRenderableExpressId,
+    ensureBaseSubset,
+    clearOffsetArtifacts,
+    updateVisibilityForModel,
+    applyVisibilityFilter,
+    hideIfcElement,
+    configureSpaceBiasTargets
+  } = useSelectionOffsetsVisibility({
+    viewerRef,
+    refs,
+    getElementKey,
+    clearIfcSelectionHighlight
+  })
 
-  const registerPickable = useCallback(
-    (viewer: IfcViewerAPI, mesh: Mesh, slot?: number) => {
-      const pickables = viewer.context.items.pickableIfcModels
-      if (typeof slot === 'number') {
-        pickables[slot] = mesh as any
-        return
-      }
-      if (!pickables.includes(mesh as any)) {
-        pickables.push(mesh as any)
-      }
-    },
-    []
-  )
-
-  const getExpressIdSet = useCallback(
-    (modelID: number) => {
-      const cached = expressIdCacheRef.current.get(modelID)
-      if (cached && cached.size > 0) return cached
-
-      const viewer = viewerRef.current
-      const model = viewer?.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh as Mesh | undefined
-      const expressAttr = model?.geometry.getAttribute('expressID')
-      if (!expressAttr || !('array' in expressAttr)) {
-        // Model/geometry might not be ready yet. Do not cache empty permanently.
-        return cached ?? new Set<number>()
-      }
-
-      const uniqueIds = new Set<number>()
-      Array.from((expressAttr as { array: ArrayLike<number> }).array).forEach((rawId) => {
-        if (typeof rawId === 'number') {
-          uniqueIds.add(Math.trunc(rawId))
-        }
-      })
-
-      if (uniqueIds.size > 0) {
-        expressIdCacheRef.current.set(modelID, uniqueIds)
-      } else if (!cached) {
-        expressIdCacheRef.current.set(modelID, uniqueIds)
-      }
-      return uniqueIds
-    },
-    [viewerRef]
-  )
-
-  const getAllExpressIdsForModel = useCallback(
-    (modelID: number) => {
-      // Extract every expressID present in a model geometry
-      const ids = getExpressIdSet(modelID)
-      return ids.size > 0 ? Array.from(ids) : []
-    },
-    [getExpressIdSet]
-  )
-
-  const hasRenderableExpressId = useCallback(
-    (modelID: number, expressID: number) => {
-      return getExpressIdSet(modelID).has(expressID)
-    },
-    [getExpressIdSet]
-  )
-
+  // This function applies the single-element IFC highlight subset used by the active selection.
   const applyIfcSelectionHighlight = useCallback(
     (modelID: number, expressID: number) => {
       applyIfcSelectionHighlightInternal({
@@ -442,6 +294,7 @@ export const useSelectionOffsets = (
     [getElementKey, hasRenderableExpressId, viewerRef]
   )
 
+  // This function highlights a whole IFC group while optionally remembering one anchor express id.
   const highlightIfcGroup = useCallback(
     (modelID: number, expressIDs: number[], options?: { anchorExpressID?: number | null }) => {
       highlightIfcGroupInternal({
@@ -461,6 +314,7 @@ export const useSelectionOffsets = (
     [getElementKey, hasRenderableExpressId, viewerRef]
   )
 
+  // This function resolves and caches the base center used for IFC transform previews and focusing.
   const getBaseCenter = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       const viewer = viewerRef.current
@@ -477,6 +331,7 @@ export const useSelectionOffsets = (
     [getElementKey, hasRenderableExpressId, viewerRef]
   )
 
+  // This function resolves the current world-space position for one IFC element after all applied offsets.
   const getElementWorldPosition = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       return getElementWorldPositionInternal({
@@ -491,6 +346,7 @@ export const useSelectionOffsets = (
     [getBaseCenter, getElementKey]
   )
 
+  // This function resolves the original base position for one IFC element before editor transforms.
   const getIfcElementBasePosition = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       return getIfcElementBasePositionInternal({
@@ -503,6 +359,7 @@ export const useSelectionOffsets = (
     [getBaseCenter]
   )
 
+  // This function resolves the placement-space position currently used to export one IFC element.
   const getIfcElementPlacementPosition = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       return getIfcElementPlacementPositionInternal({
@@ -520,6 +377,7 @@ export const useSelectionOffsets = (
     [getBaseCenter, getElementKey, viewerRef]
   )
 
+  // This function ensures the placement-space position is available even when it must be lazily derived first.
   const ensureIfcPlacementPosition = useCallback(
     async (modelID: number, expressID: number): Promise<Point3D | null> => {
       const viewer = viewerRef.current
@@ -535,6 +393,7 @@ export const useSelectionOffsets = (
     [getIfcElementPlacementPosition, primeIfcPlacementOrigin, viewerRef]
   )
 
+  // This function computes the translation delta between the original IFC placement and the current editor position.
   const getIfcElementTranslationDelta = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       return getIfcElementTranslationDeltaInternal({
@@ -550,6 +409,7 @@ export const useSelectionOffsets = (
     [getBaseCenter, getElementKey, getIfcElementPlacementPosition]
   )
 
+  // This function returns the current rotation delta stored for one IFC element or custom object.
   const getIfcElementRotationDelta = useCallback(
     (modelID: number, expressID: number): Point3D | null => {
       return getIfcElementRotationDeltaInternal({
@@ -563,148 +423,7 @@ export const useSelectionOffsets = (
     [getElementKey]
   )
 
-  const ensureBaseSubset = useCallback(
-    (modelID: number) => {
-      const viewer = viewerRef.current
-      if (!viewer) return null
-      return ensureBaseSubsetInternal({
-        viewer,
-        modelID,
-        baseSubsetsRef,
-        getAllExpressIdsForModel,
-        registerPickable
-      })
-    },
-    [getAllExpressIdsForModel, registerPickable, viewerRef]
-  )
-
-  const getMovedIdsForModel = useCallback((modelID: number) => {
-    return getMovedIdsForModelFromSubsets(movedSubsetsRef.current, modelID)
-  }, [])
-
-  const updateSpaceBiasSubset = useCallback(
-    (modelID: number, allowedIds: Set<number> | null) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      updateSpaceBiasSubsetInternal({
-        viewer,
-        modelID,
-        allowedIds,
-        baseSubsetsRef,
-        spaceBiasSubsetsRef,
-        spaceBiasIdsRef,
-        getMovedIdsForModel,
-        registerPickable,
-        removePickable,
-        tuneSpaceBiasSubsetMesh
-      })
-    },
-    [getMovedIdsForModel, registerPickable, removePickable, viewerRef]
-  )
-
-  const configureSpaceBiasTargets = useCallback(
-    (modelID: number, _expressIDs: number[]) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      configureSpaceBiasTargetsInternal({
-        viewer,
-        modelID,
-        baseSubsetsRef,
-        spaceBiasAppliedRef,
-        spaceBiasIdsRef,
-        filterIdsRef,
-        ensureBaseSubset,
-        updateSpaceBiasSubset
-      })
-    },
-    [ensureBaseSubset, updateSpaceBiasSubset, viewerRef]
-  )
-
-  const clearOffsetArtifacts = useCallback(
-    (modelID?: number | null) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      clearOffsetArtifactsInternal({
-        viewer,
-        modelID,
-        baseSubsetsRef,
-        spaceBiasSubsetsRef,
-        selectionSubsetsRef,
-        movedSubsetsRef,
-        filterSubsetsRef,
-        filterIdsRef,
-        elementOffsetsRef,
-        elementRotationsRef,
-        hiddenIdsRef,
-        expressIdCacheRef,
-        baseCentersRef,
-        placementOriginsRef,
-        coordinationMatrixRef,
-        highlightedIfcRef,
-        spaceBiasIdsRef,
-        spaceBiasAppliedRef,
-        registerPickable,
-        removePickable,
-        customObjectRegistryRefs
-      })
-    },
-    [
-      customObjectRegistryRefs,
-      registerPickable,
-      removePickable,
-      viewerRef
-    ]
-  )
-
-  const updateVisibilityForModel = useCallback(
-    (modelID: number, allowedIds: Set<number> | null) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      updateVisibilityForModelInternal({
-        viewer,
-        modelID,
-        allowedIds,
-        filterIdsRef,
-        hiddenIdsRef,
-        filterSubsetsRef,
-        movedSubsetsRef,
-        baseSubsetsRef,
-        ensureBaseSubset,
-        getMovedIdsForModel,
-        getAllExpressIdsForModel,
-        updateSpaceBiasSubset,
-        registerPickable,
-        removePickable
-      })
-    },
-    [
-      ensureBaseSubset,
-      getAllExpressIdsForModel,
-      getMovedIdsForModel,
-      registerPickable,
-      removePickable,
-      updateSpaceBiasSubset,
-      viewerRef
-    ]
-  )
-
-  const applyVisibilityFilter = useCallback(
-    (modelID: number, visibleIds: number[] | null) => {
-      const allowed =
-        visibleIds === null ? null : new Set(visibleIds.filter(Number.isFinite))
-      filterIdsRef.current.set(modelID, allowed)
-      updateVisibilityForModel(modelID, allowed)
-    },
-    [updateVisibilityForModel]
-  )
-
-  const buildPropertyFields = useCallback(
-    (rawProperties: any): PropertyField[] => {
-      return buildIfcPropertyFields(rawProperties)
-    },
-    []
-  )
-
+  // This function loads IFC properties for one element and synchronizes the inspector state around that selection.
   const fetchProperties = useCallback(
     async (modelID: number, expressID: number, focusPoint?: Point3D | null) => {
       const viewer = viewerRef.current
@@ -717,7 +436,7 @@ export const useSelectionOffsets = (
         propertyRequestRef,
         focusOffsetRef,
         elementOffsetsRef,
-        buildPropertyFields,
+        buildPropertyFields: buildIfcPropertyFields,
         getElementKey,
         getElementWorldPosition,
         getModelBaseOffset,
@@ -731,7 +450,6 @@ export const useSelectionOffsets = (
       })
     },
     [
-      buildPropertyFields,
       getBaseCenter,
       getElementKey,
       getElementWorldPosition,
@@ -741,10 +459,12 @@ export const useSelectionOffsets = (
     ]
   )
 
+  // This function updates one editable property field inside the inspector state.
   const handleFieldChange = useCallback((key: string, value: string) => {
     setPropertyFields((prev) => prev.map((field) => (field.key === key ? { ...field, value } : field)))
   }, [])
 
+  // This function updates one coordinate input while normalizing the stored numeric value.
   const handleOffsetInputChange = useCallback((axis: keyof OffsetVector, value: number) => {
     setOffsetInputs((prev) => ({
       ...prev,
@@ -752,47 +472,36 @@ export const useSelectionOffsets = (
     }))
   }, [])
 
-  const setCustomCubeRoomNumber = useCallback((expressID: number, roomNumber?: string | null) => {
-    setCustomObjectRoomNumberInRegistry(customObjectRegistryRefs, expressID, roomNumber)
-  }, [customObjectRegistryRefs])
+  // This hook builds the custom-object selection and spawn callbacks used by the selection runtime.
+  const {
+    buildCustomPropertyFields,
+    setCustomCubeRoomNumber,
+    setCustomObjectSpaceIfcId,
+    setCustomObjectItemId,
+    findCustomObjectExpressIdByItemId,
+    getCustomObjectState,
+    ensureCustomCubesPickable,
+    selectCustomCube,
+    removeCustomCube,
+    spawnCube,
+    spawnUploadedModel,
+    spawnStoredCustomObject
+  } = useSelectionOffsetsCustomObjects({
+    viewerRef,
+    customObjectRegistryRefs,
+    cubeRegistryRef,
+    clearIfcSelectionHighlight,
+    focusOnPoint,
+    removePickable,
+    setSelectedElement,
+    setOffsetInputs,
+    setPropertyFields,
+    setPropertyError,
+    setIsFetchingProperties,
+    setCubeHighlight
+  })
 
-  const setCustomObjectSpaceIfcId = useCallback((expressID: number, spaceIfcId?: number | null) => {
-    setCustomObjectSpaceIfcIdInRegistry(customObjectRegistryRefs, expressID, spaceIfcId)
-  }, [customObjectRegistryRefs])
-
-  const setCustomObjectItemId = useCallback((expressID: number, itemId?: string | null) => {
-    setCustomObjectItemIdInRegistry(customObjectRegistryRefs, expressID, itemId)
-  }, [customObjectRegistryRefs])
-
-  const findCustomObjectExpressIdByItemId = useCallback((itemId: string | null | undefined): number | null => {
-    return findCustomObjectExpressIdByItemIdInRegistry(customObjectRegistryRefs, itemId)
-  }, [customObjectRegistryRefs])
-
-  const getCustomObjectState = useCallback((expressID: number): CustomObjectState | null => {
-    return getCustomObjectStateFromRegistry(customObjectRegistryRefs, expressID)
-  }, [customObjectRegistryRefs])
-
-  const ensureCustomCubesPickable = useCallback(() => {
-    const viewer = viewerRef.current
-    if (!viewer) return
-    ensureCustomObjectsPickable(viewer, customObjectRegistryRefs)
-  }, [customObjectRegistryRefs, viewerRef])
-
-  const buildCustomPropertyFields = useCallback(
-    (expressID: number): PropertyField[] => {
-      return buildCustomPropertyFieldsFromRegistry(customObjectRegistryRefs, expressID)
-    },
-    [customObjectRegistryRefs]
-  )
-
-  const getExpressIdFromHit = useCallback((hit: {
-    object: Mesh
-    face?: { a?: number }
-    faceIndex?: number
-  }): number | null => {
-    return getExpressIdFromPickHit(hit)
-  }, [])
-
+  // This function collects IFC and custom-object pick candidates around one screen-space click position.
   const pickCandidatesAt = useCallback(
     (
       clientX: number,
@@ -814,6 +523,7 @@ export const useSelectionOffsets = (
     [viewerRef]
   )
 
+  // This function applies the current offset and rotation to one IFC element through the moved-subset layer.
   const applyIfcElementTransform = useCallback(
     (
       modelID: number,
@@ -857,6 +567,7 @@ export const useSelectionOffsets = (
     ]
   )
 
+  // This function updates only the translation part of one IFC element transform.
   const applyIfcElementOffset = useCallback(
     (modelID: number, expressID: number, targetOffset: OffsetVector) => {
       const key = getElementKey(modelID, expressID)
@@ -865,6 +576,7 @@ export const useSelectionOffsets = (
     [applyIfcElementTransform, getElementKey]
   )
 
+  // This function updates only the rotation part of one IFC element transform around its current center.
   const applyIfcElementRotation = useCallback(
     (modelID: number, expressID: number, targetRotation: Point3D) => {
       const center = getElementWorldPosition(modelID, expressID) ?? getBaseCenter(modelID, expressID)
@@ -879,6 +591,7 @@ export const useSelectionOffsets = (
     [applyIfcElementTransform, getBaseCenter, getElementWorldPosition]
   )
 
+  // This function moves the currently selected IFC element or custom object to the requested offset.
   const moveSelectedTo = useCallback(
     (targetOffset: OffsetVector) => {
       const viewer = viewerRef.current
@@ -902,10 +615,12 @@ export const useSelectionOffsets = (
     ]
   )
 
+  // This function commits the offset currently shown in the inspector inputs onto the selected element.
   const applyOffsetToSelectedElement = useCallback(() => {
     moveSelectedTo(offsetInputs)
   }, [moveSelectedTo, offsetInputs])
 
+  // This function performs the standard click-pick flow for IFC elements and custom objects.
   const handlePick = useCallback(async (options?: { autoFocus?: boolean; allowedIfcTypes?: string[] }) => {
     const viewer = viewerRef.current
     if (!viewer) {
@@ -925,8 +640,8 @@ export const useSelectionOffsets = (
         clearIfcSelectionHighlight,
         getCustomObjectState,
         getElementWorldPosition,
-        getExpressIdFromHit,
-        isIfcSelectionAllowed,
+        getExpressIdFromHit: getExpressIdFromPickHit,
+        isIfcSelectionAllowed: isIfcSelectionAllowedInternal,
         resetSelection,
         setCubeHighlight,
         focusOnPoint,
@@ -948,13 +663,12 @@ export const useSelectionOffsets = (
     focusOnPoint,
     getCustomObjectState,
     getElementWorldPosition,
-    getExpressIdFromHit,
-    isIfcSelectionAllowed,
     resetSelection,
     setCubeHighlight,
     viewerRef
   ])
 
+  // This function selects one IFC element by id, loads its properties, and optionally focuses the camera on it.
   const selectById = useCallback(
     async (
       modelID: number,
@@ -977,7 +691,7 @@ export const useSelectionOffsets = (
           getModelBaseOffset,
           getBaseCenter,
           hasRenderableExpressId,
-          isIfcSelectionAllowed,
+          isIfcSelectionAllowed: isIfcSelectionAllowedInternal,
           resetSelection,
           applyIfcSelectionHighlight,
           clearIfcSelectionHighlight,
@@ -1001,12 +715,12 @@ export const useSelectionOffsets = (
       getElementWorldPosition,
       getModelBaseOffset,
       hasRenderableExpressId,
-      isIfcSelectionAllowed,
       resetSelection,
       viewerRef
     ]
   )
 
+  // This function rotates the currently selected IFC element or custom object to the requested angles.
   const rotateSelectedTo = useCallback(
     (targetRotation: Point3D) => {
       const viewer = viewerRef.current
@@ -1030,150 +744,11 @@ export const useSelectionOffsets = (
     ]
   )
 
-  const hideIfcElement = useCallback(
-    (modelID: number, expressID: number) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      // Soft delete: keep subset/material graph intact and hide via visibility filtering.
-      ensureBaseSubset(modelID)
-      const manager = viewer.IFC.loader.ifcManager
-      const scene = viewer.context.getScene()
-      const key = getElementKey(modelID, expressID)
-
-      let hidden = hiddenIdsRef.current.get(modelID)
-      if (!hidden) {
-        hidden = new Set<number>()
-        hiddenIdsRef.current.set(modelID, hidden)
-      }
-      hidden.add(expressID)
-
-      removeMovedSubset({
-        modelID,
-        key,
-        movedSubset: movedSubsetsRef.current.get(key),
-        scene,
-        manager,
-        removePickable: (mesh) => removePickable(viewer, mesh)
-      })
-      movedSubsetsRef.current.delete(key)
-      elementOffsetsRef.current.delete(key)
-      elementRotationsRef.current.delete(key)
-      spaceBiasIdsRef.current.get(modelID)?.delete(expressID)
-      spaceBiasAppliedRef.current.get(modelID)?.delete(expressID)
-      const activeFilter = filterIdsRef.current.get(modelID) ?? null
-      updateVisibilityForModel(modelID, activeFilter)
-      const activeHighlight = highlightedIfcRef.current
-      if (activeHighlight && activeHighlight.modelID === modelID && activeHighlight.expressID === expressID) {
-        clearIfcSelectionHighlight(modelID)
-      }
-    },
-    [
-      clearIfcSelectionHighlight,
-      ensureBaseSubset,
-      getElementKey,
-      removePickable,
-      updateVisibilityForModel,
-      viewerRef
-    ]
-  )
-
-  const selectCustomCube = useCallback(
-    (expressID: number) => {
-      const customObject = cubeRegistryRef.current.get(expressID)
-      if (!customObject) return
-      clearIfcSelectionHighlight()
-      viewerRef.current?.IFC.selector.unpickIfcItems()
-      const pos = customObject.position
-      const customState = getCustomObjectState(expressID)
-      setSelectedElement({
-        modelID: CUSTOM_CUBE_MODEL_ID,
-        expressID,
-        type: customState?.model?.toUpperCase() ?? 'CUSTOM'
-      })
-      setOffsetInputs(pointToOffsetVector(pos))
-      setPropertyFields(buildCustomPropertyFields(expressID))
-      setPropertyError(null)
-      setIsFetchingProperties(false)
-      setCubeHighlight(expressID)
-    },
-    [buildCustomPropertyFields, clearIfcSelectionHighlight, getCustomObjectState, setCubeHighlight, viewerRef]
-  )
-
+  // This function clears every active IFC selection highlight and tells the engine picker to unselect.
   const clearIfcHighlight = useCallback(() => {
     clearIfcSelectionHighlight()
     viewerRef.current?.IFC.selector.unpickIfcItems()
   }, [clearIfcSelectionHighlight, viewerRef])
-
-  const removeCustomCube = useCallback(
-    (expressID: number) => {
-      const viewer = viewerRef.current
-      if (!viewer) return
-      removeCustomObject(viewer, customObjectRegistryRefs, expressID, removePickable)
-    },
-    [customObjectRegistryRefs, removePickable, viewerRef]
-  )
-
-  const spawnCubeAt = useCallback(
-    (target?: Point3D | null, id?: number): SpawnedCubeInfo | null => {
-      const viewer = viewerRef.current
-      if (!viewer) return null
-      return spawnCubeObject(viewer, customObjectRegistryRefs, target, id)
-    },
-    [customObjectRegistryRefs, viewerRef]
-  )
-
-  const spawnCube = useCallback(
-    (target?: Point3D | null, options?: SpawnCubeOptions): SpawnedCubeInfo | null => {
-      // Convenience wrapper that also focuses the camera if requested
-      const info = spawnCubeAt(target, options?.id)
-      if (options?.focus && info) {
-        focusOnPoint(info.position)
-      }
-      return info
-    },
-    [focusOnPoint, spawnCubeAt]
-  )
-
-  const spawnUploadedModel = useCallback(
-    async (
-      file: File,
-      target?: Point3D | null,
-      options?: { focus?: boolean }
-    ): Promise<SpawnedModelInfo | null> => {
-      const viewer = viewerRef.current
-      if (!viewer) return null
-      try {
-        const spawned = await spawnUploadedCustomObject(
-          viewer,
-          customObjectRegistryRefs,
-          file,
-          target
-        )
-        if (options?.focus && spawned) {
-          focusOnPoint(spawned.position)
-        }
-        return spawned
-      } catch (err) {
-        console.error('Failed to load uploaded model', err)
-      }
-      return null
-    },
-    [customObjectRegistryRefs, focusOnPoint, viewerRef]
-  )
-
-  const spawnStoredCustomObject = useCallback(
-    (args: SpawnStoredCustomObjectArgs): { expressID: number; position: Point3D } | null => {
-      const viewer = viewerRef.current
-      if (!viewer) return null
-
-      const restored = spawnStoredCustomRegistryObject(viewer, customObjectRegistryRefs, args)
-      if (args.focus && restored) {
-        focusOnPoint(restored.position)
-      }
-      return restored
-    },
-    [customObjectRegistryRefs, focusOnPoint, viewerRef]
-  )
 
   return {
     selectedElement,

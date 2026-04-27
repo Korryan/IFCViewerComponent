@@ -1,138 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ObjectTree } from '../ifcViewerTypes'
-import type { InsertPrefabOption } from '../ifcViewerTypes'
 import { InsertMenu } from './InsertMenu'
-import { localizeIfcType } from '../utils/ifcTypeLocalization'
+import { ObjectTreePanelRoomRow } from './ObjectTreePanelRoomRow'
+import { ObjectTreePanelTreeNode } from './ObjectTreePanelTreeNode'
+import type { MenuAnchor, ObjectTreePanelProps, ObjectTreePanelViewMode } from './objectTreePanel.types'
+import {
+  buildSelectionState,
+  countDescendantNodes,
+  groupRoomsByStorey,
+  resolvePanelMenuAnchor
+} from './objectTreePanel.utils'
 
-type ObjectTreePanelProps = {
-  tree: ObjectTree
-  selectedNodeId: string | null
-  onSelectNode: (nodeId: string) => void
-  rooms?: RoomEntry[]
-  roomContents?: RoomEntry | null
-  activeRoomNodeId?: string | null
-  onSelectRoom?: (nodeId: string) => void
-  prefabs?: InsertPrefabOption[]
-  onInsertPrefab: (nodeId: string, prefabId: string) => void
-  onUploadModel: (nodeId: string) => void
-}
-
-type RoomEntry = {
-  nodeId: string
-  label: string
-  ifcId: number
-  roomNumber?: string | null
-  storeyLabel?: string | null
-}
-
-type RenderNodeArgs = {
-  nodeId: string
-  depth: number
-  expanded: Set<string>
-  pathSet: Set<string>
-  toggle: (id: string) => void
-  onOpenMenu: (nodeId: string, anchor: { x: number; y: number }) => void
-  selectedNodeId: string | null
-  onSelectNode: (nodeId: string) => void
-  nodes: ObjectTree['nodes']
-}
-
-const indentSize = 12
-const normalizeIfcType = (value: string) => value.trim().toUpperCase()
-
-const TreeNode = ({
-  nodeId,
-  depth,
-  expanded,
-  pathSet,
-  toggle,
-  onOpenMenu,
-  selectedNodeId,
-  onSelectNode,
-  nodes
-}: RenderNodeArgs) => {
-  const node = nodes[nodeId]
-  if (!node) return null
-  const hasChildren = node.children.length > 0
-  const isExpanded = expanded.has(nodeId)
-  const isSelected = selectedNodeId === nodeId
-  const isOnPath = pathSet.has(nodeId)
-  const localizedType = localizeIfcType(node.type)
-  const ifcDisplayId =
-    node.nodeType === 'ifc' && node.expressID !== null ? `#${String(node.expressID)}` : null
-  const showTypeBadge = node.label.trim().toLocaleLowerCase() !== localizedType.trim().toLocaleLowerCase()
-  const canAddChild = node.nodeType === 'ifc' && normalizeIfcType(node.type) === 'IFCSPACE'
-
-  return (
-    <div className="tree-node" style={{ paddingLeft: depth * indentSize }}>
-      <div className="tree-node__row">
-        <button
-          type="button"
-          className="tree-node__toggle"
-          onClick={() => (hasChildren ? toggle(nodeId) : onSelectNode(nodeId))}
-          aria-label={hasChildren ? (isExpanded ? 'Collapse' : 'Expand') : 'Select'}
-        >
-          {hasChildren ? (isExpanded ? 'v' : '>') : '-'}
-        </button>
-        <button
-          type="button"
-          className={[
-            'tree-node__label',
-            isOnPath ? 'tree-node__label--path' : '',
-            isSelected ? 'tree-node__label--selected' : ''
-          ]
-            .filter(Boolean)
-            .join(' ')}
-          onClick={() => onSelectNode(nodeId)}
-          title={ifcDisplayId ? `${node.label} ${ifcDisplayId}` : node.label}
-          data-node-id={nodeId}
-          data-ifc-id={ifcDisplayId ?? undefined}
-        >
-          {showTypeBadge && <span className="tree-node__type">{localizedType}</span>}
-          <span className="tree-node__name">{node.label}</span>
-          {ifcDisplayId && <span className="tree-node__id">{ifcDisplayId}</span>}
-        </button>
-        {canAddChild && (
-          <button
-            type="button"
-            className="tree-node__add"
-            onClick={(event) => {
-              event.stopPropagation()
-              const button = event.currentTarget as HTMLButtonElement
-              const row = button.closest('.tree-node__row') as HTMLDivElement | null
-              const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
-              const anchorX = row ? rect.left + rect.width / 2 : rect.left
-              onOpenMenu(nodeId, { x: anchorX, y: rect.bottom })
-            }}
-            aria-label="Add child object"
-            title="Add child object"
-          >
-            +
-          </button>
-        )}
-      </div>
-      {hasChildren && isExpanded && (
-        <div className="tree-node__children">
-          {node.children.map((childId) => (
-            <TreeNode
-              key={childId}
-              nodeId={childId}
-              depth={depth + 1}
-              expanded={expanded}
-              pathSet={pathSet}
-              toggle={toggle}
-              onOpenMenu={onOpenMenu}
-              selectedNodeId={selectedNodeId}
-              onSelectNode={onSelectNode}
-              nodes={nodes}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
+// Renders the object tree panel and switches between tree, rooms, and active-room content views.
 export const ObjectTreePanel = ({
   tree,
   selectedNodeId,
@@ -146,13 +24,13 @@ export const ObjectTreePanel = ({
   onUploadModel
 }: ObjectTreePanelProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
-  const [menuAnchor, setMenuAnchor] = useState<{ x: number; y: number } | null>(null)
+  const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null)
   const [menuNodeId, setMenuNodeId] = useState<string | null>(null)
-  const [viewMode, setViewMode] = useState<'tree' | 'rooms' | 'roomContents'>('tree')
+  const [viewMode, setViewMode] = useState<ObjectTreePanelViewMode>('tree')
   const contentRef = useRef<HTMLDivElement | null>(null)
   const panelRef = useRef<HTMLElement | null>(null)
 
-  // Auto-expand roots when tree changes
+  // This effect expands root nodes and clears any open insert menu whenever the root tree changes.
   useEffect(() => {
     const next = new Set<string>()
     tree.roots.forEach((rootId) => next.add(rootId))
@@ -161,6 +39,7 @@ export const ObjectTreePanel = ({
     setMenuNodeId(null)
   }, [tree.roots])
 
+  // This effect keeps the current panel mode valid when room data or room-content state changes.
   useEffect(() => {
     if (viewMode === 'rooms' && rooms.length === 0) {
       setViewMode('tree')
@@ -170,31 +49,12 @@ export const ObjectTreePanel = ({
     }
   }, [roomContents, rooms.length, tree.nodes, viewMode])
 
-  const { selectionPath, selectionTrail } = useMemo(() => {
-    const ids: string[] = []
-    const trail: string[] = []
-    if (!selectedNodeId) {
-      return { selectionPath: new Set<string>(), selectionTrail: trail }
-    }
-    let current: string | null = selectedNodeId
-    while (current) {
-      ids.push(current)
-      const node: ObjectTree['nodes'][string] | undefined = tree.nodes[current]
-      if (!node || !node.parentId) break
-      current = node.parentId
-    }
-    ids
-      .slice()
-      .reverse()
-      .forEach((id) => {
-        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[id]
-        if (node) {
-          trail.push(node.label)
-        }
-      })
-    return { selectionPath: new Set(ids), selectionTrail: trail }
-  }, [selectedNodeId, tree.nodes])
+  const { selectionPath, selectionTrail } = useMemo(
+    () => buildSelectionState(tree, selectedNodeId),
+    [selectedNodeId, tree]
+  )
 
+  // This effect auto-expands the full ancestor path of the currently selected tree node.
   useEffect(() => {
     if (!selectedNodeId) return
     setExpanded((prev) => {
@@ -204,6 +64,7 @@ export const ObjectTreePanel = ({
     })
   }, [selectedNodeId, selectionPath])
 
+  // This effect keeps the selected node or room centered inside the current scroll container.
   useEffect(() => {
     if (!selectedNodeId) return
     const container = contentRef.current
@@ -216,6 +77,7 @@ export const ObjectTreePanel = ({
     }
   }, [expanded, selectedNodeId])
 
+  // This function toggles one tree node between expanded and collapsed state.
   const toggle = (id: string) => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -228,60 +90,31 @@ export const ObjectTreePanel = ({
     })
   }
 
-  const hasContent = useMemo(() => tree.roots.length > 0, [tree.roots])
-  const hasRooms = useMemo(() => rooms.length > 0, [rooms])
-  const hasRoomContents = useMemo(
-    () => Boolean(roomContents && tree.nodes[roomContents.nodeId]),
-    [roomContents, tree.nodes]
-  )
+  const hasContent = tree.roots.length > 0
+  const hasRooms = rooms.length > 0
+  const hasRoomContents = Boolean(roomContents && tree.nodes[roomContents.nodeId])
   const roomContentsNode = hasRoomContents && roomContents ? tree.nodes[roomContents.nodeId] : null
   const isRoomMode = viewMode === 'rooms'
   const isRoomContentsMode = viewMode === 'roomContents'
-  const roomGroups = useMemo(() => {
-    const groups: Array<{ label: string; rooms: typeof rooms }> = []
-    rooms.forEach((room) => {
-      const groupLabel = room.storeyLabel?.trim() || 'Nezařazené'
-      const lastGroup = groups[groups.length - 1]
-      if (!lastGroup || lastGroup.label !== groupLabel) {
-        groups.push({ label: groupLabel, rooms: [room] })
-        return
-      }
-      lastGroup.rooms.push(room)
-    })
-    return groups
-  }, [rooms])
-  const roomContentsCount = useMemo(() => {
-    if (!roomContentsNode) return 0
-    let count = 0
-    const stack = [...roomContentsNode.children]
-    while (stack.length > 0) {
-      const currentId = stack.pop()
-      if (!currentId) continue
-      const current = tree.nodes[currentId]
-      if (!current) continue
-      count += 1
-      if (current.children.length > 0) {
-        stack.push(...current.children)
-      }
-    }
-    return count
-  }, [roomContentsNode, tree.nodes])
+  const roomGroups = useMemo(() => groupRoomsByStorey(rooms), [rooms])
+  const roomContentsCount = useMemo(
+    () => countDescendantNodes(tree, roomContentsNode?.id),
+    [roomContentsNode?.id, tree]
+  )
 
-  const handleOpenMenu = (nodeId: string, anchor: { x: number; y: number }) => {
-    const panel = panelRef.current
-    if (!panel) {
+  // This function converts one viewport anchor into panel-local coordinates and opens the insert menu.
+  const handleOpenMenu = (nodeId: string, anchor: MenuAnchor) => {
+    const nextAnchor = resolvePanelMenuAnchor(panelRef.current, anchor)
+    if (!nextAnchor) {
       setMenuAnchor(null)
       setMenuNodeId(null)
       return
     }
-    const panelRect = panel.getBoundingClientRect()
-    setMenuAnchor({
-      x: Math.max(0, anchor.x - panelRect.left),
-      y: Math.max(0, anchor.y - panelRect.top)
-    })
+    setMenuAnchor(nextAnchor)
     setMenuNodeId(nodeId)
   }
 
+  // This function closes the insert menu and clears its active tree target.
   const handleCloseMenu = () => {
     setMenuAnchor(null)
     setMenuNodeId(null)
@@ -349,48 +182,13 @@ export const ObjectTreePanel = ({
                 <div key={group.label} className="tree-panel__room-group">
                   <p className="tree-panel__room-group-title">{group.label}</p>
                   {group.rooms.map((room) => (
-                    <div key={room.nodeId} className="tree-panel__room-row">
-                      <button
-                        type="button"
-                        className={[
-                          'tree-panel__room',
-                          selectedNodeId === room.nodeId || activeRoomNodeId === room.nodeId
-                            ? 'tree-panel__room--selected'
-                            : ''
-                        ]
-                          .filter(Boolean)
-                          .join(' ')}
-                        onClick={() => {
-                          ;(onSelectRoom ?? onSelectNode)(room.nodeId)
-                        }}
-                        data-room-node-id={room.nodeId}
-                        title={room.label}
-                      >
-                        <span className="tree-panel__room-label-group">
-                          <span className="tree-panel__room-label">{room.label}</span>
-                          <span className="tree-panel__room-number">#{room.ifcId}</span>
-                        </span>
-                        {room.roomNumber && (
-                          <span className="tree-panel__room-meta">c. {room.roomNumber}</span>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        className="tree-node__add"
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          const button = event.currentTarget as HTMLButtonElement
-                          const row = button.closest('.tree-panel__room-row') as HTMLDivElement | null
-                          const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
-                          const anchorX = row ? rect.left + rect.width / 2 : rect.left
-                          handleOpenMenu(room.nodeId, { x: anchorX, y: rect.bottom })
-                        }}
-                        aria-label="Add child object"
-                        title="Add child object"
-                      >
-                        +
-                      </button>
-                    </div>
+                    <ObjectTreePanelRoomRow
+                      key={room.nodeId}
+                      room={room}
+                      selected={selectedNodeId === room.nodeId || activeRoomNodeId === room.nodeId}
+                      onSelect={(nodeId) => (onSelectRoom ?? onSelectNode)(nodeId)}
+                      onOpenMenu={handleOpenMenu}
+                    />
                   ))}
                 </div>
               ))}
@@ -403,52 +201,16 @@ export const ObjectTreePanel = ({
             <div className="tree-panel__rooms">
               <div className="tree-panel__room-group">
                 <p className="tree-panel__room-group-title">Active room</p>
-                <div className="tree-panel__room-row">
-                  <button
-                    type="button"
-                    className={[
-                      'tree-panel__room',
-                      selectedNodeId === roomContents.nodeId || activeRoomNodeId === roomContents.nodeId
-                        ? 'tree-panel__room--selected'
-                        : ''
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                    onClick={() => {
-                      onSelectNode(roomContents.nodeId)
-                    }}
-                    data-room-node-id={roomContents.nodeId}
-                    title={roomContents.label}
-                  >
-                    <span className="tree-panel__room-label-group">
-                      <span className="tree-panel__room-label">{roomContents.label}</span>
-                      <span className="tree-panel__room-number">#{roomContents.ifcId}</span>
-                    </span>
-                    {roomContents.roomNumber && (
-                      <span className="tree-panel__room-meta">c. {roomContents.roomNumber}</span>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    className="tree-node__add"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      const button = event.currentTarget as HTMLButtonElement
-                      const row = button.closest('.tree-panel__room-row') as HTMLDivElement | null
-                      const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
-                      const anchorX = row ? rect.left + rect.width / 2 : rect.left
-                      handleOpenMenu(roomContents.nodeId, { x: anchorX, y: rect.bottom })
-                    }}
-                    aria-label="Add child object"
-                    title="Add child object"
-                  >
-                    +
-                  </button>
-                </div>
+                <ObjectTreePanelRoomRow
+                  room={roomContents}
+                  selected={selectedNodeId === roomContents.nodeId || activeRoomNodeId === roomContents.nodeId}
+                  onSelect={onSelectNode}
+                  onOpenMenu={handleOpenMenu}
+                />
                 {roomContentsNode.children.length > 0 ? (
                   <div className="tree-panel__room-contents-tree">
                     {roomContentsNode.children.map((childId) => (
-                      <TreeNode
+                      <ObjectTreePanelTreeNode
                         key={childId}
                         nodeId={childId}
                         depth={1}
@@ -472,7 +234,7 @@ export const ObjectTreePanel = ({
           )
         ) : hasContent ? (
           tree.roots.map((rootId) => (
-            <TreeNode
+            <ObjectTreePanelTreeNode
               key={rootId}
               nodeId={rootId}
               depth={0}

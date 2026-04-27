@@ -1,30 +1,5 @@
 import type { PropertyField } from '../ifcViewerTypes'
-
-// Normalizes raw IFC values into readable strings for the inspector panel.
-export const normalizeIfcValue = (rawValue: any): string => {
-  if (rawValue === null || rawValue === undefined) {
-    return ''
-  }
-  if (typeof rawValue === 'string') {
-    return rawValue
-  }
-  if (typeof rawValue === 'number' || typeof rawValue === 'boolean') {
-    return String(rawValue)
-  }
-  if (Array.isArray(rawValue)) {
-    return rawValue.map((entry) => normalizeIfcValue(entry)).join(', ')
-  }
-  if (typeof rawValue === 'object') {
-    if ('value' in rawValue) {
-      return normalizeIfcValue(rawValue.value)
-    }
-    if ('Name' in rawValue && typeof rawValue.Name === 'string') {
-      return rawValue.Name
-    }
-    return ''
-  }
-  return String(rawValue)
-}
+import { normalizeIfcValue } from '../ifcViewer.ifcValues'
 
 // Builds the trimmed property-field list shown in the properties panel for an IFC element.
 export const buildPropertyFields = (rawProperties: any): PropertyField[] => {

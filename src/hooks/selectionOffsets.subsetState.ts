@@ -63,7 +63,6 @@ export const updateSpaceBiasSubset = (args: {
   getMovedIdsForModel: (modelID: number) => Set<number>
   registerPickable: (viewer: IfcViewerAPI, mesh: Mesh, modelID?: number) => void
   removePickable: (viewer: IfcViewerAPI, mesh: Mesh) => void
-  tuneSpaceBiasSubsetMesh: (mesh: Mesh | null | undefined) => void
 }): void => {
   const manager = args.viewer.IFC.loader.ifcManager
   const scene = args.viewer.context.getScene()
@@ -115,7 +114,6 @@ export const updateSpaceBiasSubset = (args: {
     subset,
     baseSubset: args.baseSubsetsRef.current.get(args.modelID) ?? null
   })
-  args.tuneSpaceBiasSubsetMesh(subset)
   args.spaceBiasSubsetsRef.current.set(args.modelID, subset)
   args.registerPickable(args.viewer, subset)
 }

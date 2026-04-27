@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react'
+import { useRef } from 'react'
+import { usePointerDownOutside } from './usePointerDownOutside'
 
 type SelectionCandidate = {
   id: string
@@ -23,21 +24,7 @@ export const SelectionMenu = ({
   onCancel
 }: SelectionMenuProps) => {
   const menuRef = useRef<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    if (!open) return
-    const handlePointerDown = (event: PointerEvent) => {
-      const menu = menuRef.current
-      if (!menu) return
-      if (!menu.contains(event.target as Node)) {
-        onCancel()
-      }
-    }
-    window.addEventListener('pointerdown', handlePointerDown)
-    return () => {
-      window.removeEventListener('pointerdown', handlePointerDown)
-    }
-  }, [onCancel, open])
+  usePointerDownOutside(open, menuRef, onCancel)
 
   if (!open || !anchor || candidates.length === 0) return null
 
