@@ -68,6 +68,23 @@ export const resizeViewerViewport = (args: {
   args.updateCameraClipPlanes()
 }
 
+// Creates one resize observer that keeps the renderer and cameras synchronized with the container size.
+export const bindViewerResizeObserver = (args: {
+  container: HTMLElement
+  renderer: WebGLRenderer
+  perspectiveCamera: PerspectiveCamera
+  orthographicCamera: OrthographicCamera
+  updateCameraClipPlanes: () => void
+}) => {
+  if (typeof ResizeObserver === 'undefined') return null
+  const observer = new ResizeObserver(() => {
+    resizeViewerViewport(args)
+  })
+  observer.observe(args.container)
+  resizeViewerViewport(args)
+  return observer
+}
+
 // Advances camera controls and renders one viewer animation frame.
 export const renderViewerFrame = (args: {
   now: number
@@ -82,6 +99,64 @@ export const renderViewerFrame = (args: {
   args.cameraControls.update(delta)
   args.updateCameraClipPlanes()
   args.renderer.render(args.scene, args.perspectiveCamera)
+}
+
+// Starts the viewer animation loop that updates controls and renders frames until disposal.
+export const startViewerAnimationLoop = (args: {
+  isDisposed: () => boolean
+  getLastFrameTime: () => number
+  setLastFrameTime: (value: number) => void
+  renderFrame: (now: number, lastFrameTime: number) => void
+}): number => {
+  const animate = () => {
+    if (args.isDisposed()) return
+    const now = performance.now()
+    args.renderFrame(now, args.getLastFrameTime())
+    args.setLastFrameTime(now)
+    requestAnimationFrame(animate)
+  }
+  return requestAnimationFrame(animate)
+}
+
+// Disposes the active viewer runtime, loaded models, and WebGL context resources.
+export const disposeViewerRuntime = (args: {
+  animationFrame: number | null
+  resizeObserver: ResizeObserver | null
+  container: HTMLElement
+  handlePointerMove: (event: PointerEvent) => void
+  cameraControls: CameraControls
+  modelIds: number[]
+  removeIfcModel: (modelID: number) => void
+  components: { dispose: () => void }
+  renderer: WebGLRenderer
+}) => {
+  if (args.animationFrame !== null) {
+    cancelAnimationFrame(args.animationFrame)
+  }
+
+  args.resizeObserver?.disconnect()
+  args.container.removeEventListener('pointermove', args.handlePointerMove)
+  args.container.removeEventListener('pointerdown', args.handlePointerMove)
+
+  try {
+    args.cameraControls.dispose()
+  } catch {
+    // no-op
+  }
+
+  args.modelIds.forEach((modelID) => args.removeIfcModel(modelID))
+
+  try {
+    args.components.dispose()
+  } catch {
+    // no-op
+  }
+
+  args.renderer.dispose()
+  args.renderer.forceContextLoss()
+  if (args.renderer.domElement.parentElement === args.container) {
+    args.container.removeChild(args.renderer.domElement)
+  }
 }
 
 // Fits the camera onto all currently visible IFC models and returns the resulting scene radius.

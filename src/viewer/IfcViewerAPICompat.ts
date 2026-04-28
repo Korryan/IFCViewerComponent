@@ -4,11 +4,9 @@ import { Mesher } from '@thatopen/components-front'
 import fragmentsWorkerUrl from '@thatopen/fragments/worker?url'
 import * as THREE from 'three'
 import {
-  BufferGeometry,
   Color,
   Material,
   Mesh,
-  Object3D,
   OrthographicCamera,
   PerspectiveCamera,
   Raycaster,
@@ -16,55 +14,37 @@ import {
   Vector2,
   WebGLRenderer
 } from 'three'
-import {
-  toLegacySpatial
-} from './IfcViewerAPICompat.legacy'
-import {
-  castRayIfcCandidates as castRayIfcCandidatesInternal,
-  getExpressIdFromGeometry,
-  type PickResult
-} from './IfcViewerAPICompat.picking'
-import {
-  registerLoadedModelRecord,
-  resolveGeometryMaterialsByLocalId as resolveGeometryMaterialsByLocalIdInternal,
-  resolveMaterialsByLocalId as resolveMaterialsByLocalIdInternal
-} from './IfcViewerAPICompat.models'
+import { castRayIfcCandidates as castRayIfcCandidatesInternal } from './IfcViewerAPICompat.picking'
+import type { PickResult } from './IfcViewerAPICompat.picking'
 import {
   applyIfcLoaderSettings as applyIfcLoaderSettingsInternal,
-  getNameFromUrl as getNameFromUrlInternal,
-  isAbsoluteWasmPath as isAbsoluteWasmPathInternal,
-  makeModelKey as makeModelKeyInternal
+  isAbsoluteWasmPath as isAbsoluteWasmPathInternal
 } from './IfcViewerAPICompat.loader'
 import {
-  buildMeshFromCache as buildMeshFromCacheInternal,
-  createSubsetRecord,
-  detachSubsetRecord,
-  removeIdsFromSubsetRecord
-} from './IfcViewerAPICompat.subsets'
+  createIfcManagerBridge,
+  createIfcPublicApi,
+  createViewerContextBridge
+} from './IfcViewerAPICompat.bridge'
+import { buildMeshFromCache as buildMeshFromCacheInternal } from './IfcViewerAPICompat.subsets'
+import { computeSceneRadius, updateCameraClipPlanesForScene } from './IfcViewerAPICompat.scene'
 import {
-  addPickableObject,
-  attachIfcModelToScene,
-  computeSceneRadius,
-  removeModelFromSceneList,
-  removePickableObject,
-  updateCameraClipPlanesForScene
-} from './IfcViewerAPICompat.scene'
-import { createModelRecordFromBuffer } from './IfcViewerAPICompat.loadingFlow'
+  attachLoadedModel, createViewerSubset, removeLoadedModel, removeViewerSubset, removeViewerSubsetIds,
+  tagViewerModelObject
+} from './IfcViewerAPICompat.modelLifecycle'
+import { loadModelFromBuffer, loadModelFromFile, loadModelFromUrl } from './IfcViewerAPICompat.io'
 import { loadLegacyItemProperties } from './IfcViewerAPICompat.properties'
 import {
-  fitCameraToVisibleModels,
-  renderViewerFrame,
-  resizeViewerViewport,
-  setupDefaultSceneLights,
-  updateViewerPointerPosition
+  bindViewerResizeObserver, disposeViewerRuntime, fitCameraToVisibleModels, renderViewerFrame,
+  setupDefaultSceneLights, startViewerAnimationLoop, updateViewerPointerPosition
 } from './IfcViewerAPICompat.runtime'
-import type { IfcModelLike, ModelRecord, ViewerOptions } from './IfcViewerAPICompat.types'
+import type { IfcModelLike, ModelRecord, ViewerContextCompat, ViewerIfcManagerBridge, ViewerIfcPublicApi, ViewerOptions } from './IfcViewerAPICompat.types'
 
 let controlsInstalled = false
 
 const DEFAULT_SUBSET_ID = '__default__'
 const FRAGMENTS_WORKER_PATH = fragmentsWorkerUrl
 
+// Installs CameraControls once for the whole viewer runtime.
 const ensureCameraControlsInstalled = () => {
   if (controlsInstalled) return
   CameraControls.install({ THREE })
@@ -72,46 +52,8 @@ const ensureCameraControlsInstalled = () => {
 }
 
 export class IfcViewerAPI {
-  public readonly context: {
-    renderer: { postProduction: { active: boolean } }
-    ifcCamera: {
-      cameraControls: CameraControls
-      perspectiveCamera: PerspectiveCamera
-      orthographicCamera: OrthographicCamera
-    }
-    mouse: { position: Vector2 }
-    items: { ifcModels: IfcModelLike[]; pickableIfcModels: Object3D[] }
-    getScene: () => Scene
-    getCamera: () => PerspectiveCamera
-    castRayIfc: () => PickResult | null
-    castRayIfcCandidates: (pointer?: Vector2) => PickResult[]
-    fitToFrame: () => Promise<void>
-  }
-
-  public readonly IFC: {
-    loader: {
-      ifcManager: any
-      loadAsync: (url: string) => Promise<IfcModelLike | null>
-    }
-    context: { items: { ifcModels: IfcModelLike[]; pickableIfcModels: Object3D[] }; fitToFrame: () => Promise<void> }
-    selector: {
-      pickIfcItem: (_autoFocus?: boolean) => Promise<PickResult | null>
-      unpickIfcItems: () => void
-    }
-    setWasmPath: (path: string) => Promise<void>
-    applyWebIfcConfig: (settings: any) => Promise<void>
-    loadIfc: (file: File, fitToFrame?: boolean) => Promise<IfcModelLike | null>
-    loadIfcUrl: (url: string, fitToFrame?: boolean) => Promise<IfcModelLike | null>
-    addIfcModel: (mesh: IfcModelLike | null | undefined) => void
-    removeIfcModel: (modelID: number) => void
-    getSpatialStructure: (modelID: number) => Promise<any>
-    getProperties: (
-      modelID: number,
-      expressID: number,
-      recursive?: boolean,
-      includeProperties?: boolean
-    ) => Promise<any>
-  }
+  public readonly context: ViewerContextCompat
+  public readonly IFC: ViewerIfcPublicApi
 
   public readonly axes: { setAxes: () => void }
   public readonly grid: { setGrid: () => void }
@@ -142,31 +84,9 @@ export class IfcViewerAPI {
   private readonly modelsById = new Map<number, ModelRecord>()
   private readonly modelIdByKey = new Map<string, number>()
 
-  private readonly ifcManager: {
-    state: { models: Record<number, { mesh: IfcModelLike }> }
-    setWasmPath: (path: string) => void
-    applyWebIfcConfig: (settings: any) => Promise<void>
-    getExpressId: (geometry: BufferGeometry, faceIndex: number) => number
-    getIfcType: (modelID: number, expressID: number) => string | undefined
-    getSpatialStructure: (modelID: number, _includeProperties?: boolean) => Promise<any>
-    getItemProperties: (modelID: number, expressID: number, recursive?: boolean) => Promise<any>
-    getPropertySets: (modelID: number, expressID: number, recursive?: boolean) => Promise<any[]>
-    getTypeProperties: (_modelID: number, _expressID: number, _recursive?: boolean) => Promise<any[]>
-    getMaterialsProperties: (_modelID: number, _expressID: number, _recursive?: boolean) => Promise<any[]>
-    createSubset: (config: {
-      modelID: number
-      ids: number[]
-      scene?: Scene
-      removePrevious?: boolean
-      material?: Material | Material[]
-      customID?: string
-    }) => Mesh | null
-    removeSubset: (modelID: number, _material?: unknown, customID?: string) => void
-    removeFromSubset: (modelID: number, ids: number[], customID?: string) => void
-    close: (modelID: number) => void
-    dispose: () => Promise<void>
-  }
+  private readonly ifcManager: ViewerIfcManagerBridge
 
+  // Constructs one compatibility viewer instance around the That Open fragments pipeline.
   constructor(options: ViewerOptions) {
     ensureCameraControlsInstalled()
 
@@ -204,51 +124,28 @@ export class IfcViewerAPI {
 
     this.applyIfcLoaderSettings()
 
-    this.ifcManager = {
-      state: { models: {} },
-      setWasmPath: (path: string) => {
-        this.configureWasmPath(path)
+    this.ifcManager = createIfcManagerBridge({
+      modelsById: this.modelsById,
+      getCoordinationMatrix: async (modelID) => {
+        const getter =
+          (this.ifcLoader as any)?.ifcAPI?.GetCoordinationMatrix ??
+          (this.ifcLoader as any)?.webIfc?.GetCoordinationMatrix
+        const target = (this.ifcLoader as any)?.ifcAPI ?? (this.ifcLoader as any)?.webIfc ?? null
+        if (typeof getter !== 'function') {
+          return null
+        }
+        return await Promise.resolve(getter.call(target, modelID))
       },
-      applyWebIfcConfig: async (settings: any) => {
-        await this.applyWebIfcConfig(settings)
-      },
-      getExpressId: (geometry: BufferGeometry, faceIndex: number) => {
-        return getExpressIdFromGeometry(geometry, faceIndex)
-      },
-      getIfcType: (modelID: number, expressID: number) => {
-        return this.modelsById.get(modelID)?.ifcTypeCache.get(expressID)
-      },
-      getSpatialStructure: async (modelID: number) => {
-        const record = this.modelsById.get(modelID)
-        if (!record) return null
-        const spatial = await record.fragments.getSpatialStructure()
-        return toLegacySpatial(spatial, record.expressIds)
-      },
-      getItemProperties: async (modelID: number, expressID: number, recursive = false) => {
-        return this.getItemProperties(modelID, expressID, recursive, false)
-      },
-      getPropertySets: async (modelID: number, expressID: number, recursive = false) => {
-        const props = await this.getItemProperties(modelID, expressID, recursive, true)
-        return Array.isArray(props?.psets) ? props.psets : []
-      },
-      getTypeProperties: async () => [],
-      getMaterialsProperties: async () => [],
-      createSubset: (config) => {
-        return this.createSubset(config)
-      },
-      removeSubset: (modelID: number, _material?: unknown, customID?: string) => {
-        this.removeSubset(modelID, customID)
-      },
-      removeFromSubset: (modelID: number, ids: number[], customID?: string) => {
-        this.removeFromSubset(modelID, ids, customID)
-      },
-      close: (modelID: number) => {
-        this.removeIfcModel(modelID)
-      },
-      dispose: async () => {
-        this.dispose()
-      }
-    }
+      configureWasmPath: (path) => this.configureWasmPath(path),
+      applyWebIfcConfig: async (settings) => this.applyWebIfcConfig(settings),
+      getItemProperties: (modelID, expressID, recursive, includeProperties) =>
+        this.getItemProperties(modelID, expressID, recursive, includeProperties),
+      createSubset: (config) => this.createSubset(config),
+      removeSubset: (modelID, customID) => this.removeSubset(modelID, customID),
+      removeFromSubset: (modelID, ids, customID) => this.removeFromSubset(modelID, ids, customID),
+      removeIfcModel: (modelID) => this.removeIfcModel(modelID),
+      dispose: () => this.dispose()
+    })
 
     const castRayIfcCandidates = (pointer?: Vector2): PickResult[] => {
       return castRayIfcCandidatesInternal({
@@ -259,93 +156,34 @@ export class IfcViewerAPI {
       })
     }
 
-    const castRayIfc = () => {
-      return castRayIfcCandidates()[0] ?? null
-    }
-
-    const pickIfcItem = async (): Promise<PickResult | null> => {
-      return castRayIfcCandidates()[0] ?? null
-    }
-
-    this.context = {
-      renderer: { postProduction: { active: false } },
-      ifcCamera: {
-        cameraControls: this.cameraControls,
-        perspectiveCamera: this.perspectiveCamera,
-        orthographicCamera: this.orthographicCamera
-      },
-      mouse: { position: this.mousePosition },
+    this.context = createViewerContextBridge({
       items: {
         ifcModels: [],
         pickableIfcModels: []
       },
-      getScene: () => this.scene,
-      getCamera: () => this.perspectiveCamera,
-      castRayIfc,
+      cameraControls: this.cameraControls,
+      perspectiveCamera: this.perspectiveCamera,
+      orthographicCamera: this.orthographicCamera,
+      mousePosition: this.mousePosition,
+      scene: this.scene,
       castRayIfcCandidates,
       fitToFrame: async () => this.fitToFrame()
-    }
+    })
 
-    this.IFC = {
-      loader: {
-        ifcManager: this.ifcManager,
-        loadAsync: async (url: string) => {
-          const response = await fetch(url)
-          if (!response.ok) {
-            throw new Error(`Failed to load IFC from URL: ${url}`)
-          }
-          const buffer = await response.arrayBuffer()
-          const name = getNameFromUrlInternal(url)
-          return this.loadFromBuffer(buffer, name, false)
-        }
-      },
-      context: {
-        items: this.context.items,
-        fitToFrame: async () => this.fitToFrame()
-      },
-      selector: {
-        pickIfcItem,
-        unpickIfcItems: () => {}
-      },
-      setWasmPath: async (path: string) => {
-        this.configureWasmPath(path)
-      },
-      applyWebIfcConfig: async (settings: any) => {
-        await this.applyWebIfcConfig(settings)
-      },
-      loadIfc: async (file: File, fitToFrame = true) => {
-        const buffer = await file.arrayBuffer()
-        return this.loadFromBuffer(buffer, file.name, fitToFrame)
-      },
-      loadIfcUrl: async (url: string, fitToFrame = true) => {
-        const response = await fetch(url)
-        if (!response.ok) {
-          throw new Error(`Failed to load IFC from URL: ${url}`)
-        }
-        const buffer = await response.arrayBuffer()
-        return this.loadFromBuffer(buffer, getNameFromUrlInternal(url), fitToFrame)
-      },
-      addIfcModel: (mesh: IfcModelLike | null | undefined) => {
-        this.addIfcModel(mesh)
-      },
-      removeIfcModel: (modelID: number) => {
-        this.removeIfcModel(modelID)
-      },
-      getSpatialStructure: async (modelID: number) => {
-        const record = this.modelsById.get(modelID)
-        if (!record) return null
-        const spatial = await record.fragments.getSpatialStructure()
-        return toLegacySpatial(spatial, record.expressIds)
-      },
-      getProperties: async (
-        modelID: number,
-        expressID: number,
-        recursive = false,
-        includeProperties = false
-      ) => {
-        return this.getItemProperties(modelID, expressID, recursive, includeProperties)
-      }
-    }
+    this.IFC = createIfcPublicApi({
+      ifcManager: this.ifcManager,
+      items: this.context.items,
+      fitToFrame: async () => this.fitToFrame(),
+      configureWasmPath: (path) => this.configureWasmPath(path),
+      applyWebIfcConfig: async (settings) => this.applyWebIfcConfig(settings),
+      loadFromUrl: (url, fitToFrame) => this.loadFromUrl(url, fitToFrame),
+      loadFromFile: (file, fitToFrame) => this.loadFromFile(file, fitToFrame),
+      addIfcModel: (mesh) => this.addIfcModel(mesh),
+      removeIfcModel: (modelID) => this.removeIfcModel(modelID),
+      modelsById: this.modelsById,
+      getItemProperties: (modelID, expressID, recursive, includeProperties) =>
+        this.getItemProperties(modelID, expressID, recursive, includeProperties)
+    })
 
     this.axes = {
       setAxes: () => {
@@ -364,47 +202,32 @@ export class IfcViewerAPI {
     this.startLoop()
   }
 
+  // Disposes the viewer runtime, loaded models, and the active WebGL context.
   public dispose() {
     if (this.disposed) return
     this.disposed = true
-
-    if (this.animationFrame !== null) {
-      cancelAnimationFrame(this.animationFrame)
-      this.animationFrame = null
-    }
-
-    this.resizeObserver?.disconnect()
+    disposeViewerRuntime({
+      animationFrame: this.animationFrame,
+      resizeObserver: this.resizeObserver,
+      container: this.container,
+      handlePointerMove: this.handlePointerMove,
+      cameraControls: this.cameraControls,
+      modelIds: Array.from(this.modelsById.keys()),
+      removeIfcModel: (modelID) => this.removeIfcModel(modelID),
+      components: this.components,
+      renderer: this.renderer
+    })
+    this.animationFrame = null
     this.resizeObserver = null
-    this.container.removeEventListener('pointermove', this.handlePointerMove)
-    this.container.removeEventListener('pointerdown', this.handlePointerMove)
-
-    try {
-      this.cameraControls.dispose()
-    } catch {
-      // no-op
-    }
-
-    const modelIds = Array.from(this.modelsById.keys())
-    modelIds.forEach((modelID) => this.removeIfcModel(modelID))
-
-    try {
-      this.components.dispose()
-    } catch {
-      // no-op
-    }
-
-    this.renderer.dispose()
-    this.renderer.forceContextLoss()
-    if (this.renderer.domElement.parentElement === this.container) {
-      this.container.removeChild(this.renderer.domElement)
-    }
   }
 
+  // Binds pointer listeners that keep the legacy mouse position in sync with the canvas.
   private bindPointerEvents() {
     this.container.addEventListener('pointermove', this.handlePointerMove)
     this.container.addEventListener('pointerdown', this.handlePointerMove)
   }
 
+  // Updates the cached pointer position used by raycasting and selection.
   private handlePointerMove = (event: PointerEvent) => {
     updateViewerPointerPosition({
       container: this.container,
@@ -413,19 +236,9 @@ export class IfcViewerAPI {
     })
   }
 
+  // Observes container resizes and updates cameras and renderer viewport sizes.
   private bindResizeObserver() {
-    if (typeof ResizeObserver === 'undefined') return
-    this.resizeObserver = new ResizeObserver(() => {
-      resizeViewerViewport({
-        container: this.container,
-        renderer: this.renderer,
-        perspectiveCamera: this.perspectiveCamera,
-        orthographicCamera: this.orthographicCamera,
-        updateCameraClipPlanes: () => this.updateCameraClipPlanes()
-      })
-    })
-    this.resizeObserver.observe(this.container)
-    resizeViewerViewport({
+    this.resizeObserver = bindViewerResizeObserver({
       container: this.container,
       renderer: this.renderer,
       perspectiveCamera: this.perspectiveCamera,
@@ -434,25 +247,29 @@ export class IfcViewerAPI {
     })
   }
 
+  // Starts the animation loop that updates controls and renders the scene every frame.
   private startLoop() {
-    const animate = () => {
-      if (this.disposed) return
-      const now = performance.now()
-      renderViewerFrame({
-        now,
-        lastFrameTime: this.lastFrameTime,
-        cameraControls: this.cameraControls,
-        updateCameraClipPlanes: () => this.updateCameraClipPlanes(),
-        renderer: this.renderer,
-        scene: this.scene,
-        perspectiveCamera: this.perspectiveCamera
-      })
-      this.lastFrameTime = now
-      this.animationFrame = requestAnimationFrame(animate)
-    }
-    this.animationFrame = requestAnimationFrame(animate)
+    this.animationFrame = startViewerAnimationLoop({
+      isDisposed: () => this.disposed,
+      getLastFrameTime: () => this.lastFrameTime,
+      setLastFrameTime: (value) => {
+        this.lastFrameTime = value
+      },
+      renderFrame: (now, lastFrameTime) => {
+        renderViewerFrame({
+          now,
+          lastFrameTime,
+          cameraControls: this.cameraControls,
+          updateCameraClipPlanes: () => this.updateCameraClipPlanes(),
+          renderer: this.renderer,
+          scene: this.scene,
+          perspectiveCamera: this.perspectiveCamera
+        })
+      }
+    })
   }
 
+  // Fits the active camera to the currently visible IFC models in the scene.
   private async fitToFrame() {
     const sceneRadius = await fitCameraToVisibleModels({
       cameraControls: this.cameraControls,
@@ -464,54 +281,57 @@ export class IfcViewerAPI {
     }
   }
 
+  // Loads one IFC file object into the compatibility viewer.
+  private async loadFromFile(file: File, fitToFrame = true): Promise<IfcModelLike | null> {
+    return loadModelFromFile({
+      file,
+      fitToFrame,
+      loadFromBuffer: (buffer, sourceName, nextFitToFrame) =>
+        this.loadFromBuffer(buffer, sourceName, nextFitToFrame)
+    })
+  }
+
+  // Loads one IFC URL into the compatibility viewer through an ArrayBuffer round-trip.
+  private async loadFromUrl(url: string, fitToFrame = true): Promise<IfcModelLike | null> {
+    return loadModelFromUrl({
+      url,
+      fitToFrame,
+      loadFromBuffer: (buffer, sourceName, nextFitToFrame) =>
+        this.loadFromBuffer(buffer, sourceName, nextFitToFrame)
+    })
+  }
+
+  // Attaches one already loaded IFC mesh to the scene and refreshes camera bounds.
   private addIfcModel(mesh: IfcModelLike | null | undefined) {
-    attachIfcModelToScene({
+    attachLoadedModel({
       scene: this.scene,
       items: this.context.items,
-      mesh
+      mesh,
+      updateSceneRadius: () => this.updateSceneRadius(),
+      updateCameraClipPlanes: () => this.updateCameraClipPlanes()
     })
-    this.updateSceneRadius()
-    this.updateCameraClipPlanes()
   }
 
+  // Removes one loaded IFC model, its subsets, caches, and pickable scene objects.
   private removeIfcModel(modelID: number) {
-    const record = this.modelsById.get(modelID)
-    if (!record) {
-      delete this.ifcManager.state.models[modelID]
-      return
-    }
-
-    Array.from(record.subsets.keys()).forEach((subsetId) => {
-      this.detachSubset(record, subsetId)
+    removeLoadedModel({
+      modelID,
+      modelsById: this.modelsById,
+      modelIdByKey: this.modelIdByKey,
+      ifcManagerState: this.ifcManager.state.models,
+      fragmentsManager: this.fragmentsManager,
+      items: this.context.items,
+      updateSceneRadius: () => this.updateSceneRadius(),
+      updateCameraClipPlanes: () => this.updateCameraClipPlanes()
     })
-
-    this.removePickable(record.mesh)
-    this.removeModelFromList(record.mesh)
-    record.mesh.parent?.remove(record.mesh)
-    record.mesh.geometry?.dispose?.()
-
-    record.geometryCache.forEach((entries) => {
-      entries.forEach((entry) => entry.geometry.dispose())
-    })
-
-    this.modelsById.delete(modelID)
-    this.modelIdByKey.delete(record.modelKey)
-    delete this.ifcManager.state.models[modelID]
-
-    try {
-      void this.fragmentsManager.core.disposeModel(record.modelKey)
-    } catch {
-      // no-op
-    }
-
-    this.updateSceneRadius()
-    this.updateCameraClipPlanes()
   }
 
+  // Recomputes the scene radius from the currently visible IFC models.
   private updateSceneRadius() {
     this.sceneRadius = computeSceneRadius(this.context.items.ifcModels)
   }
 
+  // Recomputes camera clipping planes from the current scene radius.
   private updateCameraClipPlanes() {
     updateCameraClipPlanesForScene({
       cameraControls: this.cameraControls,
@@ -521,6 +341,7 @@ export class IfcViewerAPI {
     })
   }
 
+  // Ensures the That Open IFC loader has been configured and initialized exactly once.
   private async ensureIfcLoaderReady() {
     if (this.ifcLoaderSetupPromise) {
       await this.ifcLoaderSetupPromise
@@ -544,6 +365,7 @@ export class IfcViewerAPI {
     await this.ifcLoaderSetupPromise
   }
 
+  // Applies the current wasm path and WebIFC config onto the shared IFC loader instance.
   private applyIfcLoaderSettings() {
     applyIfcLoaderSettingsInternal({
       ifcLoader: this.ifcLoader,
@@ -552,12 +374,14 @@ export class IfcViewerAPI {
     })
   }
 
+  // Stores one new wasm path and invalidates the current IFC loader setup promise.
   private configureWasmPath(path: string) {
     this.wasmPath = path
     this.applyIfcLoaderSettings()
     this.ifcLoaderSetupPromise = null
   }
 
+  // Merges new WebIFC config into the loader settings and reinitializes the loader bridge.
   private async applyWebIfcConfig(settings: any) {
     this.webIfcConfig = {
       ...this.webIfcConfig,
@@ -568,6 +392,7 @@ export class IfcViewerAPI {
     await this.ensureIfcLoaderReady()
   }
 
+  // Builds one subset mesh from cached fragment geometry for a given express-id list.
   private buildMeshFromCache(
     record: ModelRecord,
     ids: number[],
@@ -577,36 +402,11 @@ export class IfcViewerAPI {
       record,
       ids,
       materialOverride,
-      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
+      tagModelObject: tagViewerModelObject
     })
   }
 
-  private tagModelObject(root: Object3D, modelID: number) {
-    root.traverse((entry: any) => {
-      entry.modelID = modelID
-    })
-  }
-
-  private removePickable(object: Object3D) {
-    removePickableObject(this.context.items, object)
-  }
-
-  private addPickable(object: Object3D) {
-    addPickableObject(this.context.items, object)
-  }
-
-  private removeModelFromList(model: IfcModelLike) {
-    removeModelFromSceneList(this.context.items, model)
-  }
-
-  private detachSubset(record: ModelRecord, subsetId: string) {
-    detachSubsetRecord({
-      record,
-      subsetId,
-      removePickable: (object) => this.removePickable(object)
-    })
-  }
-
+  // Creates or replaces one subset mesh for a model and subset id pair.
   private createSubset(config: {
     modelID: number
     ids: number[]
@@ -615,83 +415,64 @@ export class IfcViewerAPI {
     material?: Material | Material[]
     customID?: string
   }): Mesh | null {
-    const record = this.modelsById.get(config.modelID)
-    if (!record) return null
-
-    const subsetId = config.customID || DEFAULT_SUBSET_ID
-    return createSubsetRecord({
-      record,
-      subsetId,
-      ids: config.ids ?? [],
-      scene: config.scene ?? this.scene,
-      removePrevious: config.removePrevious,
-      material: config.material,
-      addPickable: (object) => this.addPickable(object),
-      removePickable: (object) => this.removePickable(object),
-      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
-    })
-  }
-
-  private removeSubset(modelID: number, customID?: string) {
-    const record = this.modelsById.get(modelID)
-    if (!record) return
-
-    const subsetId = customID || DEFAULT_SUBSET_ID
-    this.detachSubset(record, subsetId)
-  }
-
-  private removeFromSubset(modelID: number, ids: number[], customID?: string) {
-    const record = this.modelsById.get(modelID)
-    if (!record) return
-
-    const subsetId = customID || DEFAULT_SUBSET_ID
-    removeIdsFromSubsetRecord({
-      record,
-      subsetId,
-      ids,
+    return createViewerSubset({
+      config: {
+        ...config,
+        customID: config.customID || DEFAULT_SUBSET_ID
+      },
+      modelsById: this.modelsById,
       fallbackScene: this.scene,
-      addPickable: (object) => this.addPickable(object),
-      removePickable: (object) => this.removePickable(object),
-      tagModelObject: (root, modelID) => this.tagModelObject(root, modelID)
+      items: this.context.items
     })
   }
 
+  // Removes one subset mesh from a model by its custom subset id.
+  private removeSubset(modelID: number, customID?: string) {
+    removeViewerSubset({
+      modelID,
+      customID: customID || DEFAULT_SUBSET_ID,
+      modelsById: this.modelsById,
+      items: this.context.items
+    })
+  }
+
+  // Removes a list of express ids from one existing subset mesh.
+  private removeFromSubset(modelID: number, ids: number[], customID?: string) {
+    removeViewerSubsetIds({
+      modelID,
+      ids,
+      customID: customID || DEFAULT_SUBSET_ID,
+      modelsById: this.modelsById,
+      fallbackScene: this.scene,
+      items: this.context.items
+    })
+  }
+
+  // Loads one IFC buffer into fragments, registers caches, and optionally fits the camera.
   private async loadFromBuffer(
     buffer: ArrayBuffer,
     sourceName: string,
     fitToFrame = true
   ): Promise<IfcModelLike | null> {
-    const record = await createModelRecordFromBuffer({
+    return loadModelFromBuffer({
       buffer,
       sourceName,
-      numericId: this.nextModelId++,
+      fitToFrame,
+      allocateModelId: () => this.nextModelId++,
       ifcLoader: this.ifcLoader,
       fragmentsManager: this.fragmentsManager,
       mesher: this.mesher,
       ensureIfcLoaderReady: () => this.ensureIfcLoaderReady(),
-      makeModelKey: (name) => makeModelKeyInternal(name),
-      resolveMaterialsByLocalId: resolveMaterialsByLocalIdInternal,
-      resolveGeometryMaterialsByLocalId: resolveGeometryMaterialsByLocalIdInternal,
-      buildMeshFromCache: (record, ids) => this.buildMeshFromCache(record, ids)
-    })
-    if (!record) return null
-
-    registerLoadedModelRecord({
-      record,
       modelsById: this.modelsById,
       modelIdByKey: this.modelIdByKey,
-      ifcManagerState: this.ifcManager.state
+      ifcManagerState: this.ifcManager.state,
+      addIfcModel: (mesh) => this.addIfcModel(mesh),
+      fitToFrameNow: () => this.fitToFrame(),
+      buildMeshFromCache: (record, ids) => this.buildMeshFromCache(record, ids)
     })
-
-    this.addIfcModel(record.mesh)
-
-    if (fitToFrame) {
-      await this.fitToFrame()
-    }
-
-    return record.mesh
   }
 
+  // Reads one legacy property payload for an express id from the loaded fragments model.
   private async getItemProperties(
     modelID: number,
     expressID: number,

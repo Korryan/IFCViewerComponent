@@ -1,0 +1,124 @@
+.viewer-wrapper {
+  width: 100%;
+  height: 100%;
+}
+
+.viewer-layout {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.viewer-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.side-panel {
+  width: 360px;
+  border-left: 1px solid #e2e8f0;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.viewer-container {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  line-height: 0;
+}
+
+.viewer-container canvas,
+.viewer-container img {
+  display: block;
+}
+
+.viewer-overlay {
+  position: absolute;
+  left: 1rem;
+  bottom: 1rem;
+  padding: 0.5rem 0.85rem;
+  border-radius: 0.5rem;
+  background: rgba(2, 6, 23, 0.8);
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+.viewer-overlay--error {
+  background: rgba(220, 38, 38, 0.9);
+}
+
+.shortcuts-toggle {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  color: #0f172a;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.12);
+}
+
+.shortcuts-toggle:hover {
+  background: #f1f5f9;
+}
+
+.viewer-mode-controls {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.viewer-mode-controls--with-shortcuts {
+  right: 3.8rem;
+}
+
+.navigation-toggle {
+  min-width: 54px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  color: #0f172a;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.12);
+  padding: 0 0.75rem;
+  white-space: nowrap;
+}
+
+.navigation-toggle:hover {
+  background: #f1f5f9;
+}
+
+.navigation-toggle--walk {
+  background: #0f172a;
+  border-color: #0f172a;
+  color: #ffffff;
+}
+
+.navigation-toggle--walk:hover {
+  background: #1e293b;
+}
+
+.navigation-toggle--room-guard-active {
+  background: #0f172a;
+  border-color: #0f172a;
+  color: #ffffff;
+}
+
+.navigation-toggle--room-guard-active:hover {
+  background: #1e293b;
+}
+
