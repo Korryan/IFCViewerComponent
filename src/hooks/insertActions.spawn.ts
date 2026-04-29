@@ -74,7 +74,7 @@ export const spawnUploadedTreeObject = async (args: {
     resolveNodeInsertTarget
   })
 
-  const info = await spawnUploadedModel(uploadFile, target, { focus: true })
+  const info = await spawnUploadedModel(uploadFile, target, { focus: false })
   if (!info) return
 
   const parentId = resolveInsertParentId(tree, requestedNodeId ?? selectedNodeId)

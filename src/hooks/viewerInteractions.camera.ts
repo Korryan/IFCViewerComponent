@@ -56,6 +56,24 @@ const getViewerCameraControls = (viewer: IfcViewerAPI | null | undefined): Camer
   return (viewer?.context?.ifcCamera?.cameraControls as CameraControlsFacade | undefined) ?? null
 }
 
+// Captures the current camera position and target from the viewer controls when available.
+export const captureViewerCameraState = (
+  viewer: IfcViewerAPI | null | undefined
+): { cameraPosition: Point3D; cameraTarget: Point3D } | null => {
+  const controls = getViewerCameraControls(viewer)
+  if (!controls?.getPosition || !controls?.getTarget) return null
+
+  const position = new Vector3()
+  const target = new Vector3()
+  controls.getPosition(position)
+  controls.getTarget(target)
+
+  return {
+    cameraPosition: { x: position.x, y: position.y, z: position.z },
+    cameraTarget: { x: target.x, y: target.y, z: target.z }
+  }
+}
+
 // Applies one instant look-at update when the controls support the combined setter.
 const setLookAtInstant = (
   controls: CameraControlsFacade,
@@ -65,6 +83,23 @@ const setLookAtInstant = (
   if (typeof controls.setLookAt !== 'function') return false
   controls.setLookAt(position.x, position.y, position.z, target.x, target.y, target.z, false)
   return true
+}
+
+// Restores one previously captured camera position and target back into the viewer controls.
+export const restoreViewerCameraState = (
+  viewer: IfcViewerAPI | null | undefined,
+  cameraPosition: Point3D | null | undefined,
+  cameraTarget: Point3D | null | undefined
+): boolean => {
+  if (!cameraPosition || !cameraTarget) return false
+  const controls = getViewerCameraControls(viewer)
+  if (!controls) return false
+
+  return setLookAtInstant(
+    controls,
+    new Vector3(cameraPosition.x, cameraPosition.y, cameraPosition.z),
+    new Vector3(cameraTarget.x, cameraTarget.y, cameraTarget.z)
+  )
 }
 
 // Switches camera-controls mouse bindings between free and walk navigation modes.

@@ -35,6 +35,7 @@ type UseIfcViewerModelLifecycleArgs = {
   stopWalkMovementLoop: () => void
   resetSelection: () => void
   applyNavigationMode: (viewer: IfcViewerAPI) => void
+  fitToFrameOnLoad: boolean
   file?: File | null
   defaultModelUrl?: string
   loadIfcWithCustomSettings: (
@@ -112,6 +113,7 @@ export const useIfcViewerModelLifecycle = ({
   stopWalkMovementLoop,
   resetSelection,
   applyNavigationMode,
+  fitToFrameOnLoad,
   file,
   defaultModelUrl,
   loadIfcWithCustomSettings,
@@ -185,6 +187,7 @@ export const useIfcViewerModelLifecycle = ({
       const existingViewer = viewerRef.current
       if (existingViewer) {
         stopWalkMovementLoop()
+        clearOffsetArtifacts()
         clearLoadedViewerModels({
           viewer: existingViewer,
           lastModelId: lastModelIdRef.current,
@@ -393,7 +396,7 @@ export const useIfcViewerModelLifecycle = ({
 
     if (nextSource.kind === 'file') {
       void loadModelRef.current(
-        (viewer) => loadIfcWithCustomSettings(viewer, { file: nextSource.file }, true),
+        (viewer) => loadIfcWithCustomSettings(viewer, { file: nextSource.file }, fitToFrameOnLoad),
         'Loading IFC file...'
       )
       return
@@ -401,12 +404,12 @@ export const useIfcViewerModelLifecycle = ({
 
     if (nextSource.kind === 'url') {
       void loadModelRef.current(
-        (viewer) => loadIfcWithCustomSettings(viewer, { url: nextSource.url }, true),
+        (viewer) => loadIfcWithCustomSettings(viewer, { url: nextSource.url }, fitToFrameOnLoad),
         'Loading sample model...'
       )
       return
     }
 
     setStatus(null)
-  }, [defaultModelUrl, file, lastLoadSourceRef, loadIfcWithCustomSettings, setStatus])
+  }, [defaultModelUrl, file, fitToFrameOnLoad, lastLoadSourceRef, loadIfcWithCustomSettings, setStatus])
 }

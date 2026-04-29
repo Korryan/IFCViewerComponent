@@ -28,6 +28,14 @@ export type Point3D = {
   z: number
 }
 
+export type ViewerState = {
+  navigationMode?: 'free' | 'walk' | null
+  roomOnlyTransformGuard?: boolean | null
+  shortcutsOpen?: boolean | null
+  cameraPosition?: Point3D | null
+  cameraTarget?: Point3D | null
+}
+
 export type InsertPrefabOption = {
   prefabId: string
   fileName: string

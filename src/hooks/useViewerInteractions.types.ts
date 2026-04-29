@@ -42,6 +42,7 @@ export type UseViewerInteractionsResult = {
   navigationMode: NavigationMode
   isWalkMode: boolean
   toggleNavigationMode: () => void
+  setNavigationMode: Dispatch<SetStateAction<NavigationMode>>
   applyNavigationMode: (viewer: IfcViewerAPI) => void
   stopWalkMovementLoop: () => void
   hoverCoords: Point3D | null

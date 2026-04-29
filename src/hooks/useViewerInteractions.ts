@@ -233,6 +233,7 @@ export const useViewerInteractions = ({
     navigationMode,
     isWalkMode,
     toggleNavigationMode,
+    setNavigationMode,
     applyNavigationMode,
     stopWalkMovementLoop,
     hoverCoords,

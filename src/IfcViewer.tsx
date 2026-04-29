@@ -1,11 +1,12 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { forwardRef, useRef, useState } from 'react'
 import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
 import type {
   FurnitureItem,
   HistoryEntry,
   InsertPrefabOption,
   MetadataEntry,
-  SelectedElement
+  SelectedElement,
+  ViewerState
 } from './ifcViewerTypes'
 import { useSelectionOffsets } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
@@ -17,7 +18,6 @@ import { useObjectTree } from './hooks/useObjectTree'
 import { type StoreyInfo } from './ifcRoomTree.utils'
 import { SHORTCUTS, wasmRootPath } from './ifcViewer.constants'
 import { type LoadSource } from './ifcViewer.utils'
-import { loadIfcModelWithSettings } from './ifcViewer.loading'
 import { useIfcViewerSelectionPersistence } from './useIfcViewerSelectionPersistence'
 import { useIfcViewerModelLifecycle } from './useIfcViewerModelLifecycle'
 import {
@@ -27,6 +27,9 @@ import {
 import { useIfcViewerRoomState } from './useIfcViewerRoomState'
 import { useIfcViewerTreeSelection } from './useIfcViewerTreeSelection'
 import { useIfcViewerPrefabInsertion } from './useIfcViewerPrefabInsertion'
+import { type IfcViewerHandle, useIfcViewerSessionState } from './useIfcViewerSessionState'
+import { useIfcViewerDerivedState } from './useIfcViewerDerivedState'
+import { useIfcViewerLoadSource } from './useIfcViewerLoadSource'
 import './IfcViewer.css'
 
 type IfcViewerProps = {
@@ -38,6 +41,7 @@ type IfcViewerProps = {
   metadata?: MetadataEntry[]
   furniture?: FurnitureItem[]
   history?: HistoryEntry[]
+  viewerState?: ViewerState | null
   prefabs?: InsertPrefabOption[]
   onMetadataChange?: (entries: MetadataEntry[]) => void
   onFurnitureChange?: (items: FurnitureItem[]) => void
@@ -46,8 +50,10 @@ type IfcViewerProps = {
   onResolvePrefabFile?: (prefabId: string) => Promise<File | null>
 }
 
+export type { IfcViewerHandle }
+
 // Top-level viewer wiring together scene setup, selection hook, and UI overlays
-const IfcViewer = ({
+const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer({
   file,
   defaultModelUrl,
   showTree = true,
@@ -56,13 +62,14 @@ const IfcViewer = ({
   metadata,
   furniture,
   history,
+  viewerState,
   prefabs = [],
   onMetadataChange,
   onFurnitureChange,
   onHistoryChange,
   onSelectionChange,
   onResolvePrefabFile
-}: IfcViewerProps) => {
+}, ref) {
   // Scene / viewer refs
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewerRef = useRef<IfcViewerAPI | null>(null)
@@ -158,10 +165,18 @@ const IfcViewer = ({
   })
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
-  const metadataMap = useMemo(
-    () => new Map(metadataEntries.map((entry) => [entry.ifcId, entry])),
-    [metadataEntries]
+  const { metadataMap, deletedIfcIds, showSidePanel, sourceKey } = useIfcViewerDerivedState({
+    file,
+    defaultModelUrl,
+    showTree,
+    showProperties,
+    metadataEntries
+  })
+  const loadIfcWithCustomSettings = useIfcViewerLoadSource(
+    activeIfcTextRef,
+    activeModelInverseCoordinationMatrixRef
   )
+  const fitToFrameOnLoad = viewerState == null
 
   useIfcViewerInverseMatrixBackfill({
     activeModelId,
@@ -169,17 +184,6 @@ const IfcViewer = ({
     setFurnitureEntries,
     setMetadataEntries
   })
-
-  const deletedIfcIds = useMemo(() => {
-    const ids = new Set<number>()
-    metadataEntries.forEach((entry) => {
-      if (entry.deleted) {
-        ids.add(entry.ifcId)
-      }
-    })
-    return ids
-  }, [metadataEntries])
-  const showSidePanel = showTree || showProperties
 
   const {
     roomOptions,
@@ -197,23 +201,6 @@ const IfcViewer = ({
     lastWalkRoomNodeId,
     lastWalkRoomNodeIdSetter: setLastWalkRoomNodeId
   })
-
-  // This loads an IFC source while capturing the raw text and coordination matrix used by later editors.
-  const loadIfcWithCustomSettings = useCallback(
-    async (viewer: IfcViewerAPI, source: { file?: File; url?: string }, fitToFrame: boolean) => {
-      activeModelInverseCoordinationMatrixRef.current = null
-      activeIfcTextRef.current = null
-      const loaded = await loadIfcModelWithSettings({
-        viewer,
-        source,
-        fitToFrame
-      })
-      activeIfcTextRef.current = loaded?.ifcText ?? null
-      activeModelInverseCoordinationMatrixRef.current = loaded?.inverseCoordinationMatrix ?? null
-      return loaded?.model ?? null
-    },
-    []
-  )
 
   const {
     pushHistoryEntry,
@@ -269,8 +256,10 @@ const IfcViewer = ({
   })
 
   const {
+    navigationMode,
     isWalkMode,
     toggleNavigationMode,
+    setNavigationMode,
     applyNavigationMode,
     stopWalkMovementLoop,
     hoverCoords,
@@ -306,6 +295,20 @@ const IfcViewer = ({
     syncSelectedCubePosition,
     syncSelectedIfcPosition,
     pushHistoryEntry
+  })
+
+  useIfcViewerSessionState({
+    ref,
+    viewerRef,
+    activeModelId,
+    sourceKey,
+    viewerState,
+    navigationMode,
+    setNavigationMode,
+    roomOnlyTransformGuard,
+    setRoomOnlyTransformGuard,
+    isShortcutsOpen,
+    setIsShortcutsOpen
   })
 
   const {
@@ -358,6 +361,7 @@ const IfcViewer = ({
     stopWalkMovementLoop,
     resetSelection,
     applyNavigationMode,
+    fitToFrameOnLoad,
     file,
     defaultModelUrl,
     loadIfcWithCustomSettings,
@@ -489,7 +493,7 @@ const IfcViewer = ({
       onTreeUploadInputChange={handleTreeUploadInputChange}
     />
   )
-}
+})
 
 export default IfcViewer
 

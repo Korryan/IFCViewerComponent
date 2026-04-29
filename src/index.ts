@@ -1,4 +1,5 @@
 export { default as IfcViewer } from './IfcViewer'
+export type { IfcViewerHandle } from './IfcViewer'
 export type {
   FurnitureGeometry,
   FurnitureItem,
@@ -10,5 +11,6 @@ export type {
   OffsetVector,
   Point3D,
   PropertyField,
-  SelectedElement
+  SelectedElement,
+  ViewerState
 } from './ifcViewerTypes'
