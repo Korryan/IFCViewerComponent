@@ -1,4 +1,4 @@
-import CameraControls from 'camera-controls'
+import type CameraControls from 'camera-controls'
 import {
   AmbientLight,
   Box3,

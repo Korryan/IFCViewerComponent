@@ -13,23 +13,26 @@
     ".": "./src/index.ts"
   },
   "peerDependencies": {
-    "camera-controls": "^3.1.2",
+    "camera-controls": "3.1.2",
     "react": "^18.0.0 || ^19.0.0",
     "react-dom": "^18.0.0 || ^19.0.0",
-    "three": ">=0.175.0 <0.200.0",
-    "web-ifc": "^0.0.74"
+    "three": "0.175.0",
+    "web-ifc": "0.0.74"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@types/three": "^0.175.0",
-    "camera-controls": "^3.1.2",
-    "three": "^0.175.0",
+    "@types/three": "0.175.0",
+    "camera-controls": "3.1.2",
+    "three": "0.175.0",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@thatopen/components": "^3.3.3",
-    "@thatopen/components-front": "^3.3.3",
-    "@thatopen/fragments": "^3.3.6"
+    "@thatopen/components": "3.3.3",
+    "@thatopen/components-front": "3.3.3",
+    "@thatopen/fragments": "3.3.6"
+  },
+  "overrides": {
+    "fast-xml-parser": "5.7.2"
   }
 }

@@ -1,13 +1,6 @@
 import { forwardRef, useRef, useState } from 'react'
 import { IfcViewerAPI } from './viewer/IfcViewerAPICompat'
-import type {
-  FurnitureItem,
-  HistoryEntry,
-  InsertPrefabOption,
-  MetadataEntry,
-  SelectedElement,
-  ViewerState
-} from './ifcViewerTypes'
+import type { FurnitureItem, HistoryEntry, InsertPrefabOption, MetadataEntry, SelectedElement, ViewerState } from './ifcViewerTypes'
 import { useSelectionOffsets } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
 import { useFurnitureState } from './hooks/useFurnitureState'
@@ -20,10 +13,7 @@ import { SHORTCUTS, wasmRootPath } from './ifcViewer.constants'
 import { type LoadSource } from './ifcViewer.utils'
 import { useIfcViewerSelectionPersistence } from './useIfcViewerSelectionPersistence'
 import { useIfcViewerModelLifecycle } from './useIfcViewerModelLifecycle'
-import {
-  useIfcViewerBuildFurnitureCustom,
-  useIfcViewerInverseMatrixBackfill
-} from './useIfcViewerFurnitureCustom'
+import { useIfcViewerBuildFurnitureCustom, useIfcViewerInverseMatrixBackfill } from './useIfcViewerFurnitureCustom'
 import { useIfcViewerRoomState } from './useIfcViewerRoomState'
 import { useIfcViewerTreeSelection } from './useIfcViewerTreeSelection'
 import { useIfcViewerPrefabInsertion } from './useIfcViewerPrefabInsertion'
@@ -130,6 +120,7 @@ const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer
     ensureCustomCubesPickable,
     pickCandidatesAt,
     resetSelection,
+    clearCustomObjects,
     clearOffsetArtifacts,
     spawnCube,
     removeCustomCube,
@@ -325,7 +316,10 @@ const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer
     tree,
     roomNumbersRef,
     selectedNodeId,
+    activeRoomNodeId: lastWalkRoomNodeId,
     setSelectedNodeId,
+    roomOnlyTransformGuard,
+    setStatus,
     hoverCoords,
     insertTargetCoords,
     addCustomNode,
@@ -357,6 +351,7 @@ const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer
     setIsFurnitureStateReconciled,
     setStatus,
     setError,
+    clearCustomObjects,
     clearOffsetArtifacts,
     stopWalkMovementLoop,
     resetSelection,
@@ -432,7 +427,7 @@ const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer
       insertMenuAnchor={insertMenuAnchor}
       prefabs={prefabs}
       onInsertPrefab={(prefabId) => {
-        void handleInsertPrefab(prefabId)
+        void handleInsertPrefab(prefabId, lastWalkRoomNodeId)
       }}
       onCloseInsertMenu={closeInsertMenu}
       isPickMenuOpen={isPickMenuOpen}
@@ -485,7 +480,10 @@ const IfcViewer = forwardRef<IfcViewerHandle, IfcViewerProps>(function IfcViewer
       onUploadInputChange={async (event) => {
         const inputFile = event.target.files?.[0]
         if (inputFile) {
-          await spawnUploadedModelAt(inputFile)
+          const roomTarget = lastWalkRoomNodeId
+            ? await resolveNodeInsertTarget(lastWalkRoomNodeId)
+            : null
+          await spawnUploadedModelAt(inputFile, lastWalkRoomNodeId, roomTarget)
         }
         event.target.value = ''
         closeInsertMenu()

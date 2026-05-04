@@ -3,6 +3,7 @@ import type { ChangeEvent } from 'react'
 import type { Point3D } from '../ifcViewerTypes'
 import {
   findSpaceNodeIdByIfcIdInTree,
+  isTreeNodeInsideSpace,
   findSpaceNodeIdByRoomNumberInTree,
   resolveInsertTargetForNode,
   resolveRoomNumberForTreeNode,
@@ -15,7 +16,10 @@ export const useInsertActions = ({
   tree,
   roomNumbersRef,
   selectedNodeId,
+  activeRoomNodeId = null,
   setSelectedNodeId,
+  roomOnlyTransformGuard,
+  setStatus,
   hoverCoords,
   insertTargetCoords,
   addCustomNode,
@@ -29,6 +33,17 @@ export const useInsertActions = ({
 }: UseInsertActionsArgs): UseInsertActionsResult => {
   const treeUploadInputRef = useRef<HTMLInputElement | null>(null)
   const pendingTreeUploadRef = useRef<string | null>(null)
+
+  // This prevents inserting objects outside rooms while room-only edit mode is active.
+  const canInsertAtNode = useCallback(
+    (nodeId: string | null | undefined): boolean => {
+      if (!roomOnlyTransformGuard) return true
+      if (isTreeNodeInsideSpace(tree, nodeId)) return true
+      setStatus('Room-only edit is on. Select a room or an object inside a room before adding an object.')
+      return false
+    },
+    [roomOnlyTransformGuard, setStatus, tree]
+  )
 
   // This resolves the first room number found while walking from one tree node upward.
   const resolveRoomNumberForNode = useCallback(
@@ -80,11 +95,14 @@ export const useInsertActions = ({
   // This uploads and inserts one IFC object into the scene, furniture state and tree state together.
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File, requestedNodeId?: string | null, requestedTarget?: Point3D | null) => {
+      const targetNodeId = requestedNodeId ?? selectedNodeId ?? activeRoomNodeId
+      if (!canInsertAtNode(targetNodeId)) return
+
       await spawnUploadedTreeObject({
         tree,
         roomNumbers: roomNumbersRef.current,
         uploadFile,
-        requestedNodeId,
+        requestedNodeId: targetNodeId,
         requestedTarget,
         selectedNodeId,
         insertTargetCoords,
@@ -99,6 +117,8 @@ export const useInsertActions = ({
     },
     [
       addCustomNode,
+      activeRoomNodeId,
+      canInsertAtNode,
       hoverCoords,
       insertTargetCoords,
       registerUploadedFurniture,
@@ -115,24 +135,27 @@ export const useInsertActions = ({
   // This inserts a prefab IFC file using the same flow as any other uploaded custom object.
   const spawnPrefabAt = useCallback(
     async (prefabFile: File) => {
-      await spawnUploadedModelAt(prefabFile)
+      const resolvedTarget = activeRoomNodeId ? await resolveNodeInsertTarget(activeRoomNodeId) : null
+      await spawnUploadedModelAt(prefabFile, activeRoomNodeId, resolvedTarget)
     },
-    [spawnUploadedModelAt]
+    [activeRoomNodeId, resolveNodeInsertTarget, spawnUploadedModelAt]
   )
 
   // This remembers the tree node that requested a file upload before opening the hidden file input.
   const handleTreeUploadModel = useCallback((nodeId: string) => {
+    if (!canInsertAtNode(nodeId)) return
     pendingTreeUploadRef.current = nodeId
     treeUploadInputRef.current?.click()
-  }, [])
+  }, [canInsertAtNode])
 
   // This inserts one prefab under the requested tree node using the resolved room target position.
   const handleTreeInsertPrefab = useCallback(
     async (nodeId: string, prefabFile: File) => {
+      if (!canInsertAtNode(nodeId)) return
       const resolvedTarget = await resolveNodeInsertTarget(nodeId)
       await spawnUploadedModelAt(prefabFile, nodeId, resolvedTarget)
     },
-    [resolveNodeInsertTarget, spawnUploadedModelAt]
+    [canInsertAtNode, resolveNodeInsertTarget, spawnUploadedModelAt]
   )
 
   // This completes the hidden file-input flow started from the object tree and then clears the pending request.
@@ -141,6 +164,11 @@ export const useInsertActions = ({
       const inputFile = event.target.files?.[0]
       const requestedParentId = pendingTreeUploadRef.current
       if (inputFile && requestedParentId) {
+        if (!canInsertAtNode(requestedParentId)) {
+          pendingTreeUploadRef.current = null
+          event.target.value = ''
+          return
+        }
         const resolvedTarget = await resolveNodeInsertTarget(requestedParentId)
         await spawnUploadedModelAt(inputFile, requestedParentId, resolvedTarget)
       }
@@ -148,6 +176,7 @@ export const useInsertActions = ({
       event.target.value = ''
     },
     [
+      canInsertAtNode,
       resolveNodeInsertTarget,
       spawnUploadedModelAt
     ]

@@ -276,6 +276,15 @@ export const clearOffsetArtifacts = (args: {
   }
 }
 
+// Clears only the temporary custom-object layer without touching IFC subset or model cleanup state.
+export const clearCustomObjectsOnly = (args: {
+  viewer: IfcViewerAPI
+  customObjectRegistryRefs: CustomObjectRegistryRefs
+  removePickable: (viewer: IfcViewerAPI, mesh: Mesh) => void
+}) => {
+  clearAllCustomObjects(args.viewer, args.customObjectRegistryRefs, args.removePickable)
+}
+
 // Recomputes the filter subset so only the allowed express ids remain visible on top of moved elements.
 export const updateVisibilityForModel = (args: {
   viewer: IfcViewerAPI

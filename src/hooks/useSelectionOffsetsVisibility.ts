@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
 import { Mesh } from 'three'
 import type { IfcViewerAPI } from '../viewer/IfcViewerAPICompat'
-import { clearOffsetArtifacts as clearOffsetArtifactsInternal, configureSpaceBiasTargets as configureSpaceBiasTargetsInternal, ensureBaseSubset as ensureBaseSubsetInternal, updateSpaceBiasSubset as updateSpaceBiasSubsetInternal, updateVisibilityForModel as updateVisibilityForModelInternal } from './selectionOffsets.subsetState'
+import { clearCustomObjectsOnly as clearCustomObjectsOnlyInternal, clearOffsetArtifacts as clearOffsetArtifactsInternal, configureSpaceBiasTargets as configureSpaceBiasTargetsInternal, ensureBaseSubset as ensureBaseSubsetInternal, updateSpaceBiasSubset as updateSpaceBiasSubsetInternal, updateVisibilityForModel as updateVisibilityForModelInternal } from './selectionOffsets.subsetState'
 import { getMovedIdsForModel as getMovedIdsForModelFromSubsets, removeMovedSubset } from './selectionOffsets.subsets'
 import type { SelectionOffsetRefs } from './useSelectionOffsetRefs'
 
@@ -19,6 +19,7 @@ type UseSelectionOffsetsVisibilityResult = {
   hasRenderableExpressId: (modelID: number, expressID: number) => boolean
   ensureBaseSubset: (modelID: number) => Mesh | null
   configureSpaceBiasTargets: (modelID: number, expressIDs: number[]) => void
+  clearCustomObjects: () => void
   clearOffsetArtifacts: (modelID?: number | null) => void
   updateVisibilityForModel: (modelID: number, allowedIds: Set<number> | null) => void
   applyVisibilityFilter: (modelID: number, visibleIds: number[] | null) => void
@@ -29,22 +30,24 @@ type UseSelectionOffsetsVisibilityResult = {
 export const useSelectionOffsetsVisibility = (
   args: UseSelectionOffsetsVisibilityArgs
 ): UseSelectionOffsetsVisibilityResult => {
-  // This function removes one mesh from the viewer pickable collection if it is currently registered there.
+  // This function removes every occurrence of one mesh from the viewer pickable collection.
   const removePickable = useCallback((viewer: IfcViewerAPI, mesh: Mesh) => {
     const pickables = viewer.context.items.pickableIfcModels
-    const index = pickables.indexOf(mesh as any)
-    if (index !== -1) {
-      pickables.splice(index, 1)
+    for (let index = pickables.length - 1; index >= 0; index -= 1) {
+      if (pickables[index] === (mesh as any)) {
+        pickables.splice(index, 1)
+      }
     }
   }, [])
 
-  // This function adds or replaces one mesh inside the viewer pickable collection.
+  // This function compacts the pickable collection and appends one mesh only when it is not already present.
   const registerPickable = useCallback(
-    (viewer: IfcViewerAPI, mesh: Mesh, slot?: number) => {
+    (viewer: IfcViewerAPI, mesh: Mesh, _slot?: number) => {
       const pickables = viewer.context.items.pickableIfcModels
-      if (typeof slot === 'number') {
-        pickables[slot] = mesh as any
-        return
+      for (let index = pickables.length - 1; index >= 0; index -= 1) {
+        if (!pickables[index]) {
+          pickables.splice(index, 1)
+        }
       }
       if (!pickables.includes(mesh as any)) {
         pickables.push(mesh as any)
@@ -206,6 +209,17 @@ export const useSelectionOffsetsVisibility = (
     [args.refs, args.viewerRef, registerPickable, removePickable]
   )
 
+  // This function clears only the temporary custom-object layer while leaving IFC subset state intact.
+  const clearCustomObjects = useCallback(() => {
+    const viewer = args.viewerRef.current
+    if (!viewer) return
+    clearCustomObjectsOnlyInternal({
+      viewer,
+      customObjectRegistryRefs: args.refs.customObjectRegistryRefs,
+      removePickable
+    })
+  }, [args.refs.customObjectRegistryRefs, args.viewerRef, removePickable])
+
   // This function rebuilds the filter subset so only the allowed IFC ids remain visible.
   const updateVisibilityForModel = useCallback(
     (modelID: number, allowedIds: Set<number> | null) => {
@@ -302,6 +316,7 @@ export const useSelectionOffsetsVisibility = (
     hasRenderableExpressId,
     ensureBaseSubset,
     configureSpaceBiasTargets,
+    clearCustomObjects,
     clearOffsetArtifacts,
     updateVisibilityForModel,
     applyVisibilityFilter,

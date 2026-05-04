@@ -31,6 +31,7 @@ type UseIfcViewerModelLifecycleArgs = {
   setIsFurnitureStateReconciled: (value: boolean) => void
   setStatus: (value: string | null) => void
   setError: (value: string | null) => void
+  clearCustomObjects: () => void
   clearOffsetArtifacts: (modelID?: number | null) => void
   stopWalkMovementLoop: () => void
   resetSelection: () => void
@@ -109,6 +110,7 @@ export const useIfcViewerModelLifecycle = ({
   setIsFurnitureStateReconciled,
   setStatus,
   setError,
+  clearCustomObjects,
   clearOffsetArtifacts,
   stopWalkMovementLoop,
   resetSelection,
@@ -187,12 +189,12 @@ export const useIfcViewerModelLifecycle = ({
       const existingViewer = viewerRef.current
       if (existingViewer) {
         stopWalkMovementLoop()
-        clearOffsetArtifacts()
         clearLoadedViewerModels({
           viewer: existingViewer,
           lastModelId: lastModelIdRef.current,
           clearOffsetArtifacts
         })
+        clearCustomObjects()
       }
       lastModelIdRef.current = null
       const viewer = ensureViewer()
@@ -237,6 +239,7 @@ export const useIfcViewerModelLifecycle = ({
     [
       activeIfcTextRef,
       applyNavigationMode,
+      clearCustomObjects,
       clearOffsetArtifacts,
       ensureViewer,
       furnitureRestoredRef,

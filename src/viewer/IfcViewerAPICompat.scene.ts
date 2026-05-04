@@ -1,4 +1,4 @@
-import CameraControls from 'camera-controls'
+import type CameraControls from 'camera-controls'
 import { Box3, Object3D, OrthographicCamera, PerspectiveCamera, Scene, Vector3 } from 'three'
 
 type ViewerItems = {
@@ -13,11 +13,12 @@ export const addPickableObject = (items: ViewerItems, object: Object3D) => {
   }
 }
 
-// Removes one object from the pickable list if it is currently registered.
+// Removes every occurrence of one object from the pickable list if it is currently registered.
 export const removePickableObject = (items: ViewerItems, object: Object3D) => {
-  const index = items.pickableIfcModels.indexOf(object)
-  if (index !== -1) {
-    items.pickableIfcModels.splice(index, 1)
+  for (let index = items.pickableIfcModels.length - 1; index >= 0; index -= 1) {
+    if (items.pickableIfcModels[index] === object) {
+      items.pickableIfcModels.splice(index, 1)
+    }
   }
 }
 

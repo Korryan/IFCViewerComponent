@@ -1,7 +1,6 @@
 import CameraControls from 'camera-controls'
 import * as OBC from '@thatopen/components'
 import { Mesher } from '@thatopen/components-front'
-import fragmentsWorkerUrl from '@thatopen/fragments/worker?url'
 import * as THREE from 'three'
 import {
   Color,
@@ -42,13 +41,39 @@ import type { IfcModelLike, ModelRecord, ViewerContextCompat, ViewerIfcManagerBr
 let controlsInstalled = false
 
 const DEFAULT_SUBSET_ID = '__default__'
-const FRAGMENTS_WORKER_PATH = fragmentsWorkerUrl
+const FRAGMENTS_WORKER_PATH = '/fragments-worker.mjs'
 
 // Installs CameraControls once for the whole viewer runtime.
 const ensureCameraControlsInstalled = () => {
   if (controlsInstalled) return
   CameraControls.install({ THREE })
   controlsInstalled = true
+}
+
+// Wraps one viewer init failure with the stage name that triggered it.
+const wrapViewerInitError = (stage: string, error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error)
+  const wrapped = new Error(`IFC viewer init failed at ${stage}: ${message}`)
+  ;(wrapped as Error & { cause?: unknown }).cause = error
+  return wrapped
+}
+
+// Runs one synchronous viewer init step and annotates any thrown error with its stage.
+const runViewerInitStep = <T>(stage: string, action: () => T): T => {
+  try {
+    return action()
+  } catch (error) {
+    throw wrapViewerInitError(stage, error)
+  }
+}
+
+// Runs one async viewer init step and annotates any thrown error with its stage.
+const runViewerInitStepAsync = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
+  try {
+    return await action()
+  } catch (error) {
+    throw wrapViewerInitError(stage, error)
+  }
 }
 
 export class IfcViewerAPI {
@@ -73,9 +98,10 @@ export class IfcViewerAPI {
   private sceneRadius = 50
 
   private readonly components: OBC.Components
-  private readonly fragmentsManager: any
-  private readonly ifcLoader: any
-  private readonly mesher: any
+  private fragmentsManager: any | null = null
+  private ifcLoader: any | null = null
+  private mesher: any | null = null
+  private fragmentsRuntimeSetupPromise: Promise<void> | null = null
   private ifcLoaderSetupPromise: Promise<void> | null = null
   private wasmPath = '/ifc/'
   private webIfcConfig: Record<string, any> = {}
@@ -91,14 +117,14 @@ export class IfcViewerAPI {
     ensureCameraControlsInstalled()
 
     this.container = options.container
-    this.scene = new Scene()
+    this.scene = runViewerInitStep('scene', () => new Scene())
     this.scene.background = options.backgroundColor ?? new Color(0xffffff)
     setupDefaultSceneLights(this.scene)
 
-    this.renderer = new WebGLRenderer({
+    this.renderer = runViewerInitStep('renderer', () => new WebGLRenderer({
       antialias: true,
       alpha: true
-    })
+    }))
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.NoToneMapping
     this.renderer.toneMappingExposure = 1
@@ -106,23 +132,16 @@ export class IfcViewerAPI {
     this.renderer.setSize(this.container.clientWidth || 1, this.container.clientHeight || 1)
     this.container.appendChild(this.renderer.domElement)
 
-    this.perspectiveCamera = new PerspectiveCamera(60, 1, 0.1, 2000)
+    this.perspectiveCamera = runViewerInitStep('perspective camera', () => new PerspectiveCamera(60, 1, 0.1, 2000))
     this.perspectiveCamera.position.set(12, 8, 12)
-    this.orthographicCamera = new OrthographicCamera(-10, 10, 10, -10, 0.1, 2000)
+    this.orthographicCamera = runViewerInitStep('orthographic camera', () => new OrthographicCamera(-10, 10, 10, -10, 0.1, 2000))
     this.orthographicCamera.position.copy(this.perspectiveCamera.position)
     this.orthographicCamera.lookAt(0, 0, 0)
 
-    this.cameraControls = new CameraControls(this.perspectiveCamera, this.renderer.domElement)
+    this.cameraControls = runViewerInitStep('camera controls', () => new CameraControls(this.perspectiveCamera, this.renderer.domElement))
     this.cameraControls.setTarget(0, 0, 0, false)
 
-    this.components = new OBC.Components()
-    this.fragmentsManager = this.components.get(OBC.FragmentsManager)
-    this.fragmentsManager.init(FRAGMENTS_WORKER_PATH)
-    this.ifcLoader = this.components.get(OBC.IfcLoader)
-    this.mesher = this.components.get(Mesher as any) as any
-    this.components.init()
-
-    this.applyIfcLoaderSettings()
+    this.components = runViewerInitStep('components registry', () => new OBC.Components())
 
     this.ifcManager = createIfcManagerBridge({
       modelsById: this.modelsById,
@@ -341,32 +360,75 @@ export class IfcViewerAPI {
     })
   }
 
+  // Lazily initializes the That Open fragments runtime so viewer mount stays lightweight and easier to debug.
+  private async ensureFragmentsRuntimeReady() {
+    if (this.fragmentsManager && this.ifcLoader && this.mesher) {
+      return
+    }
+
+    if (this.fragmentsRuntimeSetupPromise) {
+      await this.fragmentsRuntimeSetupPromise
+      return
+    }
+
+    this.fragmentsRuntimeSetupPromise = (async () => {
+      this.fragmentsManager = runViewerInitStep('fragments manager', () => this.components.get(OBC.FragmentsManager))
+      runViewerInitStep('fragments manager init', () => {
+        this.fragmentsManager?.init(FRAGMENTS_WORKER_PATH)
+      })
+      this.ifcLoader = runViewerInitStep('ifc loader', () => this.components.get(OBC.IfcLoader))
+      this.mesher = runViewerInitStep('mesher', () => this.components.get(Mesher as any) as any)
+
+      try {
+        this.components.init()
+      } catch (error) {
+        console.warn('ThatOpen components init failed; continuing with manual viewer loop.', error)
+      }
+
+      this.applyIfcLoaderSettings()
+    })()
+
+    try {
+      await this.fragmentsRuntimeSetupPromise
+    } catch (error) {
+      this.fragmentsRuntimeSetupPromise = null
+      throw error
+    }
+  }
+
   // Ensures the That Open IFC loader has been configured and initialized exactly once.
   private async ensureIfcLoaderReady() {
+    await this.ensureFragmentsRuntimeReady()
+    if (!this.ifcLoader) {
+      throw new Error('IFC loader is not available after fragments runtime initialization.')
+    }
+
     if (this.ifcLoaderSetupPromise) {
       await this.ifcLoaderSetupPromise
       return
     }
 
     this.applyIfcLoaderSettings()
-    this.ifcLoaderSetupPromise = this.ifcLoader.setup({
+    this.ifcLoaderSetupPromise = runViewerInitStepAsync('ifc loader setup', async () => this.ifcLoader!.setup({
       autoSetWasm: false,
       wasm: {
-        ...this.ifcLoader.settings.wasm,
+        ...this.ifcLoader!.settings.wasm,
         path: this.wasmPath,
         absolute: isAbsoluteWasmPathInternal(this.wasmPath)
       },
       webIfc: {
-        ...this.ifcLoader.settings.webIfc,
+        ...this.ifcLoader!.settings.webIfc,
         ...this.webIfcConfig
       }
-    })
+    }))
 
     await this.ifcLoaderSetupPromise
   }
 
   // Applies the current wasm path and WebIFC config onto the shared IFC loader instance.
   private applyIfcLoaderSettings() {
+    if (!this.ifcLoader) return
+
     applyIfcLoaderSettingsInternal({
       ifcLoader: this.ifcLoader,
       wasmPath: this.wasmPath,
@@ -454,6 +516,11 @@ export class IfcViewerAPI {
     sourceName: string,
     fitToFrame = true
   ): Promise<IfcModelLike | null> {
+    await this.ensureFragmentsRuntimeReady()
+    if (!this.ifcLoader || !this.fragmentsManager || !this.mesher) {
+      throw new Error('IFC runtime is not available after fragments initialization.')
+    }
+
     return loadModelFromBuffer({
       buffer,
       sourceName,

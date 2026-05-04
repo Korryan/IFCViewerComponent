@@ -43,7 +43,10 @@ export type UseInsertActionsArgs = {
   tree: ObjectTree
   roomNumbersRef: MutableRefObject<Map<number, string>>
   selectedNodeId: string | null
+  activeRoomNodeId?: string | null
   setSelectedNodeId: Dispatch<SetStateAction<string | null>>
+  roomOnlyTransformGuard: boolean
+  setStatus: Dispatch<SetStateAction<string | null>>
   hoverCoords: Point3D | null
   insertTargetCoords: Point3D | null
   addCustomNode: AddCustomNode
@@ -66,7 +69,11 @@ export type UseInsertActionsResult = {
     nodeId: string,
     options?: { autoFocus?: boolean }
   ) => Promise<Point3D>
-  spawnUploadedModelAt: (uploadFile: File) => Promise<void>
+  spawnUploadedModelAt: (
+    uploadFile: File,
+    requestedNodeId?: string | null,
+    requestedTarget?: Point3D | null
+  ) => Promise<void>
   spawnPrefabAt: (prefabFile: File) => Promise<void>
   handleTreeInsertPrefab: (nodeId: string, prefabFile: File) => Promise<void>
   handleTreeUploadModel: (nodeId: string) => void

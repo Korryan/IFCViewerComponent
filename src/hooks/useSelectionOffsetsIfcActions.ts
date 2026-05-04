@@ -217,6 +217,7 @@ export const useSelectionOffsetsIfcActions = ({
     ) => {
       const viewer = viewerRef.current
       if (!viewer) return null
+      setCubeHighlight(null)
       try {
         return await selectIfcElementById({
           viewer,
@@ -258,6 +259,7 @@ export const useSelectionOffsetsIfcActions = ({
       getModelBaseOffset,
       hasRenderableExpressId,
       resetSelection,
+      setCubeHighlight,
       setIsFetchingProperties,
       setOffsetInputs,
       setPropertyError,

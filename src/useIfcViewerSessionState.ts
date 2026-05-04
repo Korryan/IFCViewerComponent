@@ -80,9 +80,15 @@ export const useIfcViewerSessionState = ({
     if (activeModelId === null || viewerState === undefined) return
     if (lastAppliedSourceKeyRef.current === sourceKey) return
 
-    setNavigationMode(viewerState?.navigationMode === 'walk' ? 'walk' : 'free')
-    setRoomOnlyTransformGuard(viewerState?.roomOnlyTransformGuard ?? true)
-    setIsShortcutsOpen(Boolean(viewerState?.shortcutsOpen))
+    if (viewerState?.navigationMode === 'walk' || viewerState?.navigationMode === 'free') {
+      setNavigationMode(viewerState.navigationMode)
+    }
+    if (viewerState?.roomOnlyTransformGuard !== undefined && viewerState.roomOnlyTransformGuard !== null) {
+      setRoomOnlyTransformGuard(viewerState.roomOnlyTransformGuard)
+    }
+    if (viewerState?.shortcutsOpen !== undefined && viewerState.shortcutsOpen !== null) {
+      setIsShortcutsOpen(Boolean(viewerState.shortcutsOpen))
+    }
 
     if (hasPersistedViewerState(viewerState)) {
       restoreViewerCameraState(viewerRef.current, viewerState.cameraPosition, viewerState.cameraTarget)

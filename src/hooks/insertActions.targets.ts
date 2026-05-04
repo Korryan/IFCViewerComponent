@@ -90,6 +90,14 @@ export const resolveSpaceIfcIdForTreeNode = (
   return spaceNode?.expressID ?? null
 }
 
+// This checks whether one node is a room or belongs below a room in the object tree.
+export const isTreeNodeInsideSpace = (
+  tree: ObjectTree,
+  nodeId: string | null | undefined
+): boolean => {
+  return !!resolveSpaceNodeForTreeNode(tree, nodeId)
+}
+
 // This chooses the parent room node when available and otherwise falls back to the requested node itself.
 export const resolveInsertParentId = (
   tree: ObjectTree,

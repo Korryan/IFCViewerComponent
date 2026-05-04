@@ -23,33 +23,38 @@ export const useViewerSetup = (
       return viewerRef.current
     }
 
-    const viewer = new IfcViewerAPI({
-      container: containerRef.current,
-      backgroundColor: new Color(0xf3f4f6)
-    })
+    try {
+      const viewer = new IfcViewerAPI({
+        container: containerRef.current,
+        backgroundColor: new Color(0xf3f4f6)
+      })
 
-    viewer.IFC.setWasmPath(wasmRootPath)
-    // Keep outlines and postprocessing fully disabled.
-    viewer.context.renderer.postProduction.active = false
+      viewer.IFC.setWasmPath(wasmRootPath)
+      // Keep outlines and postprocessing fully disabled.
+      viewer.context.renderer.postProduction.active = false
 
-    // Explicit camera clip planes help reduce depth precision artifacts on IFC geometry.
-    const perspectiveCamera = viewer.context.ifcCamera.perspectiveCamera
-    perspectiveCamera.near = PERSPECTIVE_NEAR
-    perspectiveCamera.far = PERSPECTIVE_FAR
-    perspectiveCamera.updateProjectionMatrix()
+      // Explicit camera clip planes help reduce depth precision artifacts on IFC geometry.
+      const perspectiveCamera = viewer.context.ifcCamera.perspectiveCamera
+      perspectiveCamera.near = PERSPECTIVE_NEAR
+      perspectiveCamera.far = PERSPECTIVE_FAR
+      perspectiveCamera.updateProjectionMatrix()
 
-    const orthographicCamera = viewer.context.ifcCamera.orthographicCamera
-    orthographicCamera.near = ORTHOGRAPHIC_NEAR
-    orthographicCamera.far = ORTHOGRAPHIC_FAR
-    orthographicCamera.updateProjectionMatrix()
+      const orthographicCamera = viewer.context.ifcCamera.orthographicCamera
+      orthographicCamera.near = ORTHOGRAPHIC_NEAR
+      orthographicCamera.far = ORTHOGRAPHIC_FAR
+      orthographicCamera.updateProjectionMatrix()
 
-    const cameraControls = viewer.context.ifcCamera.cameraControls
-    cameraControls.mouseButtons.left = CameraControls.ACTION.NONE
-    cameraControls.mouseButtons.middle = CameraControls.ACTION.ROTATE
-    cameraControls.mouseButtons.right = CameraControls.ACTION.TRUCK
-    cameraControls.mouseButtons.wheel = CameraControls.ACTION.NONE
+      const cameraControls = viewer.context.ifcCamera.cameraControls
+      cameraControls.mouseButtons.left = CameraControls.ACTION.NONE
+      cameraControls.mouseButtons.middle = CameraControls.ACTION.ROTATE
+      cameraControls.mouseButtons.right = CameraControls.ACTION.TRUCK
+      cameraControls.mouseButtons.wheel = CameraControls.ACTION.NONE
 
-    viewerRef.current = viewer
-    return viewer
+      viewerRef.current = viewer
+      return viewer
+    } catch (error) {
+      console.error('Failed to initialize IFC viewer', error)
+      return null
+    }
   }, [containerRef, viewerRef, wasmRootPath])
 }

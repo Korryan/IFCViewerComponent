@@ -63,9 +63,10 @@ export const castRayIfcCandidates = (args: {
   camera: PerspectiveCamera
   pickables: Object3D[]
 }) => {
-  if (args.pickables.length === 0) return []
+  const pickables = args.pickables.filter((entry): entry is Object3D => Boolean(entry))
+  if (pickables.length === 0) return []
   args.raycaster.setFromCamera(args.pointer, args.camera)
-  const hits = args.raycaster.intersectObjects(args.pickables, true)
+  const hits = args.raycaster.intersectObjects(pickables, true)
   const results: PickResult[] = []
   const seen = new Set<string>()
   for (const hit of hits) {

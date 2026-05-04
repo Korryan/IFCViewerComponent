@@ -58,6 +58,7 @@ export type UseSelectionOffsetsResult = {
   ) => PickCandidate[]
   getSelectedWorldPosition: () => Vector3 | null
   resetSelection: () => void
+  clearCustomObjects: () => void
   clearOffsetArtifacts: (modelID?: number | null) => void
   spawnCube: (target?: Point3D | null, options?: SpawnCubeOptions) => SpawnedCubeInfo | null
   removeCustomCube: (expressID: number) => void
